@@ -19,7 +19,7 @@ the intention here is that when i will refernce ai engine such as clude the trig
 2. data layer
 
 
-pull data from tweleve of the last 365 days , of 5m,15m,30m,1h,4h, 1d and save to local db 
+pull data from tweleve of the last 365 days , of 5m,15m,30m,1h,4h, 1d and save to local db  
 
 if i ask for data that is not availble , go ahead and fetch it , but during dev stage, if the most new data is less tha 24 hours ago , dont attempt to fetch the latest for exising data , and just continue running the script on the availble data
 
