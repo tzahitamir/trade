@@ -27,7 +27,7 @@ identify bos
 
 image should show candles , not a line
 
-during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 10 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback
+during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 20 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback
 
 add multi timeframe support:
 htf is 4h
@@ -56,7 +56,7 @@ confirmation candle that is in the same direction of the bos direction
 
 check which if one of the confluence took place after bos , and only then trigger the alert , on the image itself , state the confluence that you found
 
-add an arrow that show when will you trigger the alert , and an arrow that points to when you confirmed the confluence
+add an arrow that show when will you trigger the alert , and an arrow that points to when you confirmed the confluence , and also if the recommendation is buy or sell
 
 5. loop feedback
 
