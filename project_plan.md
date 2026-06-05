@@ -35,7 +35,7 @@ during development stage , in order to tune parameters , i want to go throgh pas
 add multi timeframe support:
 htf is 4h
 tf is 15m
-ltf is 5m
+ltf is 5m 
 
 when a bos is found , the script check if the htf bias is bullish or bearish ,at the time that the bos takes place, by checking the current swing high and low of that htf, than prints on the image the result , for example 15m bullish , and htf bearish
 
