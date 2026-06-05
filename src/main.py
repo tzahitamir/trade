@@ -172,20 +172,22 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
 def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager) -> None:
     """
     CLI dev mode: scans 15m historical data for BOS events in the last 48h.
-    Each unique BOS (first candle that breaks the swing, with a preceding liquidity sweep)
-    gets a chart saved to disk and sent via Telegram. In dev_mode the chart also shows
-    the next 10 candles after the BOS so the outcome is visible.
+
+    For each unique BOS:
+      - Checks the 4h bias (HTF) at the moment of the BOS using swing high/low
+      - Generates a chart with BOS + sweep arrows, HTF bias label, and 10 lookahead candles
+      - Saves chart to data/charts/{alert_id}.png
+      - Telegram is DISABLED in dev mode
+
     Prints a per-pair count summary at the end.
     """
     from datetime import timedelta
     timeframe = "15m"
+    htf = "4h"
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=48)).timestamp())
     dev_mode = getattr(settings, "dev_mode", True)
 
-    logging.info(
-        "Scanning 15m BOS (last 48h, liquidity sweep required, dev_mode=%s)",
-        dev_mode,
-    )
+    logging.info("Scanning 15m BOS (last 48h) — MTF bias from 4h — Telegram OFF")
     logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
 
     pair_counts: dict = {}
@@ -197,23 +199,29 @@ def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
             pair_counts[symbol] = 0
             continue
 
+        # Pre-fetch 4h candles for HTF bias (newest-first)
+        candles_4h = db.query_recent(symbol, htf, limit=500)
+
         n = len(candles_desc)
         count = 0
         seen_levels: set = set()
 
         for k in range(50, n):
-            # candles_desc[n-1-k] is the BOS candidate candle (newest-first array)
             bos_ts = candles_desc[n - 1 - k]["timestamp"]
             if bos_ts < cutoff_ts:
                 continue
 
             window = candles_desc[n - 1 - k:]  # newest-first, k+1 candles
-
-            # lookahead: up to 10 candles that are chronologically after the BOS candle
-            # In the newest-first array these sit at lower indices than the BOS candle.
             lookahead = candles_desc[max(0, n - k - 11) : n - 1 - k] if dev_mode else None
 
-            alerts = alert_manager.evaluate(symbol, timeframe, window, lookahead_candles=lookahead)
+            # HTF bias: 4h swing state at the exact moment of the BOS
+            htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, bos_ts) if candles_4h else None
+
+            alerts = alert_manager.evaluate(
+                symbol, timeframe, window,
+                lookahead_candles=lookahead,
+                htf_bias=htf_bias,
+            )
 
             for alert in alerts:
                 ev = alert["event"]
@@ -231,12 +239,12 @@ def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
                         sweep["timestamp"], tz=timezone.utc
                     ).strftime("%H:%M")
                 logging.info(
-                    "  [%s] %s BOS  id=%s  level=%.5f  str=%.2f  ts=%s%s",
+                    "  [%s] %s BOS  id=%s  level=%.5f  str=%.2f  4H=%-8s  ts=%s%s",
                     symbol, ev["direction"].upper(), alert["alert_id"],
-                    ev["broken_level"], ev["break_strength"], ts_str, sweep_str,
+                    ev["broken_level"], ev["break_strength"],
+                    (htf_bias or "?").upper(), ts_str, sweep_str,
                 )
-
-                alert_manager.send_alert(alert)
+                # Telegram disabled in dev mode — charts are saved to data/charts/
 
         pair_counts[symbol] = count
 

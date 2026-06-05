@@ -39,12 +39,15 @@ class AlertManager:
         timeframe: str,
         candles: List[Dict],
         lookahead_candles: Optional[List[Dict]] = None,
+        htf_bias: Optional[str] = None,
     ) -> List[Dict]:
         """Evaluate candles for SMC alerts.
 
         candles: newest-first list (as returned by query_recent / sliding window).
         lookahead_candles: optional newest-first list of candles after the BOS candle,
             used in dev_mode to show the outcome on the chart.
+        htf_bias: 'bullish', 'bearish', or 'neutral' — the HTF (4h) directional
+            bias at the time of the BOS, printed on the chart image.
         """
         alerts: List[Dict] = []
         params = {"symbol": symbol, "timeframe": timeframe}
@@ -52,10 +55,10 @@ class AlertManager:
         for ev in bos_events:
             alert_id = self._generate_alert_id(symbol, ev.get("breakout_ts", 0))
             try:
-                fig_path = self._render_bos_chart(candles, ev, alert_id, lookahead_candles)
+                fig_path = self._render_bos_chart(candles, ev, alert_id, lookahead_candles, htf_bias)
             except Exception:
                 fig_path = None
-            message = self._format_bos_message(ev)
+            message = self._format_bos_message(ev, htf_bias)
             alert = {
                 "alert_id": alert_id,
                 "symbol": symbol,
@@ -63,6 +66,7 @@ class AlertManager:
                 "event": ev,
                 "message": message,
                 "image_path": fig_path,
+                "htf_bias": htf_bias,
             }
             try:
                 db_id = self.db.insert_alert(
@@ -78,7 +82,7 @@ class AlertManager:
 
         return alerts
 
-    def _format_bos_message(self, ev: Dict) -> str:
+    def _format_bos_message(self, ev: Dict, htf_bias: Optional[str] = None) -> str:
         direction = ev.get("direction", "")
         lvl = ev.get("broken_level")
         strength = ev.get("break_strength")
@@ -87,7 +91,8 @@ class AlertManager:
         if sweep:
             sweep_ts = datetime.fromtimestamp(sweep["timestamp"], tz=timezone.utc).strftime("%H:%M")
             sweep_info = f" | sweep@{sweep_ts}"
-        return f"SMC BOS {direction.upper()} @ {lvl:.5f} (str={strength:.2f}){sweep_info}"
+        bias_info = f" | 4H {htf_bias.upper()}" if htf_bias and htf_bias != "neutral" else ""
+        return f"SMC BOS {direction.upper()} @ {lvl:.5f} (str={strength:.2f}){sweep_info}{bias_info}"
 
     @staticmethod
     def _draw_candles(
@@ -117,6 +122,7 @@ class AlertManager:
         ev: Dict,
         alert_id: str,
         lookahead_candles: Optional[List[Dict]] = None,
+        htf_bias: Optional[str] = None,
     ) -> str:
         """
         Render BOS candlestick chart and save to data/charts/{alert_id}.png.
@@ -199,6 +205,18 @@ class AlertManager:
         if c_ahead:
             legend_items.append(mpatches.Patch(color="gray", alpha=0.45, label="next 10 candles"))
         ax.legend(handles=legend_items, fontsize=7, loc="upper left")
+
+        # HTF bias label — top-right corner
+        if htf_bias and htf_bias != "neutral":
+            tf = ev.get("timeframe", "15m").upper()
+            bias_color = "#26a69a" if htf_bias == "bullish" else "#ef5350"
+            bias_text = f"{tf} {direction.upper()}  |  4H {htf_bias.upper()}"
+            ax.text(
+                0.98, 0.97, bias_text,
+                transform=ax.transAxes, fontsize=9, fontweight="bold",
+                color=bias_color, ha="right", va="top",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, edgecolor=bias_color),
+            )
 
         mode_tag = " [DEV]" if self.dev_mode and c_ahead else ""
         ax.set_title(

@@ -243,5 +243,40 @@ class SMCAnalyzer:
 
         return events
 
+    def get_htf_bias(self, candles_htf: List[Dict], bos_ts: int) -> str:
+        """
+        Determine the HTF (4h) directional bias at the time of a lower-TF BOS.
+
+        Uses the swing high and swing low of the 4h candles that were available
+        at bos_ts (i.e. candles whose timestamp <= bos_ts).
+
+        Logic:
+          - price above swing_high  → bullish (already broke HTF structure up)
+          - price below swing_low   → bearish (already broke HTF structure down)
+          - price between the two   → whichever side of the midpoint price sits on
+
+        Returns 'bullish', 'bearish', or 'neutral' (insufficient data).
+        """
+        available = [c for c in candles_htf if c["timestamp"] <= bos_ts]
+        if len(available) < 10:
+            return "neutral"
+
+        c = self._chronological(available)  # oldest → newest
+        price = c[-1]["close"]
+
+        swings = self._find_last_swing(available, lookback=2, search_back=20)
+        sh = swings.get("swing_high")
+        sl = swings.get("swing_low")
+
+        if sh is None or sl is None:
+            return "neutral"
+
+        if price > sh:
+            return "bullish"
+        if price < sl:
+            return "bearish"
+        mid = (sh + sl) / 2
+        return "bullish" if price >= mid else "bearish"
+
 
 __all__ = ["SMCAnalyzer"]
