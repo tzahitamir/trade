@@ -27,7 +27,7 @@ identify bos
 
 image should show candles , not a line
 
-during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 50 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback
+during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 50 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback 
 
 add multi timeframe support:
 htf is 4h
@@ -59,6 +59,9 @@ check which if one of the confluence took place after bos , and only then trigge
 add an arrow that show when will you trigger the alert , and an arrow that points to when you confirmed the confluence , and also if the recommendation is buy or sell
 
 add to the graph the latest swing low or high , depending on the situation , and the recomended sl and tp , then finally run a check on the graph , if that trade would have been a success or fail
+
+if the trade status is still open , check what happend on a htf candles , and if evantually this trade would have been a win , and change the status to confirmed a win or loss on htf 
+add a statistics  file to the same location of the charts, that shows how many wins and losses happend
 
 5. loop feedback
 
