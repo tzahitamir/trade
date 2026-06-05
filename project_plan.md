@@ -4,6 +4,8 @@
 
 FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd
 
+download 30 days past data if not present
+
 the app will run as a script , on past data and look for patterns,
 when a pattern appears , it will trigger an action , such as send to telegram
 the action will have an id number that will be stored in db for future use.
@@ -37,7 +39,10 @@ ltf is 5m
 when a bos is found , the script check if the htf bias is bullish or bearish ,at the time that the bos takes place, by checking the current swing high and low of that htf, than prints on the image the result , for example 15m bullish , and htf bearish
 
 disable the alert on telegram
-  
+
+define quiet time , when telegram will not send an alert , between 23:00 and 07:00 israel time 
+
+
 5. loop feedback
 
 this is the production phase
