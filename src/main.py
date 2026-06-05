@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import List, Optional
+import time
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -159,10 +160,80 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
         for timeframe in timeframes:
             try:
                 process_symbol_timeframe(symbol, timeframe, fetcher, db, alert_manager)
+                # Delay to stay within API rate limits (8/min). 
+                # 7s ensures 9+ calls are spread across > 1 minute.
+                time.sleep(7)
             except Exception as exc:
                 message = f"Failed to fetch {symbol} {timeframe}: {exc}"
                 logging.exception(message)
                 alert_manager.send_fetch_error(symbol, timeframe, str(exc))
+
+
+def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager) -> None:
+    """
+    CLI mode: scans 15m historical data for all BOS events in the last 48 hours.
+    Requires a preceding liquidity sweep (SSL/BSL grab) to validate each BOS.
+    Prints a per-pair count summary. Telegram is disabled in this mode.
+    """
+    from datetime import timedelta
+    timeframe = "15m"
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=48)).timestamp())
+
+    logging.info("Scanning 15m BOS (last 48h, liquidity sweep required) — Telegram OFF")
+    logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
+
+    pair_counts: dict = {}
+
+    for symbol in settings.fx_pairs:
+        candles_desc = db.query_recent(symbol, timeframe, limit=1000)
+        if not candles_desc:
+            logging.info("No %s data for %s, skipping", timeframe, symbol)
+            pair_counts[symbol] = 0
+            continue
+
+        n = len(candles_desc)
+        count = 0
+        # Track seen (direction, level) pairs so each BOS fires only once —
+        # the first candle that breaks the swing, not every subsequent candle above it.
+        seen_levels: set = set()
+
+        for k in range(50, n):
+            # window[0] is the BOS candidate candle (newest-first)
+            bos_ts = candles_desc[n - 1 - k]["timestamp"]
+            if bos_ts < cutoff_ts:
+                continue
+
+            window = candles_desc[n - 1 - k:]  # newest-first, k+1 candles
+            events = alert_manager.analyzer.detect_bos(
+                window, params={"symbol": symbol, "timeframe": timeframe}
+            )
+
+            for ev in events:
+                key = (ev["direction"], round(ev["broken_level"], 5))
+                if key in seen_levels:
+                    continue
+                seen_levels.add(key)
+                count += 1
+                ts_str = datetime.fromtimestamp(ev["breakout_ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                sweep = ev.get("liquidity_sweep") or {}
+                sweep_ts_str = ""
+                if sweep:
+                    sweep_ts_str = "  sweep@" + datetime.fromtimestamp(
+                        sweep["timestamp"], tz=timezone.utc
+                    ).strftime("%H:%M")
+                logging.info(
+                    "  [%s] %s BOS  level=%.5f  strength=%.2f  ts=%s%s",
+                    symbol, ev["direction"].upper(), ev["broken_level"],
+                    ev["break_strength"], ts_str, sweep_ts_str,
+                )
+
+        pair_counts[symbol] = count
+
+    logging.info("")
+    logging.info("=== 15m BOS count (last 48h, with liquidity sweep) ===")
+    for sym, cnt in pair_counts.items():
+        logging.info("  %-10s %d", sym, cnt)
+    logging.info("  %-10s %d", "TOTAL", sum(pair_counts.values()))
 
 
 def setup_logging(log_dir: Path) -> Path:
@@ -205,6 +276,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Send a test Telegram alert and exit",
     )
+    parser.add_argument(
+        "--experiment-bos",
+        action="store_true",
+        help="Scan existing 15m DB data for the first 3 BOS occurrences and send each as a Telegram image",
+    )
     return parser.parse_args()
 
 
@@ -213,14 +289,22 @@ def main() -> None:
     settings = Settings.load_from_yaml(str(Path(__file__).parents[1] / "config.yaml"))
     log_file = setup_logging(Path(__file__).parents[1] / "logs")
     db = LocalDB(settings.db_path)
-    fetcher = FXFetcher(settings)
-    alert_manager = AlertManager(settings)
-    log_monitor = LogMonitor(log_file, alert_manager.notifier)
+    # Pass the existing DB instance to AlertManager to avoid locking issues
+    alert_manager = AlertManager(settings, db=db)
 
     if args.test_telegram:
         alert_manager.send_test_alert()
         db.close()
         return
+
+    if args.experiment_bos:
+        run_bos_experiment(settings, db, alert_manager)
+        db.close()
+        return
+
+    # FXFetcher and LogMonitor are only needed for the scheduler (service mode)
+    fetcher = FXFetcher(settings)
+    log_monitor = LogMonitor(log_file, alert_manager.notifier)
 
     scheduler = BlockingScheduler()
     scheduler.add_job(

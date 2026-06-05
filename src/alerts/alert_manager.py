@@ -11,15 +11,15 @@ import json
 from typing import Any
 
 class AlertManager:
-    def __init__(self, settings):
+    def __init__(self, settings, db: Optional[LocalDB] = None):
         self.settings = settings
         self.notifier: Optional[TelegramNotifier] = None
         bot_token = getattr(settings, "telegram_bot_token", "")
         chat_id = getattr(settings, "telegram_chat_id", "")
         if bot_token and chat_id:
             self.notifier = TelegramNotifier(bot_token, chat_id)
-        # local DB for storing alerts
-        self.db = LocalDB(getattr(settings, "db_path"))
+        # Use provided DB or create a new instance if none provided
+        self.db = db if db else LocalDB(getattr(settings, "db_path"))
         self.analyzer = SMCAnalyzer()
 
     def evaluate(self, symbol: str, timeframe: str, candles: List[Dict]) -> List[Dict]:
@@ -63,21 +63,20 @@ class AlertManager:
         return f"SMC ALERT: BOS {dir.upper()} at {lvl:.5f} (strength={strength:.2f})"
 
     def _render_bos_chart(self, candles: List[Dict], ev: Dict) -> str:
-        # plot last N candles with broken level
+        # candles is newest-first; reverse to oldest-first then take last N
         N = 60
         c = list(reversed(candles))[-N:]
-        times = [bar["timestamp"] for bar in c]
-        opens = [bar["open"] for bar in c]
-        highs = [bar["high"] for bar in c]
-        lows = [bar["low"] for bar in c]
         closes = [bar["close"] for bar in c]
-        fig, ax = plt.subplots(figsize=(8,4))
+        fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(closes, color="black", label="close")
         broken = ev.get("broken_level")
         if broken is not None:
-            ax.hlines(broken, 0, len(closes)-1, colors="red", linestyles="--", label="broken level")
-        ax.set_title(f"{ev.get('symbol')} {ev.get('timeframe')} BOS {ev.get('direction')}")
-        ax.legend()
+            ax.hlines(broken, 0, len(closes) - 1, colors="red", linestyles="--", label="broken level")
+        # mark the BOS candle (last in window)
+        ax.axvline(x=len(closes) - 1, color="orange", linewidth=1.5, label="BOS candle")
+        direction = (ev.get("direction") or "").upper()
+        ax.set_title(f"{ev.get('symbol')} {ev.get('timeframe')} BOS {direction}")
+        ax.legend(fontsize=8)
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         fig.tight_layout()
         fig.savefig(tmp.name)

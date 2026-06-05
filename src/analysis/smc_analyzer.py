@@ -25,7 +25,6 @@ class SMCAnalyzer:
             trs.append(tr)
         if len(trs) < period:
             return mean(trs)
-        # simple ATR as SMA of TRs
         return mean(trs[-period:])
 
     @staticmethod
@@ -57,20 +56,75 @@ class SMCAnalyzer:
             "swing_low_idx": swing_low_idx,
         }
 
+    @staticmethod
+    def _has_preceding_sweep(
+        c: List[Dict],
+        direction: str,
+        sweep_lookback: int = 30,
+        level_lookback: int = 10,
+    ) -> Optional[Dict]:
+        """
+        Check if a liquidity sweep precedes the last candle in c (chronological).
+
+        Bullish BOS needs an SSL grab: a candle that wicked below the recent
+        swing low and closed back above it (stop hunt below support).
+        Bearish BOS needs a BSL grab: a candle that wicked above the recent
+        swing high and closed back below it (stop hunt above resistance).
+
+        Returns the sweep event dict if found, None otherwise.
+        c must be chronological (oldest → newest).
+        """
+        # candles before the BOS candle
+        pre_bos = c[-(sweep_lookback + 1):-1]
+        if len(pre_bos) < level_lookback + 1:
+            return None
+
+        for i in range(level_lookback, len(pre_bos)):
+            candle = pre_bos[i]
+            prior = pre_bos[i - level_lookback:i]
+
+            if direction == "bullish":
+                level = min(b["low"] for b in prior)
+                if candle["low"] < level and candle["close"] > level:
+                    return {
+                        "type": "SSL",
+                        "level": level,
+                        "timestamp": candle["timestamp"],
+                        "wick_low": candle["low"],
+                        "close": candle["close"],
+                    }
+            else:
+                level = max(b["high"] for b in prior)
+                if candle["high"] > level and candle["close"] < level:
+                    return {
+                        "type": "BSL",
+                        "level": level,
+                        "timestamp": candle["timestamp"],
+                        "wick_high": candle["high"],
+                        "close": candle["close"],
+                    }
+
+        return None
+
     def detect_bos(self, candles: List[Dict], params: Dict = None) -> List[Dict]:
         """
         Detect Break Of Structure (BOS) events in the provided candles list.
-        Returns list of BOS events (may be empty).
 
-        Expected `candles`: list of dicts with keys timestamp, open, high, low, close, volume
+        When require_liquidity_sweep=True (default), a BOS is only valid when
+        a liquidity sweep (stop hunt) preceded it in the last sweep_lookback candles:
+          - Bullish BOS requires a prior SSL grab (wick below swing low, close above).
+          - Bearish BOS requires a prior BSL grab (wick above swing high, close below).
+
+        Returns list of BOS event dicts (may be empty).
         """
         params = params or {}
         swing_lookback = params.get("swing_lookback", 20)
         min_break_candles = params.get("min_break_candles", 1)
         confirmation_candles = params.get("confirmation_candles", 1)
-        volume_multiplier = params.get("volume_multiplier", 1.0)
-        use_atr = params.get("use_atr", True)
         min_break_distance_param = params.get("min_break_distance")
+        require_sweep = params.get("require_liquidity_sweep", True)
+        sweep_lookback = params.get("sweep_lookback", 30)
+        sweep_level_lookback = params.get("sweep_level_lookback", 10)
 
         if not candles or len(candles) < 5:
             return []
@@ -78,44 +132,38 @@ class SMCAnalyzer:
         c = SMCAnalyzer._chronological(candles)
         atr = self.calculate_atr(candles) or 0.0
         last = c[-1]
-        price = last["close"]
 
         swings = self._find_last_swing(candles, lookback=3, search_back=swing_lookback)
         events = []
 
-        # determine threshold distance
         if min_break_distance_param is not None:
             min_break_distance = min_break_distance_param
         else:
-            # default: 0.5% of price or 0.5 * ATR, whichever is larger
-            pct = 0.005 * price
-            min_break_distance = max(pct, 0.5 * atr)
+            # 0.2 * ATR — small enough to catch real breaks on 15m FX
+            min_break_distance = 0.2 * atr
 
-        # bullish BOS: close(s) above swing_high + threshold
+        # --- Bullish BOS: close(s) above swing_high + threshold ---
         sh = swings.get("swing_high")
         if sh is not None:
             threshold = sh + min_break_distance
-            # check last min_break_candles closes
             ok = True
             for i in range(1, min_break_candles + 1):
-                if len(c) - i < 0:
+                if len(c) - i < 0 or c[-i]["close"] <= threshold:
                     ok = False
                     break
-                if c[-i]["close"] <= threshold:
-                    ok = False
-                    break
+
+            if ok and require_sweep:
+                sweep = self._has_preceding_sweep(c, "bullish", sweep_lookback, sweep_level_lookback)
+                ok = sweep is not None
+            else:
+                sweep = None
+
             if ok:
-                # confirmation: at least one of next confirmation_candles shows follow-through or retest
-                follow = 0
-                for j in range(1, confirmation_candles + 1):
-                    if len(c) - 1 - j < 0:
-                        continue
-                    # check that subsequent candles continue higher
-                    if c[-1]["close"] < c[-1 - j]["close"]:
-                        follow += 1
-                break_strength = 0.0
-                if atr > 0:
-                    break_strength = (c[-1]["close"] - sh) / atr * (1 + follow / 5)
+                follow = sum(
+                    1 for j in range(1, confirmation_candles + 1)
+                    if len(c) - 1 - j >= 0 and c[-1]["close"] < c[-1 - j]["close"]
+                )
+                break_strength = (c[-1]["close"] - sh) / atr * (1 + follow / 5) if atr > 0 else 0.0
                 events.append({
                     "symbol": params.get("symbol"),
                     "timeframe": params.get("timeframe"),
@@ -123,36 +171,38 @@ class SMCAnalyzer:
                     "broken_level": sh,
                     "breakout_ts": last["timestamp"],
                     "break_strength": break_strength,
+                    "liquidity_sweep": sweep,
                     "params_used": {
                         "swing_lookback": swing_lookback,
                         "min_break_distance": min_break_distance,
                         "min_break_candles": min_break_candles,
                         "confirmation_candles": confirmation_candles,
+                        "require_liquidity_sweep": require_sweep,
                     },
                 })
 
-        # bearish BOS: close(s) below swing_low - threshold
+        # --- Bearish BOS: close(s) below swing_low - threshold ---
         sl = swings.get("swing_low")
         if sl is not None:
             threshold = sl - min_break_distance
             ok = True
             for i in range(1, min_break_candles + 1):
-                if len(c) - i < 0:
+                if len(c) - i < 0 or c[-i]["close"] >= threshold:
                     ok = False
                     break
-                if c[-i]["close"] >= threshold:
-                    ok = False
-                    break
+
+            if ok and require_sweep:
+                sweep = self._has_preceding_sweep(c, "bearish", sweep_lookback, sweep_level_lookback)
+                ok = sweep is not None
+            else:
+                sweep = None
+
             if ok:
-                follow = 0
-                for j in range(1, confirmation_candles + 1):
-                    if len(c) - 1 - j < 0:
-                        continue
-                    if c[-1]["close"] > c[-1 - j]["close"]:
-                        follow += 1
-                break_strength = 0.0
-                if atr > 0:
-                    break_strength = (sl - c[-1]["close"]) / atr * (1 + follow / 5)
+                follow = sum(
+                    1 for j in range(1, confirmation_candles + 1)
+                    if len(c) - 1 - j >= 0 and c[-1]["close"] > c[-1 - j]["close"]
+                )
+                break_strength = (sl - c[-1]["close"]) / atr * (1 + follow / 5) if atr > 0 else 0.0
                 events.append({
                     "symbol": params.get("symbol"),
                     "timeframe": params.get("timeframe"),
@@ -160,11 +210,13 @@ class SMCAnalyzer:
                     "broken_level": sl,
                     "breakout_ts": last["timestamp"],
                     "break_strength": break_strength,
+                    "liquidity_sweep": sweep,
                     "params_used": {
                         "swing_lookback": swing_lookback,
                         "min_break_distance": min_break_distance,
                         "min_break_candles": min_break_candles,
                         "confirmation_candles": confirmation_candles,
+                        "require_liquidity_sweep": require_sweep,
                     },
                 })
 

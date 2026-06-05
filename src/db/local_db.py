@@ -18,8 +18,11 @@ class LocalDB:
             tmp_conn.close()
 
     def _init_schema(self, conn=None) -> None:
+        is_local = False
         if conn is None:
-            conn = self._get_conn()
+            # Use a temporary connection for schema initialization to avoid thread-local issues during setup
+            conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            is_local = True
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS fx_candles (
@@ -52,9 +55,10 @@ class LocalDB:
                 feedback TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            """
-        )
+        """)
         conn.commit()
+        if is_local:
+            conn.close()
 
     def insert_candles(self, symbol: str, timeframe: str, candles: List[Dict]) -> None:
         query = """
