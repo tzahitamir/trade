@@ -110,6 +110,11 @@ class SMCAnalyzer:
         """
         Detect Break Of Structure (BOS) events in the provided candles list.
 
+        Filters applied (both must pass):
+          1. ATR gate: if ATR < min_atr_pct * price the market is too quiet
+             (overnight chop) and no signal is generated.
+          2. Break size: close must exceed swing ± (min_break_distance_atr_mult * ATR).
+
         When require_liquidity_sweep=True (default), a BOS is only valid when
         a liquidity sweep (stop hunt) preceded it in the last sweep_lookback candles:
           - Bullish BOS requires a prior SSL grab (wick below swing low, close above).
@@ -122,6 +127,8 @@ class SMCAnalyzer:
         min_break_candles = params.get("min_break_candles", 1)
         confirmation_candles = params.get("confirmation_candles", 1)
         min_break_distance_param = params.get("min_break_distance")
+        min_break_distance_atr_mult = params.get("min_break_distance_atr_mult", 1.0)
+        min_atr_pct = params.get("min_atr_pct", 0.0003)   # ATR gate: skip if mkt too quiet
         require_sweep = params.get("require_liquidity_sweep", True)
         sweep_lookback = params.get("sweep_lookback", 30)
         sweep_level_lookback = params.get("sweep_level_lookback", 10)
@@ -132,6 +139,11 @@ class SMCAnalyzer:
         c = SMCAnalyzer._chronological(candles)
         atr = self.calculate_atr(candles) or 0.0
         last = c[-1]
+        price = last["close"]
+
+        # --- ATR gate: skip signals in dead/overnight markets ---
+        if atr < min_atr_pct * price:
+            return []
 
         swings = self._find_last_swing(candles, lookback=3, search_back=swing_lookback)
         events = []
@@ -139,8 +151,8 @@ class SMCAnalyzer:
         if min_break_distance_param is not None:
             min_break_distance = min_break_distance_param
         else:
-            # 0.2 * ATR — small enough to catch real breaks on 15m FX
-            min_break_distance = 0.2 * atr
+            # require a full ATR-sized break above the swing — kills marginal noise breaks
+            min_break_distance = min_break_distance_atr_mult * atr
 
         # --- Bullish BOS: close(s) above swing_high + threshold ---
         sh = swings.get("swing_high")
