@@ -56,6 +56,8 @@ confirmation candle that is in the same direction of the bos direction
 
 check which if one of the confluence took place after bos , and only then trigger the alert , on the image itself , state the confluence that you found
 
+add an arrow that show when will you trigger the alert , and an arrow that points to when you confirmed the confluence
+
 5. loop feedback
 
 this is the production phase
