@@ -38,10 +38,25 @@ ltf is 5m
 
 when a bos is found , the script check if the htf bias is bullish or bearish ,at the time that the bos takes place, by checking the current swing high and low of that htf, than prints on the image the result , for example 15m bullish , and htf bearish
 
-disable the alert on telegram
 
-define quiet time , when telegram will not send an alert , between 23:00 and 07:00 israel time 
+define quiet time , when telegram will not send an alert , between 23:00 and 07:00 israel time , but the script will still fetch data
 
+i want to add confluence criteria,
+the type of confluence are:
+
+Order Block retrace: After the BOS, price pulls back into the last opposing candle before the impulse (the "origin candle") — this is where institutional orders were placed
+
+Break + Retest (BRT): Price breaks the swing level, then comes back to touch it from the other side before continuing — confirms the level flipped from resistance to support (or vice versa)
+
+Fair Value Gap (FVG) fill: The BOS impulse leg leaves a 3-candle gap; price retraces into it before resuming
+
+HTF OB alignment: The 15m pullback lands inside a 4h Order Block — adds higher-timeframe institutional interest to the same zone
+
+HTF confluence at level: The broken 15m swing level coincides with a 4h swing high/low — structure aligns across timeframes
+
+confirmation candle that is in the same direction of the bos direction
+
+check which if one of the confluence took place after bos , and only then trigger the alert , on the image itself , state the confluence that you found
 
 5. loop feedback
 
