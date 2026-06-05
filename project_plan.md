@@ -4,7 +4,7 @@
 
 FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd , gbp/jpy , eur/gbp , usd/jpy 
 
-download 30 days past data for the pairs if not present
+download 365 days past data for the pairs if not present
 
 the app will run as a script , on past data and look for patterns,
 when a pattern appears , it will trigger an action , such as send to telegram
@@ -18,7 +18,7 @@ the intention here is that when i will refernce ai engine such as clude the trig
 
 2. data layer
 
-pull data from tweleve of the last 60 days , of 5m,15m,30m,1h,4h and save to local db 
+pull data from tweleve of the last 365 days , of 5m,15m,30m,1h,4h and save to local db 
 
 
 4. smc 
@@ -62,7 +62,10 @@ add to the graph the latest swing low or high , depending on the situation , and
 
 if the trade status is still open , check what happend on a htf candles , and if evantually this trade would have been a win , and change the status to confirmed a win or loss on htf 
 add a statistics  file to the same location of the charts, that shows how many wins and losses happend
-write in the text file which trade failed
+write in the text file which trade failed , and for which conflence , and which confluence worked best for the winning trades  
+
+add to the db the exact set of parametrs used as a version.
+later on you can try different set of parameters , to see which one had the best win rate
 
 5. loop feedback
 
