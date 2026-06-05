@@ -2,7 +2,7 @@
 
 1. this is the development stage
 
-FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd
+FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd , gbp/jpy , eur/gbp , usd/jpy 
 
 download 30 days past data for the pairs if not present
 
@@ -18,7 +18,7 @@ the intention here is that when i will refernce ai engine such as clude the trig
 
 2. data layer
 
-pull data from tweleve of the last 30 days , of 5m,15m,30m,1h,4h and save to local db 
+pull data from tweleve of the last 60 days , of 5m,15m,30m,1h,4h and save to local db 
 
 
 4. smc 
@@ -27,7 +27,7 @@ identify bos
 
 image should show candles , not a line
 
-during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 20 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback
+during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 30 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback
 
 add multi timeframe support:
 htf is 4h
@@ -57,6 +57,8 @@ confirmation candle that is in the same direction of the bos direction
 check which if one of the confluence took place after bos , and only then trigger the alert , on the image itself , state the confluence that you found
 
 add an arrow that show when will you trigger the alert , and an arrow that points to when you confirmed the confluence , and also if the recommendation is buy or sell
+
+add to the graph the latest swing low or high , depending on the situation , and the recomended sl and tp , then finally run a check on the graph , if that trade would have been a success or fail
 
 5. loop feedback
 
