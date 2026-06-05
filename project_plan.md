@@ -62,6 +62,7 @@ add to the graph the latest swing low or high , depending on the situation , and
 
 if the trade status is still open , check what happend on a htf candles , and if evantually this trade would have been a win , and change the status to confirmed a win or loss on htf 
 add a statistics  file to the same location of the charts, that shows how many wins and losses happend
+write in the text file which trade failed
 
 5. loop feedback
 
