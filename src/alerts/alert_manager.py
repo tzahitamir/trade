@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from .telegram_notifier import TelegramNotifier
@@ -6,9 +8,9 @@ from db.local_db import LocalDB
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import tempfile
 import json
 from typing import Any
+
 
 class AlertManager:
     def __init__(self, settings, db: Optional[LocalDB] = None):
@@ -18,86 +20,148 @@ class AlertManager:
         chat_id = getattr(settings, "telegram_chat_id", "")
         if bot_token and chat_id:
             self.notifier = TelegramNotifier(bot_token, chat_id)
-        # Use provided DB or create a new instance if none provided
         self.db = db if db else LocalDB(getattr(settings, "db_path"))
         self.analyzer = SMCAnalyzer()
+        self.charts_dir = Path(getattr(settings, "charts_dir", "data/charts"))
+        self.charts_dir.mkdir(parents=True, exist_ok=True)
+        self.dev_mode: bool = getattr(settings, "dev_mode", True)
 
-    def evaluate(self, symbol: str, timeframe: str, candles: List[Dict]) -> List[Dict]:
+    @staticmethod
+    def _generate_alert_id(symbol: str, timestamp: int) -> str:
+        """Generate alert ID: mm-hh-day-month-year-fxpairname  e.g. 30-09-05-06-2026-eurusd"""
+        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        pair = symbol.lower().replace("/", "")
+        return f"{dt.minute:02d}-{dt.hour:02d}-{dt.day:02d}-{dt.month:02d}-{dt.year}-{pair}"
+
+    def evaluate(
+        self,
+        symbol: str,
+        timeframe: str,
+        candles: List[Dict],
+        lookahead_candles: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
         """Evaluate candles for SMC alerts.
 
-        Placeholder method for future SMC logic. It should return alerts when
-        price action matches the configured SMC structure.
+        candles: newest-first list (as returned by query_recent / sliding window).
+        lookahead_candles: optional newest-first list of candles after the BOS candle,
+            used in dev_mode to show the outcome on the chart.
         """
         alerts: List[Dict] = []
-        # Only run BOS detection for now
         params = {"symbol": symbol, "timeframe": timeframe}
         bos_events = self.analyzer.detect_bos(candles, params=params)
         for ev in bos_events:
-            # create a simple chart
+            alert_id = self._generate_alert_id(symbol, ev.get("breakout_ts", 0))
             try:
-                fig_path = self._render_bos_chart(candles, ev)
-            except Exception as exc:
+                fig_path = self._render_bos_chart(candles, ev, alert_id, lookahead_candles)
+            except Exception:
                 fig_path = None
             message = self._format_bos_message(ev)
             alert = {
+                "alert_id": alert_id,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "event": ev,
                 "message": message,
                 "image_path": fig_path,
             }
-            # persist alert
             try:
-                alert_id = self.db.insert_alert(symbol, timeframe, ev.get("breakout_ts", 0), "BOS", message, fig_path, json.dumps(ev.get("params_used", {})))
-                alert["alert_id"] = alert_id
+                db_id = self.db.insert_alert(
+                    symbol, timeframe, ev.get("breakout_ts", 0), "BOS",
+                    message, fig_path,
+                    json.dumps(ev.get("params_used", {})),
+                    alert_id=alert_id,
+                )
+                alert["db_id"] = db_id
             except Exception:
-                alert["alert_id"] = None
+                alert["db_id"] = None
             alerts.append(alert)
 
         return alerts
 
     def _format_bos_message(self, ev: Dict) -> str:
-        dir = ev.get("direction")
+        direction = ev.get("direction", "")
         lvl = ev.get("broken_level")
         strength = ev.get("break_strength")
-        return f"SMC ALERT: BOS {dir.upper()} at {lvl:.5f} (strength={strength:.2f})"
+        sweep = ev.get("liquidity_sweep") or {}
+        sweep_info = ""
+        if sweep:
+            sweep_ts = datetime.fromtimestamp(sweep["timestamp"], tz=timezone.utc).strftime("%H:%M")
+            sweep_info = f" | sweep@{sweep_ts}"
+        return f"SMC BOS {direction.upper()} @ {lvl:.5f} (str={strength:.2f}){sweep_info}"
 
-    def _render_bos_chart(self, candles: List[Dict], ev: Dict) -> str:
-        # candles is newest-first; reverse to oldest-first then take last N
+    def _render_bos_chart(
+        self,
+        candles: List[Dict],
+        ev: Dict,
+        alert_id: str,
+        lookahead_candles: Optional[List[Dict]] = None,
+    ) -> str:
+        """
+        Render BOS chart and save to data/charts/{alert_id}.png.
+
+        candles: newest-first. Reversed to oldest-first for plotting.
+        lookahead_candles: newest-first future candles (dev mode only).
+            Plotted in gray after the BOS candle to show outcome.
+        """
         N = 60
+        # main window: last N candles up to and including BOS candle (oldest→newest)
         c = list(reversed(candles))[-N:]
         closes = [bar["close"] for bar in c]
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(closes, color="black", label="close")
+        x_main = list(range(len(c)))
+
+        # lookahead: future candles after BOS (oldest→newest)
+        c_ahead: List[Dict] = []
+        if lookahead_candles and self.dev_mode:
+            c_ahead = list(reversed(lookahead_candles))
+        closes_ahead = [bar["close"] for bar in c_ahead]
+        x_ahead = list(range(len(c), len(c) + len(c_ahead)))
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(x_main, closes, color="black", linewidth=1, label="close")
+        if closes_ahead:
+            ax.plot(x_ahead, closes_ahead, color="gray", linewidth=1,
+                    linestyle="--", label="next 10 candles")
+
         broken = ev.get("broken_level")
         if broken is not None:
-            ax.hlines(broken, 0, len(closes) - 1, colors="red", linestyles="--", label="broken level")
-        # mark the BOS candle (last in window)
-        ax.axvline(x=len(closes) - 1, color="orange", linewidth=1.5, label="BOS candle")
+            total_x = len(c) + len(c_ahead) - 1
+            ax.hlines(broken, 0, total_x, colors="red", linestyles="--",
+                      linewidth=0.8, label="broken level")
+
+        # BOS candle marker
+        ax.axvline(x=len(c) - 1, color="orange", linewidth=1.5, label="BOS")
+
         direction = (ev.get("direction") or "").upper()
-        ax.set_title(f"{ev.get('symbol')} {ev.get('timeframe')} BOS {direction}")
-        ax.legend(fontsize=8)
-        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        mode_tag = " [DEV]" if self.dev_mode and c_ahead else ""
+        ax.set_title(
+            f"{ev.get('symbol')} {ev.get('timeframe')} BOS {direction}{mode_tag}  |  {alert_id}",
+            fontsize=9,
+        )
+        ax.legend(fontsize=7)
+        ax.tick_params(labelsize=7)
+
+        chart_path = self.charts_dir / f"{alert_id}.png"
         fig.tight_layout()
-        fig.savefig(tmp.name)
+        fig.savefig(str(chart_path), dpi=100)
         plt.close(fig)
-        return tmp.name
+        return str(chart_path)
 
     def format_alert(self, alert: Dict) -> str:
-        return f"SMC alert for {alert.get('symbol')} {alert.get('timeframe')}: {alert.get('message')}"
+        return f"[{alert.get('alert_id')}] {alert.get('message')}"
 
-    def send_alert(self, message: str) -> None:
-        # message can be str or dict with image
+    def send_alert(self, message) -> None:
         if isinstance(message, dict):
             text = message.get("message")
             img = message.get("image_path")
+            alert_id = message.get("alert_id", "")
+            caption = f"[{alert_id}]\n{text}" if alert_id else text
             if self.notifier:
                 if img:
-                    self.notifier.send_photo(img, caption=text)
+                    self.notifier.send_photo(img, caption=caption)
                 else:
-                    self.notifier.send_message(text)
+                    self.notifier.send_message(caption)
             else:
-                print(text)
+                print(caption)
         else:
             if self.notifier:
                 self.notifier.send_message(message)
@@ -105,8 +169,7 @@ class AlertManager:
                 print(message)
 
     def send_fetch_error(self, symbol: str, timeframe: str, error_message: str) -> None:
-        message = f"[trade] fetch error for {symbol} {timeframe}: {error_message}"
-        self.send_alert(message)
+        self.send_alert(f"[trade] fetch error for {symbol} {timeframe}: {error_message}")
 
     def send_test_alert(self) -> None:
         self.send_alert("[trade] test alert: Telegram notifications are configured and working.")

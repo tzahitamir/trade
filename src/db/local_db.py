@@ -20,7 +20,6 @@ class LocalDB:
     def _init_schema(self, conn=None) -> None:
         is_local = False
         if conn is None:
-            # Use a temporary connection for schema initialization to avoid thread-local issues during setup
             conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             is_local = True
         conn.execute(
@@ -39,11 +38,11 @@ class LocalDB:
             )
             """
         )
-        # SMC alerts table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS smc_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id TEXT,
                 symbol TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
                 ts INTEGER NOT NULL,
@@ -55,7 +54,13 @@ class LocalDB:
                 feedback TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+            """
+        )
+        # migrate: add alert_id column to existing DBs that predate this schema
+        try:
+            conn.execute("ALTER TABLE smc_alerts ADD COLUMN alert_id TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
         if is_local:
             conn.close()
@@ -141,14 +146,14 @@ class LocalDB:
             self._local.conn = conn
         return conn
 
-    def insert_alert(self, symbol: str, timeframe: str, ts: int, type_: str, reason: str = None, image_path: str = None, params: str = None) -> int:
+    def insert_alert(self, symbol: str, timeframe: str, ts: int, type_: str, reason: str = None, image_path: str = None, params: str = None, alert_id: str = None) -> int:
         query = """
-            INSERT INTO smc_alerts (symbol, timeframe, ts, type, reason, image_path, params, sent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO smc_alerts (alert_id, symbol, timeframe, ts, type, reason, image_path, params, sent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
         """
         with self._lock:
             conn = self._get_conn()
-            cursor = conn.execute(query, (symbol, timeframe, ts, type_, reason, image_path, params))
+            cursor = conn.execute(query, (alert_id, symbol, timeframe, ts, type_, reason, image_path, params))
             conn.commit()
             return cursor.lastrowid
 

@@ -15,7 +15,7 @@ from alerts.alert_manager import AlertManager
 from alerts.log_monitor import LogMonitor
 
 FETCH_CHECK_SECOND = 10
-INITIAL_LOOKBACK_HOURS = 48
+INITIAL_LOOKBACK_HOURS = 720  # 30 days
 TIMEFRAME_INTERVAL_MINUTES = {
     "5m": 5,
     "5min": 5,
@@ -171,21 +171,27 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
 
 def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager) -> None:
     """
-    CLI mode: scans 15m historical data for all BOS events in the last 48 hours.
-    Requires a preceding liquidity sweep (SSL/BSL grab) to validate each BOS.
-    Prints a per-pair count summary. Telegram is disabled in this mode.
+    CLI dev mode: scans 15m historical data for BOS events in the last 48h.
+    Each unique BOS (first candle that breaks the swing, with a preceding liquidity sweep)
+    gets a chart saved to disk and sent via Telegram. In dev_mode the chart also shows
+    the next 10 candles after the BOS so the outcome is visible.
+    Prints a per-pair count summary at the end.
     """
     from datetime import timedelta
     timeframe = "15m"
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(hours=48)).timestamp())
+    dev_mode = getattr(settings, "dev_mode", True)
 
-    logging.info("Scanning 15m BOS (last 48h, liquidity sweep required) — Telegram OFF")
+    logging.info(
+        "Scanning 15m BOS (last 48h, liquidity sweep required, dev_mode=%s)",
+        dev_mode,
+    )
     logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
 
     pair_counts: dict = {}
 
     for symbol in settings.fx_pairs:
-        candles_desc = db.query_recent(symbol, timeframe, limit=1000)
+        candles_desc = db.query_recent(symbol, timeframe, limit=5000)
         if not candles_desc:
             logging.info("No %s data for %s, skipping", timeframe, symbol)
             pair_counts[symbol] = 0
@@ -193,39 +199,44 @@ def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
 
         n = len(candles_desc)
         count = 0
-        # Track seen (direction, level) pairs so each BOS fires only once —
-        # the first candle that breaks the swing, not every subsequent candle above it.
         seen_levels: set = set()
 
         for k in range(50, n):
-            # window[0] is the BOS candidate candle (newest-first)
+            # candles_desc[n-1-k] is the BOS candidate candle (newest-first array)
             bos_ts = candles_desc[n - 1 - k]["timestamp"]
             if bos_ts < cutoff_ts:
                 continue
 
             window = candles_desc[n - 1 - k:]  # newest-first, k+1 candles
-            events = alert_manager.analyzer.detect_bos(
-                window, params={"symbol": symbol, "timeframe": timeframe}
-            )
 
-            for ev in events:
+            # lookahead: up to 10 candles that are chronologically after the BOS candle
+            # In the newest-first array these sit at lower indices than the BOS candle.
+            lookahead = candles_desc[max(0, n - k - 11) : n - 1 - k] if dev_mode else None
+
+            alerts = alert_manager.evaluate(symbol, timeframe, window, lookahead_candles=lookahead)
+
+            for alert in alerts:
+                ev = alert["event"]
                 key = (ev["direction"], round(ev["broken_level"], 5))
                 if key in seen_levels:
                     continue
                 seen_levels.add(key)
                 count += 1
+
                 ts_str = datetime.fromtimestamp(ev["breakout_ts"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
                 sweep = ev.get("liquidity_sweep") or {}
-                sweep_ts_str = ""
+                sweep_str = ""
                 if sweep:
-                    sweep_ts_str = "  sweep@" + datetime.fromtimestamp(
+                    sweep_str = "  sweep@" + datetime.fromtimestamp(
                         sweep["timestamp"], tz=timezone.utc
                     ).strftime("%H:%M")
                 logging.info(
-                    "  [%s] %s BOS  level=%.5f  strength=%.2f  ts=%s%s",
-                    symbol, ev["direction"].upper(), ev["broken_level"],
-                    ev["break_strength"], ts_str, sweep_ts_str,
+                    "  [%s] %s BOS  id=%s  level=%.5f  str=%.2f  ts=%s%s",
+                    symbol, ev["direction"].upper(), alert["alert_id"],
+                    ev["broken_level"], ev["break_strength"], ts_str, sweep_str,
                 )
+
+                alert_manager.send_alert(alert)
 
         pair_counts[symbol] = count
 

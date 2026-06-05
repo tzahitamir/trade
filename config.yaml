@@ -1,7 +1,9 @@
 fx_pairs:
   - EURUSD
-  - GBPUSD
-  - USDJPY
+  - EURJPY
+  - USDCAD
+  - USDCHF
+  - NZDUSD
 
 timeframes:
   - 5m
@@ -19,3 +21,4 @@ telegram:
   chat_id: ""
 
 alert_threshold: 0.0
+dev_mode: true
