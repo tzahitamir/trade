@@ -18,7 +18,7 @@ the intention here is that when i will refernce ai engine such as clude the trig
 
 2. data layer
 
-pull data from tweleve of the last 365 days , of 5m,15m,30m,1h,4h and save to local db 
+pull data from tweleve of the last 365 days , of 5m,15m,30m,1h,4h, 1d and save to local db 
 
 
 4. smc 
@@ -78,6 +78,14 @@ the stats should not live in a file but rather be inside the db , as each run of
 add to the db the exact set of parametrs used as a version.
 later on you can try different set of parameters , to see which one had the best win rate
 
-5. loop feedback
+5. 
+
+run the same logic of #4 , but this time the ltf is 15m , the timeframe is 4h and htf is 1d. run all calculations and statistiscs , same as on the 15m. when creating the image , print on it that this is a 4h timeframe
+
+6. add another strategy to check , on a 30m timeframe look for an fvg , which is followed by a deep retrace into the fvg which eventually becomes a doji , meaning that there was a pullback into the fvg , but buy  or sell pressure agressivley pushed the price to the same direction when the fvg was formed. 
+use the same logic of plotting an image , the name of the files should start with fvg,
+create 10 set of parameters of how strong the fvg is , and what is considered a pullback which becomes a doji, then run statistcial checks to see which paremetrs gave the best results in terms of winn rate
+
+7. loop feedback
 
 this is the production phase
