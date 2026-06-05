@@ -73,6 +73,8 @@ Expected value per trade — (win_rate × 2) - (loss_rate × 1) with 1:2 R:R. Th
 
 Monthly breakdown — win rate per calendar month. If it's degrading month-over-month it means parameters are overfitted to older data.
 
+the stats should not live in a file but rather be inside the db , as each run of the script will reporduce different results , and each pair might need different adjusment to be made in terms of the best threshold that can fit the pair
+
 add to the db the exact set of parametrs used as a version.
 later on you can try different set of parameters , to see which one had the best win rate
 
