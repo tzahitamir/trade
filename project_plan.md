@@ -27,10 +27,17 @@ check that liquidity took place before the bos
 
 image should show candles , not a line
 
-during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the  next 10 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback
+during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 10 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback
 
-disable the alert on telegram  
+add multi timeframe support:
+htf is 4h
+tf is 15m
+ltf is 5m
 
+when a bos is found , the script check if the htf bias is bullish or bearish ,at the time that the bos takes place, by checking the current swing high and low of that htf, than prints on the image the result , for example 15m bullish , and htf bearish
+
+disable the alert on telegram
+  
 5. loop feedback
 
 this is the production phase
