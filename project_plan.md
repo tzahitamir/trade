@@ -62,7 +62,7 @@ add to the graph the latest swing low or high , depending on the situation , and
 
 if the trade status is still open , check what happend on a htf candles , and if evantually this trade would have been a win , and change the status to confirmed a win or loss on htf 
 add a statistics  file to the same location of the charts, that shows how many wins and losses happend
-write in the text file which trade failed , and for which conflence , and which confluence worked best for the winning trades  
+write in the text file which trade failed , on which pair, and for which conflence , and which confluence worked best for the winning trades  
 
 add to the db the exact set of parametrs used as a version.
 later on you can try different set of parameters , to see which one had the best win rate
