@@ -61,8 +61,17 @@ add an arrow that show when will you trigger the alert , and an arrow that point
 add to the graph the latest swing low or high , depending on the situation , and the recomended sl and tp , then finally run a check on the graph , if that trade would have been a success or fail
 
 if the trade status is still open , check what happend on a htf candles , and if evantually this trade would have been a win , and change the status to confirmed a win or loss on htf 
-add a statistics  file to the same location of the charts, that shows how many wins and losses happend
-write in the text file which trade failed , on which pair, and for which conflence , and which confluence worked best for the winning trades  
+add a statistics  file to the same location of the charts, that shows how many wins and losses happend 
+
+write in the text file which trade failed , on which pair, and for which conflence , and which confluence worked best for the winning trades , Win rate by hour of day ,   Win rate by break strength bucket — group str into 0.7–1.0, 1.0–1.5, 1.5–2.0, 2.0+. This tells you exactly where to set min_break_strength without guessing.
+
+Win rate by confluence count — does having 3 confluences beat 2? Does 5 beat 4? Answers whether raising the confluence requirement helps.
+
+Win rate by HTF alignment — aligned vs counter-trend. Confirms (or disproves) whether the 4H bias filter is actually useful.
+
+Expected value per trade — (win_rate × 2) - (loss_rate × 1) with 1:2 R:R. This is the single number that tells you if the system is profitable. Positive = worth running. Also shows if 1:1.5 or 1:3 R:R would be better.
+
+Monthly breakdown — win rate per calendar month. If it's degrading month-over-month it means parameters are overfitted to older data.
 
 add to the db the exact set of parametrs used as a version.
 later on you can try different set of parameters , to see which one had the best win rate
