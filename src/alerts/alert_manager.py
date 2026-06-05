@@ -102,6 +102,10 @@ class AlertManager:
         candles: newest-first. Reversed to oldest-first for plotting.
         lookahead_candles: newest-first future candles (dev mode only).
             Plotted in gray after the BOS candle to show outcome.
+
+        Annotations (dev mode):
+          - Orange arrow pointing to the BOS candle labelled "BOS"
+          - Blue arrow pointing to the liquidity sweep candle labelled "SSL" or "BSL"
         """
         N = 60
         # main window: last N candles up to and including BOS candle (oldest→newest)
@@ -128,13 +132,47 @@ class AlertManager:
             ax.hlines(broken, 0, total_x, colors="red", linestyles="--",
                       linewidth=0.8, label="broken level")
 
-        # BOS candle marker
-        ax.axvline(x=len(c) - 1, color="orange", linewidth=1.5, label="BOS")
+        # offset for arrows: 5% of the visible price range
+        all_prices = closes + closes_ahead
+        price_range = max(all_prices) - min(all_prices) or closes[-1] * 0.001
+        arrow_offset = price_range * 0.12
+        direction = ev.get("direction", "bullish")
+        # arrows point UP for bullish (annotation text sits below the candle),
+        # DOWN for bearish (annotation text sits above)
+        sign = 1 if direction == "bullish" else -1
 
-        direction = (ev.get("direction") or "").upper()
+        arrow_props = dict(arrowstyle="-|>", lw=1.2)
+
+        # BOS arrow
+        bos_x = len(c) - 1
+        bos_y = closes[-1]
+        ax.annotate(
+            "BOS",
+            xy=(bos_x, bos_y),
+            xytext=(bos_x, bos_y - sign * arrow_offset),
+            fontsize=8, fontweight="bold", color="darkorange", ha="center",
+            arrowprops={**arrow_props, "color": "darkorange"},
+        )
+
+        # Liquidity sweep arrow
+        sweep = ev.get("liquidity_sweep") or {}
+        sweep_ts = sweep.get("timestamp")
+        if sweep_ts:
+            sweep_idx = next((i for i, bar in enumerate(c) if bar["timestamp"] == sweep_ts), None)
+            if sweep_idx is not None:
+                sweep_y = c[sweep_idx]["close"]
+                sweep_label = sweep.get("type", "sweep")
+                ax.annotate(
+                    sweep_label,
+                    xy=(sweep_idx, sweep_y),
+                    xytext=(sweep_idx, sweep_y - sign * arrow_offset),
+                    fontsize=8, fontweight="bold", color="royalblue", ha="center",
+                    arrowprops={**arrow_props, "color": "royalblue"},
+                )
+
         mode_tag = " [DEV]" if self.dev_mode and c_ahead else ""
         ax.set_title(
-            f"{ev.get('symbol')} {ev.get('timeframe')} BOS {direction}{mode_tag}  |  {alert_id}",
+            f"{ev.get('symbol')} {ev.get('timeframe')} BOS {direction.upper()}{mode_tag}  |  {alert_id}",
             fontsize=9,
         )
         ax.legend(fontsize=7)
