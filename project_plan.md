@@ -63,7 +63,7 @@ add to the graph the latest swing low or high , depending on the situation , and
 if the trade status is still open , check what happend on a htf candles , and if evantually this trade would have been a win , and change the status to confirmed a win or loss on htf 
 add a statistics  file to the same location of the charts, that shows how many wins and losses happend 
 
-write in the text file which trade failed , on which pair, and for which conflence , and which confluence worked best for the winning trades , Win rate by hour of day ,   Win rate by break strength bucket — group str into 0.7–1.0, 1.0–1.5, 1.5–2.0, 2.0+. This tells you exactly where to set min_break_strength without guessing.
+write in db  which trade failed , on which pair, and for which conflence , and which confluence worked best for the winning trades , Win rate by hour of day ,   Win rate by break strength bucket — group str into 0.7–1.0, 1.0–1.5, 1.5–2.0, 2.0+. This tells you exactly where to set min_break_strength without guessing.
 
 Win rate by confluence count — does having 3 confluences beat 2? Does 5 beat 4? Answers whether raising the confluence requirement helps.
 
