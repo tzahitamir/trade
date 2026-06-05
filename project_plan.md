@@ -4,7 +4,7 @@
 
 FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd
 
-download 30 days past data if not present
+download 30 days past data for the pairs if not present
 
 the app will run as a script , on past data and look for patterns,
 when a pattern appears , it will trigger an action , such as send to telegram
