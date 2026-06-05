@@ -1,0 +1,20 @@
+/home/tzahi/repo/trade file structure snapshot:
+
+.env
+.git/
+.gitignore
+.venv/
+PROJECT_CONTEXT.md
+README.md
+config.yaml
+data/
+logs/
+requirements.txt
+scripts/
+secrets/
+src/
+
+Important notes:
+- `scripts/` contains helper scripts such as `test_db_threads.py`.
+- `secrets/` contains credential files and is not copied into this summary.
+- `src/` contains the application modules for config, data fetchers, alerts, and DB access.
