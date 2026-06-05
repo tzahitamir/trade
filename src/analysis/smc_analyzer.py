@@ -129,7 +129,9 @@ class SMCAnalyzer:
         min_break_distance_param = params.get("min_break_distance")
         min_break_distance_atr_mult = params.get("min_break_distance_atr_mult", 0.3)
         min_atr_pct = params.get("min_atr_pct", 0.0003)   # ATR gate: skip if mkt too quiet
-        require_sweep = params.get("require_liquidity_sweep", True)
+        min_break_strength = params.get("min_break_strength", 0.7)  # filter weak BOS signals
+        min_swing_age = params.get("min_swing_age_candles", 5)  # swing must be this many candles old
+        require_sweep = params.get("require_liquidity_sweep", False)
         sweep_lookback = params.get("sweep_lookback", 30)
         sweep_level_lookback = params.get("sweep_level_lookback", 10)
 
@@ -165,6 +167,9 @@ class SMCAnalyzer:
 
         # --- Bullish BOS: close(s) above swing_high + threshold ---
         sh = swings.get("swing_high")
+        sh_idx = swings.get("swing_high_idx")
+        if sh_idx is not None and (len(c) - 1 - sh_idx) < min_swing_age:
+            sh = None  # swing too recent to be valid structure
         if sh is not None:
             threshold = sh + min_break_distance
             ok = True
@@ -173,11 +178,9 @@ class SMCAnalyzer:
                     ok = False
                     break
 
+            sweep = self._has_preceding_sweep(c, "bullish", sweep_lookback, sweep_level_lookback)
             if ok and require_sweep:
-                sweep = self._has_preceding_sweep(c, "bullish", sweep_lookback, sweep_level_lookback)
                 ok = sweep is not None
-            else:
-                sweep = None
 
             if ok:
                 follow = sum(
@@ -185,6 +188,9 @@ class SMCAnalyzer:
                     if len(c) - 1 - j >= 0 and c[-1]["close"] < c[-1 - j]["close"]
                 )
                 break_strength = (c[-1]["close"] - sh) / atr * (1 + follow / 5) if atr > 0 else 0.0
+                if break_strength < min_break_strength:
+                    ok = False
+            if ok:
                 events.append({
                     "symbol": params.get("symbol"),
                     "timeframe": params.get("timeframe"),
@@ -193,6 +199,7 @@ class SMCAnalyzer:
                     "breakout_ts": last["timestamp"],
                     "break_strength": break_strength,
                     "liquidity_sweep": sweep,
+                    "swing_age_candles": len(c) - 1 - sh_idx,
                     "params_used": {
                         "swing_lookback": swing_lookback,
                         "min_break_distance": min_break_distance,
@@ -204,6 +211,9 @@ class SMCAnalyzer:
 
         # --- Bearish BOS: close(s) below swing_low - threshold ---
         sl = swings.get("swing_low")
+        sl_idx = swings.get("swing_low_idx")
+        if sl_idx is not None and (len(c) - 1 - sl_idx) < min_swing_age:
+            sl = None  # swing too recent to be valid structure
         if sl is not None:
             threshold = sl - min_break_distance
             ok = True
@@ -212,11 +222,9 @@ class SMCAnalyzer:
                     ok = False
                     break
 
+            sweep = self._has_preceding_sweep(c, "bearish", sweep_lookback, sweep_level_lookback)
             if ok and require_sweep:
-                sweep = self._has_preceding_sweep(c, "bearish", sweep_lookback, sweep_level_lookback)
                 ok = sweep is not None
-            else:
-                sweep = None
 
             if ok:
                 follow = sum(
@@ -224,6 +232,9 @@ class SMCAnalyzer:
                     if len(c) - 1 - j >= 0 and c[-1]["close"] > c[-1 - j]["close"]
                 )
                 break_strength = (sl - c[-1]["close"]) / atr * (1 + follow / 5) if atr > 0 else 0.0
+                if break_strength < min_break_strength:
+                    ok = False
+            if ok:
                 events.append({
                     "symbol": params.get("symbol"),
                     "timeframe": params.get("timeframe"),
@@ -232,6 +243,7 @@ class SMCAnalyzer:
                     "breakout_ts": last["timestamp"],
                     "break_strength": break_strength,
                     "liquidity_sweep": sweep,
+                    "swing_age_candles": len(c) - 1 - sl_idx,
                     "params_used": {
                         "swing_lookback": swing_lookback,
                         "min_break_distance": min_break_distance,

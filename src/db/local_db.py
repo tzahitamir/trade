@@ -56,11 +56,66 @@ class LocalDB:
             )
             """
         )
-        # migrate: add alert_id column to existing DBs that predate this schema
-        try:
-            conn.execute("ALTER TABLE smc_alerts ADD COLUMN alert_id TEXT")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS param_sets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                params_hash TEXT NOT NULL UNIQUE,
+                params TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_run_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                breakout_ts INTEGER NOT NULL,
+                alert_id TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                broken_level REAL NOT NULL,
+                break_strength REAL NOT NULL,
+                htf_bias TEXT,
+                confluences TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                hour INTEGER NOT NULL,
+                month TEXT NOT NULL,
+                has_liquidity_sweep INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(scan_run_id, alert_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                param_set_id INTEGER NOT NULL,
+                scan_date INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                total_signals INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                losses INTEGER NOT NULL DEFAULT 0,
+                open_trades INTEGER NOT NULL DEFAULT 0,
+                stats_json TEXT NOT NULL,
+                FOREIGN KEY (param_set_id) REFERENCES param_sets(id)
+            )
+            """
+        )
+        # migrate: add columns to existing DBs that predate this schema
+        for col_sql in [
+            "ALTER TABLE smc_alerts ADD COLUMN alert_id TEXT",
+            "ALTER TABLE smc_alerts ADD COLUMN param_set_id INTEGER",
+            "ALTER TABLE raw_signals ADD COLUMN swing_age_candles INTEGER",
+            "ALTER TABLE raw_signals ADD COLUMN session TEXT",
+            "ALTER TABLE raw_signals ADD COLUMN dow INTEGER",
+        ]:
+            try:
+                conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
         if is_local:
             conn.close()
@@ -127,6 +182,39 @@ class LocalDB:
             row = cursor.fetchone()
         return row[0] if row else None
 
+    def get_earliest_timestamp(self, symbol: str, timeframe: str) -> Optional[int]:
+        query = """
+            SELECT timestamp
+            FROM fx_candles
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY timestamp ASC
+            LIMIT 1
+        """
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute(query, (symbol, timeframe))
+            row = cursor.fetchone()
+        return row[0] if row else None
+
+    def get_or_create_param_set(self, params: dict) -> int:
+        """Return the ID of this parameter set, inserting it if it doesn't exist yet."""
+        import json, hashlib, time as _time
+        params_json = json.dumps(params, sort_keys=True)
+        params_hash = hashlib.sha256(params_json.encode()).hexdigest()[:16]
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT id FROM param_sets WHERE params_hash = ?", (params_hash,)
+            ).fetchone()
+            if row:
+                return row[0]
+            cursor = conn.execute(
+                "INSERT INTO param_sets (created_at, params_hash, params) VALUES (?, ?, ?)",
+                (int(_time.time()), params_hash, params_json),
+            )
+            conn.commit()
+            return cursor.lastrowid
+
     def close(self) -> None:
         # close thread-local connection if exists
         with self._lock:
@@ -146,14 +234,66 @@ class LocalDB:
             self._local.conn = conn
         return conn
 
-    def insert_alert(self, symbol: str, timeframe: str, ts: int, type_: str, reason: str = None, image_path: str = None, params: str = None, alert_id: str = None) -> int:
+    def insert_alert(self, symbol: str, timeframe: str, ts: int, type_: str, reason: str = None, image_path: str = None, params: str = None, alert_id: str = None, param_set_id: int = None) -> int:
         query = """
-            INSERT INTO smc_alerts (alert_id, symbol, timeframe, ts, type, reason, image_path, params, sent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO smc_alerts (alert_id, symbol, timeframe, ts, type, reason, image_path, params, param_set_id, sent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         """
         with self._lock:
             conn = self._get_conn()
-            cursor = conn.execute(query, (alert_id, symbol, timeframe, ts, type_, reason, image_path, params))
+            cursor = conn.execute(query, (alert_id, symbol, timeframe, ts, type_, reason, image_path, params, param_set_id))
+            conn.commit()
+            return cursor.lastrowid
+
+    def insert_raw_signals(self, scan_run_id: int, signals: list) -> None:
+        query = """
+            INSERT OR IGNORE INTO raw_signals
+            (scan_run_id, symbol, timeframe, breakout_ts, alert_id, direction,
+             broken_level, break_strength, htf_bias, confluences, outcome,
+             hour, month, has_liquidity_sweep, swing_age_candles, session, dow)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        rows = [
+            (scan_run_id, r["symbol"], r["timeframe"], r["breakout_ts"], r["alert_id"],
+             r["direction"], r["broken_level"], r["break_strength"], r.get("htf_bias"),
+             r["confluences"], r["outcome"], r["hour"], r["month"],
+             r.get("has_liquidity_sweep", 0), r.get("swing_age_candles"),
+             r.get("session"), r.get("dow"))
+            for r in signals
+        ]
+        with self._lock:
+            conn = self._get_conn()
+            conn.executemany(query, rows)
+            conn.commit()
+
+    def get_latest_raw_signals(self) -> tuple:
+        """Return (scan_run_id, list-of-dicts) for the most recent scan run."""
+        cols = ["id", "scan_run_id", "symbol", "timeframe", "breakout_ts", "alert_id",
+                "direction", "broken_level", "break_strength", "htf_bias", "confluences",
+                "outcome", "hour", "month", "has_liquidity_sweep",
+                "swing_age_candles", "session", "dow"]
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute("SELECT MAX(scan_run_id) FROM raw_signals").fetchone()
+            if not row or row[0] is None:
+                return None, []
+            scan_run_id = row[0]
+            rows = conn.execute(
+                "SELECT " + ", ".join(cols) + " FROM raw_signals WHERE scan_run_id=?",
+                (scan_run_id,)
+            ).fetchall()
+        return scan_run_id, [dict(zip(cols, r)) for r in rows]
+
+    def insert_scan_stats(self, param_set_id: int, symbol: str, total: int, wins: int, losses: int, open_count: int, stats_json: str) -> int:
+        import time as _time
+        query = """
+            INSERT INTO scan_stats
+            (param_set_id, scan_date, symbol, total_signals, wins, losses, open_trades, stats_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute(query, (param_set_id, int(_time.time()), symbol, total, wins, losses, open_count, stats_json))
             conn.commit()
             return cursor.lastrowid
 

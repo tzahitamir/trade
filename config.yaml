@@ -4,6 +4,9 @@ fx_pairs:
   - USDCAD
   - USDCHF
   - NZDUSD
+  - GBPJPY
+  - EURGBP
+  - USDJPY
 
 timeframes:
   - 5m

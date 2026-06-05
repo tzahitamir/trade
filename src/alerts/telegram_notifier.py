@@ -1,7 +1,11 @@
 import logging
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import requests
+
+_ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
 
 class TelegramNotifier:
@@ -13,9 +17,18 @@ class TelegramNotifier:
     def is_configured(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
+    @staticmethod
+    def _is_quiet_time() -> bool:
+        """True if current Israel time is between 23:00 and 07:00 (no alerts)."""
+        hour = datetime.now(tz=_ISRAEL_TZ).hour
+        return hour >= 23 or hour < 7
+
     def send_message(self, message: str) -> bool:
         if not self.is_configured():
             logging.warning("Telegram notifier is not configured.")
+            return False
+        if self._is_quiet_time():
+            logging.info("Telegram quiet time (23:00–07:00 IL) — message suppressed")
             return False
 
         payload = {
@@ -40,6 +53,9 @@ class TelegramNotifier:
     def send_photo(self, image_path: str, caption: str = "") -> bool:
         if not self.is_configured():
             logging.warning("Telegram notifier is not configured.")
+            return False
+        if self._is_quiet_time():
+            logging.info("Telegram quiet time (23:00–07:00 IL) — photo suppressed")
             return False
 
         endpoint = f"https://api.telegram.org/bot{self.bot_token}/sendPhoto"
