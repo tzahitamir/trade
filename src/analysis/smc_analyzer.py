@@ -127,7 +127,7 @@ class SMCAnalyzer:
         min_break_candles = params.get("min_break_candles", 1)
         confirmation_candles = params.get("confirmation_candles", 1)
         min_break_distance_param = params.get("min_break_distance")
-        min_break_distance_atr_mult = params.get("min_break_distance_atr_mult", 1.0)
+        min_break_distance_atr_mult = params.get("min_break_distance_atr_mult", 0.3)
         min_atr_pct = params.get("min_atr_pct", 0.0003)   # ATR gate: skip if mkt too quiet
         require_sweep = params.get("require_liquidity_sweep", True)
         sweep_lookback = params.get("sweep_lookback", 30)
@@ -141,8 +141,16 @@ class SMCAnalyzer:
         last = c[-1]
         price = last["close"]
 
-        # --- ATR gate: skip signals in dead/overnight markets ---
-        if atr < min_atr_pct * price:
+        # --- Activity gate: use the current candle's true range, not the lagging ATR.
+        # The 14-period ATR is slow to respond when the market transitions from quiet
+        # overnight to an active session, causing the gate to block valid early breaks.
+        prev_close = c[-2]["close"] if len(c) >= 2 else last["close"]
+        last_tr = max(
+            last["high"] - last["low"],
+            abs(last["high"] - prev_close),
+            abs(last["low"] - prev_close),
+        )
+        if last_tr < min_atr_pct * price:
             return []
 
         swings = self._find_last_swing(candles, lookback=3, search_back=swing_lookback)
@@ -151,7 +159,8 @@ class SMCAnalyzer:
         if min_break_distance_param is not None:
             min_break_distance = min_break_distance_param
         else:
-            # require a full ATR-sized break above the swing — kills marginal noise breaks
+            # 0.3 × ATR: screens out micro-noise breaks; the activity gate above
+            # already handles the dead-market case so this can stay small
             min_break_distance = min_break_distance_atr_mult * atr
 
         # --- Bullish BOS: close(s) above swing_high + threshold ---
