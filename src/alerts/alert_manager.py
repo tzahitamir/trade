@@ -8,8 +8,8 @@ from db.local_db import LocalDB
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import json
-from typing import Any
 
 
 class AlertManager:
@@ -89,6 +89,28 @@ class AlertManager:
             sweep_info = f" | sweep@{sweep_ts}"
         return f"SMC BOS {direction.upper()} @ {lvl:.5f} (str={strength:.2f}){sweep_info}"
 
+    @staticmethod
+    def _draw_candles(
+        ax,
+        bars: List[Dict],
+        x_offset: int = 0,
+        alpha: float = 1.0,
+    ) -> None:
+        """Draw OHLC candlesticks on ax starting at x_offset."""
+        for i, bar in enumerate(bars):
+            x = x_offset + i
+            o, h, l, c = bar["open"], bar["high"], bar["low"], bar["close"]
+            color = "#26a69a" if c >= o else "#ef5350"  # teal up / red down
+            body_bottom = min(o, c)
+            body_height = abs(c - o) or abs(h - l) * 0.05
+            ax.add_patch(
+                mpatches.Rectangle(
+                    (x - 0.35, body_bottom), 0.7, body_height,
+                    color=color, alpha=alpha, zorder=2,
+                )
+            )
+            ax.plot([x, x], [l, h], color=color, linewidth=0.8, alpha=alpha, zorder=1)
+
     def _render_bos_chart(
         self,
         candles: List[Dict],
@@ -97,85 +119,92 @@ class AlertManager:
         lookahead_candles: Optional[List[Dict]] = None,
     ) -> str:
         """
-        Render BOS chart and save to data/charts/{alert_id}.png.
+        Render BOS candlestick chart and save to data/charts/{alert_id}.png.
 
         candles: newest-first. Reversed to oldest-first for plotting.
-        lookahead_candles: newest-first future candles (dev mode only).
-            Plotted in gray after the BOS candle to show outcome.
+        lookahead_candles: newest-first future candles (dev mode only),
+            drawn muted after the BOS candle to show outcome.
 
-        Annotations (dev mode):
-          - Orange arrow pointing to the BOS candle labelled "BOS"
-          - Blue arrow pointing to the liquidity sweep candle labelled "SSL" or "BSL"
+        Annotations:
+          - Orange arrow → BOS candle, labelled "BOS"
+          - Blue arrow → liquidity sweep candle, labelled "SSL" or "BSL"
         """
         N = 60
-        # main window: last N candles up to and including BOS candle (oldest→newest)
-        c = list(reversed(candles))[-N:]
-        closes = [bar["close"] for bar in c]
-        x_main = list(range(len(c)))
+        c = list(reversed(candles))[-N:]          # oldest → newest, up to BOS
 
-        # lookahead: future candles after BOS (oldest→newest)
         c_ahead: List[Dict] = []
         if lookahead_candles and self.dev_mode:
-            c_ahead = list(reversed(lookahead_candles))
-        closes_ahead = [bar["close"] for bar in c_ahead]
-        x_ahead = list(range(len(c), len(c) + len(c_ahead)))
+            c_ahead = list(reversed(lookahead_candles))   # oldest → newest
 
         fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(x_main, closes, color="black", linewidth=1, label="close")
-        if closes_ahead:
-            ax.plot(x_ahead, closes_ahead, color="gray", linewidth=1,
-                    linestyle="--", label="next 10 candles")
+        self._draw_candles(ax, c, x_offset=0, alpha=1.0)
+        if c_ahead:
+            self._draw_candles(ax, c_ahead, x_offset=len(c), alpha=0.45)
 
+        # scale axes manually (add_patch doesn't auto-scale)
+        all_bars = c + c_ahead
+        ax.set_xlim(-1, len(all_bars))
+        all_lows  = [b["low"]  for b in all_bars]
+        all_highs = [b["high"] for b in all_bars]
+        pad = (max(all_highs) - min(all_lows)) * 0.08
+        ax.set_ylim(min(all_lows) - pad, max(all_highs) + pad)
+
+        # broken level line
         broken = ev.get("broken_level")
         if broken is not None:
-            total_x = len(c) + len(c_ahead) - 1
-            ax.hlines(broken, 0, total_x, colors="red", linestyles="--",
-                      linewidth=0.8, label="broken level")
+            ax.hlines(broken, 0, len(all_bars) - 1, colors="red",
+                      linestyles="--", linewidth=0.8, label="broken level", zorder=3)
 
-        # offset for arrows: 5% of the visible price range
-        all_prices = closes + closes_ahead
-        price_range = max(all_prices) - min(all_prices) or closes[-1] * 0.001
-        arrow_offset = price_range * 0.12
+        # arrow offset: 15% of visible range
+        price_range = max(all_highs) - min(all_lows) or all_highs[0] * 0.001
+        arrow_offset = price_range * 0.15
         direction = ev.get("direction", "bullish")
-        # arrows point UP for bullish (annotation text sits below the candle),
-        # DOWN for bearish (annotation text sits above)
-        sign = 1 if direction == "bullish" else -1
+        bullish = direction == "bullish"
+        arrow_props = dict(arrowstyle="-|>", lw=1.3)
 
-        arrow_props = dict(arrowstyle="-|>", lw=1.2)
-
-        # BOS arrow
+        # BOS arrow — points at the wick extreme of the BOS candle
         bos_x = len(c) - 1
-        bos_y = closes[-1]
+        bos_tip_y  = c[-1]["low"]  if bullish else c[-1]["high"]
+        bos_text_y = bos_tip_y - arrow_offset if bullish else bos_tip_y + arrow_offset
         ax.annotate(
             "BOS",
-            xy=(bos_x, bos_y),
-            xytext=(bos_x, bos_y - sign * arrow_offset),
-            fontsize=8, fontweight="bold", color="darkorange", ha="center",
+            xy=(bos_x, bos_tip_y),
+            xytext=(bos_x, bos_text_y),
+            fontsize=8, fontweight="bold", color="darkorange", ha="center", zorder=5,
             arrowprops={**arrow_props, "color": "darkorange"},
         )
 
-        # Liquidity sweep arrow
+        # Sweep arrow — points at the wick that swept liquidity
         sweep = ev.get("liquidity_sweep") or {}
         sweep_ts = sweep.get("timestamp")
         if sweep_ts:
             sweep_idx = next((i for i, bar in enumerate(c) if bar["timestamp"] == sweep_ts), None)
             if sweep_idx is not None:
-                sweep_y = c[sweep_idx]["close"]
-                sweep_label = sweep.get("type", "sweep")
+                # SSL grab wicks LOW; BSL grab wicks HIGH
+                sweep_tip_y  = c[sweep_idx]["low"]  if bullish else c[sweep_idx]["high"]
+                sweep_text_y = sweep_tip_y - arrow_offset if bullish else sweep_tip_y + arrow_offset
                 ax.annotate(
-                    sweep_label,
-                    xy=(sweep_idx, sweep_y),
-                    xytext=(sweep_idx, sweep_y - sign * arrow_offset),
-                    fontsize=8, fontweight="bold", color="royalblue", ha="center",
+                    sweep.get("type", "sweep"),
+                    xy=(sweep_idx, sweep_tip_y),
+                    xytext=(sweep_idx, sweep_text_y),
+                    fontsize=8, fontweight="bold", color="royalblue", ha="center", zorder=5,
                     arrowprops={**arrow_props, "color": "royalblue"},
                 )
+
+        # legend patches
+        legend_items = [
+            mpatches.Patch(color="#26a69a", label="bullish candle"),
+            mpatches.Patch(color="#ef5350", label="bearish candle"),
+        ]
+        if c_ahead:
+            legend_items.append(mpatches.Patch(color="gray", alpha=0.45, label="next 10 candles"))
+        ax.legend(handles=legend_items, fontsize=7, loc="upper left")
 
         mode_tag = " [DEV]" if self.dev_mode and c_ahead else ""
         ax.set_title(
             f"{ev.get('symbol')} {ev.get('timeframe')} BOS {direction.upper()}{mode_tag}  |  {alert_id}",
             fontsize=9,
         )
-        ax.legend(fontsize=7)
         ax.tick_params(labelsize=7)
 
         chart_path = self.charts_dir / f"{alert_id}.png"
