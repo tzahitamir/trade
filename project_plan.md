@@ -85,7 +85,7 @@ later on you can try different set of parameters , to see which one had the best
 
 5. 
 
-run the same logic of #4 , but this time the ltf is 15m , the timeframe is 4h and htf is 1d. run all calculations and statistiscs , same as on the 15m. when creating the image , print on it that this is a 4h timeframe
+run the same logic of #4 , have 2 years of data availble (download more data if needed, and allow fetch of additional  data only if fresh data was not downloaded at least 24 hours ), create a dedicated set of params for 4h, and run a regression to check the best set of parameters that yields best win rate, but this time the ltf is 15m , the timeframe is 4h and htf is 1d. run all calculations and statistiscs , same as on the 15m. when creating the image , print on it that this is a 4h timeframe
 
 6. add another strategy to check , on a 30m timeframe look for an fvg , which is followed by a deep retrace into the fvg which eventually becomes a doji , meaning that there was a pullback into the fvg , but buy  or sell pressure agressivley pushed the price to the same direction when the fvg was formed. 
 use the same logic of plotting an image , the name of the files should start with fvg,
