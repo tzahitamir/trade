@@ -11,8 +11,9 @@ when a pattern appears , it will trigger an action , such as send to telegram
 the action will have an id number that will be stored in db for future use.
 the name of the id will be as follows:
 
-strategy-mm-hh-day-month-year-fxpairname
-strategy could be smc or fvg for example , and the date reffer to the time that the trigger happend during the trade (not the time when the script run )
+strategy-mm-hh-day-month-year-fxpairname-win/loss
+
+strategy could be smc or fvg for example , and the date reffer to the time that the trigger happend during the trade (not the time when the script run ) , also the image should include the price at which to buy or sell (this is probablly when the trigger was fired?), the tp ,sl and R ratio and expected win rate based on gold params
 
 the image will be saved to local  disk as the name of the id
 
@@ -38,7 +39,7 @@ htf is 4h
 tf is 15m
 ltf is 5m 
 
-when a bos is found , the script check if the htf bias is bullish or bearish ,at the time that the bos takes place, by checking the current swing high and low of that htf, than prints on the image the result , for example 15m bullish , and htf bearish
+when a bos is found , the script check if the htf bias is bullish or bearish ,at the time that the bos takes place, by checking the current swing high and low of that htf, than prints on the image the result , for example 15m bullish , and htf bearish, the image will include a label of the exact time of trigger point , meaning when this alert would have been sent
 
 
 define quiet time , when telegram will not send an alert , between 23:00 and 07:00 israel time , but the script will still fetch data
@@ -106,7 +107,41 @@ when the app run as script in dev mode such as when running stats etc. if you ar
 the app runs in production as a service and send alerts based on the chosen best set of parameters, i will instruct when to run in production mode.
 the app should be able to run in production mode and dev mode in parallell on the same node, meaning that the dev and prod process should be ready to co exist on the same node
 
+
+11. SL mode sweep — early trade invalidation
+
+Current SL is placed at the prior swing low/high (+ 0.3 ATR buffer). This often
+produces wide risk, limiting the R ratio. Add sl_mode as a swept parameter so the
+best invalidation logic can be found per (strategy, pair).
+
+Three modes to test:
+
+  swing         — current behaviour: SL at previous swing low (bull) / high (bear)
+  broken_level  — SL just below the broken swing level itself (bull: level - 0.3 ATR).
+                  Rationale: if price closes back through the level it just broke, the
+                  BOS is invalidated and institutional interest is absent.
+  break_candle  — SL at the low of the break candle (bull) / high (break candle) (bear).
+                  Rationale: if price wicks back past the candle that caused the break,
+                  the impulse was not genuine.
+
+Implementation notes:
+- sl_mode is added to PARAM_SWEEP_SETS alongside existing filters
+- evaluate_bos_outcome receives sl_mode and computes SL accordingly
+- WR will drop with tighter modes — EV is the correct comparison metric
+- Gold params already store EV per (strategy, pair) so the winner is auto-selected
+- Must be evaluated per pair and per timeframe (4h BOS will have different optimal
+  sl_mode than 15m BOS due to different swing-to-level distances)
+- After sweep, log the average risk reduction % vs swing mode alongside EV delta
+  so the tradeoff is visible
+
+
 100. future features - ignore that section for now
 
 #params
+trade duration
+target price 
+trade invalidation
+add a strategy of liquidation, going from one liquidity pool to the other
+
+
 
