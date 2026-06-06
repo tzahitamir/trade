@@ -18,6 +18,7 @@ strategy could be smc or fvg for example , and the date reffer to the time that 
 the image will be saved to local  disk as the name of the id
 
 the intention here is that when i will refernce ai engine such as clude the trigger id number , it will fetch the data from the db , and can help to fine tune the definition of a certain parameter such as bos
+for 4h , download data of 2 years 
 
 2. data layer 
 
@@ -100,7 +101,7 @@ this is for discussion on the next run
 8. dev mode alerts
 when the app run as script in dev mode such as when running stats etc. if you are waiting for my response or the script completed and there are new reults availble , and i did not respond or took any action 5 minutes , send me a telegram, saying "Trade dev script needs your attention". quite period for sending telegram is between 23:00 and 07:00
 
-10. after a scan is done , the statistics should be evauated and presented to me, for each of the pairs and timeframes, and strategies, than a set of paramas should be chosen they should be called gold paramas , it can be a diffierent set of paramas for each strategy and pair. whenever a new scan is performed either with new paramas or on a new data it should be evaluated against the latest gold params for each of the stragetgy and pair.
+10. after a scan is done , the statistics should be evauated and presented to me, for each of the pairs and timeframes, and strategies, than a set of paramas should be chosen they should be called gold paramas , it can be a diffierent set of paramas for each strategy and pair. whenever a new scan is performed either with new paramas or on a new data it should be evaluated against the latest gold params for each of the stragetgy and pair. the gold params will be stored in the db with veesion number , and the effective dat it was applied to production
 
 11. production phase
 
@@ -108,7 +109,7 @@ the app runs in production as a service and send alerts based on the chosen best
 the app should be able to run in production mode and dev mode in parallell on the same node, meaning that the dev and prod process should be ready to co exist on the same node
 
 
-11. SL mode sweep — early trade invalidation
+12. SL mode sweep — early trade invalidation
 
 Current SL is placed at the prior swing low/high (+ 0.3 ATR buffer). This often
 produces wide risk, limiting the R ratio. Add sl_mode as a swept parameter so the
@@ -134,6 +135,41 @@ Implementation notes:
 - After sweep, log the average risk reduction % vs swing mode alongside EV delta
   so the tradeoff is visible
 
+  Currently: SL = previous swing low/high (wide). TP = entry + 2×swing_risk.
+
+With invalidation: keep the same TP (same price target — it doesn't move), but exit early if price proves the trade is wrong at a closer level. The SL distance shrinks, so the same TP now represents a larger R multiple.
+
+Example:
+
+Entry: 1.1050, wide SL: 1.0950 (100 pip risk), TP: 1.1250 (200 pips = 2R)
+Tight SL at broken level: 1.0990 (60 pip risk)
+Same TP: 1.1250 is now 200/60 = 3.3R
+A loss is -1R at 60 pips instead of -1R at 100 pips
+Three invalidation levels to test:
+
+swing — current behaviour, no change
+broken_level — exit if price closes back below the broken swing level (bull) / above it (bear). Rationale: the level that flipped should now hold as support/resistance — if it doesn't, the BOS failed
+break_candle — exit if price closes below the low of the BOS break candle (bull) / above its high (bear). Tightest option — the impulse candle itself must hold
+What to measure:
+
+For each sl_mode, the sweep reports:
+
+WR — expected to drop slightly with tighter exits (some trades get stopped early that would have recovered)
+Average R on wins — increases as SL tightens (same TP, smaller risk)
+EV = WR × avg_R_win − (1−WR) × 1 — the number that tells you if the tighter exit is worth it
+Implementation touches:
+
+evaluate_bos_outcome in alert_manager.py — add sl_mode param, compute tight SL alongside wide SL, check tight SL for exit, return effective R on win
+PARAM_SWEEP_SETS in main.py — add sl_mode variants to existing sets (doubles sweep size)
+_apply_param_filter — pass sl_mode through to outcome re-evaluation (note: outcomes must be re-evaluated per sl_mode since they differ, unlike current filters which are post-hoc)
+_compute_stats — add avg_R_win and EV with variable R to output
+Per pair and per timeframe — 4h swings are wider so broken_level may be proportionally tighter than on 15m; optimal mode will differ
+
+
+80. 
+for dax - the trigger idea is slightly different from other pairs:
+each day , the intersting window is 1 hour before frankfurt open and 2.5 hour into the market open
+the rule is to start testing from 1 hour before the trade every day , and ignore anything that happend before. than look for an smc trend forming , on the 15m , and wait for the 15m to exaust to the point the 5m retrace, the idea is to catch the move from the 5m retrace up to the 50% expansion of the 15m
 
 100. future features - ignore that section for now
 
@@ -142,6 +178,9 @@ trade duration
 target price 
 trade invalidation
 add a strategy of liquidation, going from one liquidity pool to the other
+loop feedback , how to ensure strategy stll works
+check bos with 30m and 1h
+DAX
 
 
 
