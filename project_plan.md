@@ -10,13 +10,15 @@ the app will run as a script , on past data and look for patterns,
 when a pattern appears , it will trigger an action , such as send to telegram
 the action will have an id number that will be stored in db for future use.
 the name of the id will be as follows:
-mm-hh-day-month-year-fxpairname
+
+strategy-mm-hh-day-month-year-fxpairname
+strategy could be smc or fvg for example , and the date reffer to the time that the trigger happend during the trade (not the time when the script run )
 
 the image will be saved to local  disk as the name of the id
 
 the intention here is that when i will refernce ai engine such as clude the trigger id number , it will fetch the data from the db , and can help to fine tune the definition of a certain parameter such as bos
 
-2. data layer
+2. data layer 
 
 
 pull data from tweleve of the last 365 days , of 5m,15m,30m,1h,4h, 1d and save to local db  
