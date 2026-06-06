@@ -115,6 +115,8 @@ class LocalDB:
             "ALTER TABLE raw_signals ADD COLUMN fvg_size_atr REAL",
             "ALTER TABLE raw_signals ADD COLUMN retrace_depth REAL",
             "ALTER TABLE raw_signals ADD COLUMN doji_body_pct REAL",
+            "ALTER TABLE raw_signals ADD COLUMN swing_test_count INTEGER",
+            "ALTER TABLE raw_signals ADD COLUMN break_body_pct REAL",
         ]:
             try:
                 conn.execute(col_sql)
@@ -255,8 +257,9 @@ class LocalDB:
             (scan_run_id, symbol, timeframe, breakout_ts, alert_id, direction,
              broken_level, break_strength, htf_bias, confluences, outcome,
              hour, month, has_liquidity_sweep, swing_age_candles, session, dow, strategy,
-             fvg_size_atr, retrace_depth, doji_body_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             fvg_size_atr, retrace_depth, doji_body_pct,
+             swing_test_count, break_body_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         rows = [
             (scan_run_id, r["symbol"], r["timeframe"], r["breakout_ts"], r["alert_id"],
@@ -264,7 +267,8 @@ class LocalDB:
              r["confluences"], r["outcome"], r["hour"], r["month"],
              r.get("has_liquidity_sweep", 0), r.get("swing_age_candles"),
              r.get("session"), r.get("dow"), r.get("strategy", "BOS"),
-             r.get("fvg_size_atr"), r.get("retrace_depth"), r.get("doji_body_pct"))
+             r.get("fvg_size_atr"), r.get("retrace_depth"), r.get("doji_body_pct"),
+             r.get("swing_test_count"), r.get("break_body_pct"))
             for r in signals
         ]
         with self._lock:
@@ -277,7 +281,8 @@ class LocalDB:
         cols = ["id", "scan_run_id", "symbol", "timeframe", "breakout_ts", "alert_id",
                 "direction", "broken_level", "break_strength", "htf_bias", "confluences",
                 "outcome", "hour", "month", "has_liquidity_sweep",
-                "swing_age_candles", "session", "dow", "strategy"]
+                "swing_age_candles", "session", "dow", "strategy",
+                "swing_test_count", "break_body_pct"]
         with self._lock:
             conn = self._get_conn()
             if strategy:

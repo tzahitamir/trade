@@ -328,6 +328,8 @@ def _scan_one_symbol(args: tuple) -> tuple:
                     "month": bos_dt.strftime("%Y-%m"),
                     "has_liquidity_sweep": 1 if ev.get("liquidity_sweep") else 0,
                     "swing_age_candles": ev.get("swing_age_candles"),
+                    "swing_test_count": ev.get("swing_test_count"),
+                    "break_body_pct": ev.get("break_body_pct"),
                     "session": _hour_to_session(bos_dt.hour),
                     "dow": bos_dt.weekday(),
                     "strategy": strategy,
@@ -424,27 +426,39 @@ PARAM_SWEEP_SETS = [
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "exclude_pairs": ["GBPJPY"]},
     # ── Tier 6: swing age ────────────────────────────────────────────────────
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_swing_age_candles": 10},
-    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_swing_age_candles": 15},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_swing_age_candles": 20},
     # ── Tier 7: confluence count ─────────────────────────────────────────────
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_conf_count": 2},
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_conf_count": 3},
-    # ── Tier 8: combined "best guess" combos ─────────────────────────────────
+    # ── Tier 8: swing test count (level tested before break) ─────────────────
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_swing_test_count": 1},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_swing_test_count": 2},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_swing_test_count": 3},
+    # ── Tier 9: break candle body quality ────────────────────────────────────
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_break_body_pct": 0.4},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "min_break_body_pct": 0.6},
+    # ── Tier 10: combined signal-quality combos ───────────────────────────────
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "session": "active"},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "min_swing_test_count": 1},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "min_break_body_pct": 0.4},
+    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "min_swing_test_count": 1},
+    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "min_break_body_pct": 0.4},
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "session": "active", "exclude_pairs": ["GBPJPY"]},
     {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "session": "active"},
-    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "session": "active", "exclude_pairs": ["GBPJPY"]},
 ]
 
 
 def _apply_param_filter(raw_signals: list, params: dict) -> list:
-    min_str          = params.get("min_break_strength", 0.7)
-    req_brt          = params.get("require_brt_confluence", True)
-    req_sweep        = params.get("require_liquidity_sweep", False)
-    min_conf         = params.get("min_conf_count", 1)
-    htf_aligned_only = params.get("htf_aligned_only", False)
-    session_filter   = params.get("session", "all")
-    exclude_pairs    = set(params.get("exclude_pairs", []))
-    min_swing_age    = params.get("min_swing_age_candles", 5)
+    min_str            = params.get("min_break_strength", 0.7)
+    req_brt            = params.get("require_brt_confluence", True)
+    req_sweep          = params.get("require_liquidity_sweep", False)
+    min_conf           = params.get("min_conf_count", 1)
+    htf_aligned_only   = params.get("htf_aligned_only", False)
+    session_filter     = params.get("session", "all")
+    exclude_pairs      = set(params.get("exclude_pairs", []))
+    min_swing_age      = params.get("min_swing_age_candles", 5)
+    min_swing_tests    = params.get("min_swing_test_count", 0)
+    min_break_body     = params.get("min_break_body_pct", 0.0)
 
     result = []
     for r in raw_signals:
@@ -470,6 +484,12 @@ def _apply_param_filter(raw_signals: list, params: dict) -> list:
         swing_age = r.get("swing_age_candles")
         if swing_age is not None and swing_age < min_swing_age:
             continue
+        swing_tests = r.get("swing_test_count")
+        if min_swing_tests > 0 and (swing_tests is None or swing_tests < min_swing_tests):
+            continue
+        break_body = r.get("break_body_pct")
+        if min_break_body > 0 and (break_body is None or break_body < min_break_body):
+            continue
         result.append({**r, "confluences": confs})
     return result
 
@@ -494,6 +514,12 @@ def _pset_label(pset: dict) -> str:
     nc = pset.get("min_conf_count", 1)
     if nc > 1:
         parts.append(f"{nc}c")
+    st = pset.get("min_swing_test_count", 0)
+    if st > 0:
+        parts.append(f"tst{st}")
+    bb = pset.get("min_break_body_pct", 0.0)
+    if bb > 0:
+        parts.append(f"body{int(bb*100)}")
     return "+".join(parts)
 
 

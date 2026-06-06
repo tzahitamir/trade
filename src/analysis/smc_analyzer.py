@@ -191,6 +191,15 @@ class SMCAnalyzer:
                 if break_strength < min_break_strength:
                     ok = False
             if ok:
+                # Count candles between swing formation and break that touched the level
+                touch_tol = 0.3 * atr
+                sh_test_count = sum(
+                    1 for i in range(sh_idx + 1, len(c) - 1)
+                    if c[i]["high"] >= sh - touch_tol and c[i]["high"] <= sh + touch_tol * 3
+                )
+                brk = c[-1]
+                brk_rng = brk["high"] - brk["low"]
+                break_body_pct = round(abs(brk["close"] - brk["open"]) / brk_rng, 2) if brk_rng > 0 else 0.0
                 events.append({
                     "symbol": params.get("symbol"),
                     "timeframe": params.get("timeframe"),
@@ -200,6 +209,8 @@ class SMCAnalyzer:
                     "break_strength": break_strength,
                     "liquidity_sweep": sweep,
                     "swing_age_candles": len(c) - 1 - sh_idx,
+                    "swing_test_count": sh_test_count,
+                    "break_body_pct": break_body_pct,
                     "params_used": {
                         "swing_lookback": swing_lookback,
                         "min_break_distance": min_break_distance,
@@ -235,6 +246,14 @@ class SMCAnalyzer:
                 if break_strength < min_break_strength:
                     ok = False
             if ok:
+                touch_tol = 0.3 * atr
+                sl_test_count = sum(
+                    1 for i in range(sl_idx + 1, len(c) - 1)
+                    if c[i]["low"] <= sl + touch_tol and c[i]["low"] >= sl - touch_tol * 3
+                )
+                brk = c[-1]
+                brk_rng = brk["high"] - brk["low"]
+                break_body_pct = round(abs(brk["close"] - brk["open"]) / brk_rng, 2) if brk_rng > 0 else 0.0
                 events.append({
                     "symbol": params.get("symbol"),
                     "timeframe": params.get("timeframe"),
@@ -244,6 +263,8 @@ class SMCAnalyzer:
                     "break_strength": break_strength,
                     "liquidity_sweep": sweep,
                     "swing_age_candles": len(c) - 1 - sl_idx,
+                    "swing_test_count": sl_test_count,
+                    "break_body_pct": break_body_pct,
                     "params_used": {
                         "swing_lookback": swing_lookback,
                         "min_break_distance": min_break_distance,
