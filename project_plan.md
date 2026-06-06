@@ -2,7 +2,7 @@
 
 1. this is the development stage
 
-FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd , gbp/jpy , eur/gbp , usd/jpy 
+FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd , gbp/jpy , eur/gbp , usd/jpy , dax cfd (ger40)
 
 download 365 days past data for the pairs if not present
 
