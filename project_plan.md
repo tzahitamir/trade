@@ -86,7 +86,7 @@ later on you can try different set of parameters , to see which one had the best
 
 run the same logic of #4 , have 2 years of data availble (download more data if needed, and allow fetch of additional  data only if fresh data was not downloaded at least 24 hours ), create a dedicated set of params for 4h, and run a regression to check the best set of parameters that yields best win rate, but this time the ltf is 15m , the timeframe is 4h and htf is 1d. run all calculations and statistiscs , same as on the 15m. when creating the image , print on it that this is a 4h timeframe
 
-6. add another strategy to check , on a 30m timeframe look for an fvg , which is followed by a deep retrace into the fvg which eventually becomes a doji not on the same candle , the doji can appear up to 8 candles after the fvg formed , meaning that there was a pullback into the fvg , but buy  or sell pressure agressivley pushed the price to the same direction when the fvg was formed. the fvg should align with 4h htf
+6. add another strategy to check , on a 30m timeframe look for an fvg , which is followed by a deep retrace into the fvg which eventually becomes a doji not on the same candle , the doji can appear up to 8 candles after the fvg formed , meaning that there was a pullback into the fvg , but buy  or sell pressure agressivley pushed the price to the same direction when the fvg was formed. the fvg should align with 4h htf. the doji needs to invalidate the fvg, up to 8 candles mean after the fvg was formed 
 
 use the same logic of plotting an image , the name of the files should start with fvg,
 create 10 set of parameters of how strong the fvg is , and what is considered a pullback which becomes a doji, then run statistcial checks to see which paremetrs gave the best results in terms of winn rate
@@ -99,11 +99,14 @@ this is for discussion on the next run
 8. dev mode alerts
 when the app run as script in dev mode such as when running stats etc. if you are waiting for my response or the script completed and there are new reults availble , and i did not respond or took any action 5 minutes , send me a telegram, saying "Trade dev script needs your attention". quite period for sending telegram is between 23:00 and 07:00
 
-9. production phase
+10. after a scan is done , the statistics should be evauated and presented to me, for each of the pairs and timeframes, and strategies, than a set of paramas should be chosen they should be called gold paramas , it can be a diffierent set of paramas for each strategy and pair. whenever a new scan is performed either with new paramas or on a new data it should be evaluated against the latest gold params for each of the stragetgy and pair.
+
+11. production phase
 
 the app runs in production as a service and send alerts based on the chosen best set of parameters, i will instruct when to run in production mode.
 the app should be able to run in production mode and dev mode in parallell on the same node, meaning that the dev and prod process should be ready to co exist on the same node
 
-10. future features - ignore that section for now
+100. future features - ignore that section for now
 
 #params
+
