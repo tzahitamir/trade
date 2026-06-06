@@ -167,9 +167,60 @@ Per pair and per timeframe — 4h swings are wider so broken_level may be propor
 
 
 80. 
-for dax - the trigger idea is slightly different from other pairs:
-each day , the intersting window is 1 hour before frankfurt open and 2.5 hour into the market open
-the rule is to start testing from 1 hour before the trade every day , and ignore anything that happend before. than look for an smc trend forming , on the 15m , and wait for the 15m to exaust to the point the 5m retrace, the idea is to catch the move from the 5m retrace up to the 50% expansion of the 15m
+80. DAX (DE40) — Frankfurt Open Session Strategy
+
+Instrument: DE40 via CFD (data from Twelve Data, symbol DE40).
+
+Session window: 09:00–12:30 Israel time (IDT, UTC+3 in summer / IST, UTC+2 in winter). This covers 1 hour before Frankfurt open through 2.5 hours into the session. Reset daily — ignore any price action before 09:00 Israel time.
+
+Timeframes: 15m for trend and expansion range; 5m for entry signal.
+
+Setup logic (step by step):
+
+Wait for a 15m expansion to form — a 15m BOS establishes directional bias and defines the expansion leg: from the origin swing (LH for bullish / HL for bearish) to the new extreme (HH for bullish / LL for bearish).
+
+Mark the key levels:
+
+Expansion range = HH − LH (bullish) or HL − LL (bearish)
+50% level = origin + 50% × range (bullish) / origin − 50% × range (bearish)
+This 50% level is both the equilibrium line and the TP target
+Discount zone (bullish): from origin up to the 50% level — institutional interest expected here
+Premium zone (bullish): from 50% level up to HH — overextended relative to the expansion
+Wait for the 5m retrace — after the 15m expansion, price pulls back into the discount zone, approaching the origin from above.
+
+Entry signal — a 5m BOS or CHoCH in the direction of the 15m bias, forming inside the discount zone. Either pattern qualifies; both indicate the retracing trend is weakening and the original direction is resuming.
+
+Entry: on close of the 5m BOS/CHoCH candle (or open of the next).
+
+SL: just below the 5m BOS/CHoCH broken level (bullish) / just above it (bearish), plus a small ATR buffer.
+
+TP: the 50% level of the initial 15m expansion range measured from the origin.
+
+Formula: TP = origin + 0.5 × expansion_range (bullish) / TP = origin − 0.5 × range (bearish)
+This is the equilibrium line — the boundary between the discount and premium zones
+Example (bullish):
+
+15m expansion leg: LH (origin) = 20, HH = 120, range = 100 points
+50% level = TP = 20 + 50 = 70
+Discount zone: 20–70 / Premium zone: 70–120
+Price retraces from 120 back toward 20–70 range
+5m BOS or CHoCH bullish fires at level 55 → entry ~56
+SL = 51 (just below the 5m broken level)
+TP = 70
+R = (70 − 56) / (56 − 51) = 14 / 5 = 2.8R
+Parameters to sweep (future):
+
+retrace_min_pct — how deep into the discount zone price must retrace before a 5m signal qualifies (e.g., retrace must reach at least 20–40% of the expansion range from HH)
+tp_level_pct — TP as % of expansion range from origin (default 0.5; can test 0.4, 0.6)
+session_buffer_minutes — how many minutes before Frankfurt open to start watching (default 60)
+signal_type — bos, choch, or both (default both)
+Implementation notes:
+
+Scan only within the daily session window; discard any signal outside it
+15m BOS detection uses existing detect_bos logic; restrict to session-window candles only
+5m CHoCH detection: a lower high followed by a higher close (bullish) or higher low followed by a lower close (bearish), occurring inside the discount/premium zone
+Chart labels: 15m expansion leg, 50% equilibrium line, discount/premium zone shading, 5m signal candle, entry/SL/TP lines
+Statistics: same schema as BOS 15m — WR, avgR, EV, broken down by hour of day within the window and by signal type (BOS vs CHoCH)
 
 100. future features - ignore that section for now
 
