@@ -137,7 +137,7 @@ Implementation notes:
 
 100. future features - ignore that section for now
 
-#params
+params
 trade duration
 target price 
 trade invalidation
