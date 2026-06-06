@@ -111,6 +111,10 @@ class LocalDB:
             "ALTER TABLE raw_signals ADD COLUMN swing_age_candles INTEGER",
             "ALTER TABLE raw_signals ADD COLUMN session TEXT",
             "ALTER TABLE raw_signals ADD COLUMN dow INTEGER",
+            "ALTER TABLE raw_signals ADD COLUMN strategy TEXT NOT NULL DEFAULT 'BOS'",
+            "ALTER TABLE raw_signals ADD COLUMN fvg_size_atr REAL",
+            "ALTER TABLE raw_signals ADD COLUMN retrace_depth REAL",
+            "ALTER TABLE raw_signals ADD COLUMN doji_body_pct REAL",
         ]:
             try:
                 conn.execute(col_sql)
@@ -250,15 +254,17 @@ class LocalDB:
             INSERT OR IGNORE INTO raw_signals
             (scan_run_id, symbol, timeframe, breakout_ts, alert_id, direction,
              broken_level, break_strength, htf_bias, confluences, outcome,
-             hour, month, has_liquidity_sweep, swing_age_candles, session, dow)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             hour, month, has_liquidity_sweep, swing_age_candles, session, dow, strategy,
+             fvg_size_atr, retrace_depth, doji_body_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         rows = [
             (scan_run_id, r["symbol"], r["timeframe"], r["breakout_ts"], r["alert_id"],
              r["direction"], r["broken_level"], r["break_strength"], r.get("htf_bias"),
              r["confluences"], r["outcome"], r["hour"], r["month"],
              r.get("has_liquidity_sweep", 0), r.get("swing_age_candles"),
-             r.get("session"), r.get("dow"))
+             r.get("session"), r.get("dow"), r.get("strategy", "BOS"),
+             r.get("fvg_size_atr"), r.get("retrace_depth"), r.get("doji_body_pct"))
             for r in signals
         ]
         with self._lock:
@@ -266,22 +272,33 @@ class LocalDB:
             conn.executemany(query, rows)
             conn.commit()
 
-    def get_latest_raw_signals(self) -> tuple:
-        """Return (scan_run_id, list-of-dicts) for the most recent scan run."""
+    def get_latest_raw_signals(self, strategy: str = None) -> tuple:
+        """Return (scan_run_id, list-of-dicts) for the most recent scan run, optionally filtered by strategy."""
         cols = ["id", "scan_run_id", "symbol", "timeframe", "breakout_ts", "alert_id",
                 "direction", "broken_level", "break_strength", "htf_bias", "confluences",
                 "outcome", "hour", "month", "has_liquidity_sweep",
-                "swing_age_candles", "session", "dow"]
+                "swing_age_candles", "session", "dow", "strategy"]
         with self._lock:
             conn = self._get_conn()
-            row = conn.execute("SELECT MAX(scan_run_id) FROM raw_signals").fetchone()
+            if strategy:
+                row = conn.execute(
+                    "SELECT MAX(scan_run_id) FROM raw_signals WHERE strategy=?", (strategy,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT MAX(scan_run_id) FROM raw_signals").fetchone()
             if not row or row[0] is None:
                 return None, []
             scan_run_id = row[0]
-            rows = conn.execute(
-                "SELECT " + ", ".join(cols) + " FROM raw_signals WHERE scan_run_id=?",
-                (scan_run_id,)
-            ).fetchall()
+            if strategy:
+                rows = conn.execute(
+                    "SELECT " + ", ".join(cols) + " FROM raw_signals WHERE scan_run_id=? AND strategy=?",
+                    (scan_run_id, strategy)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT " + ", ".join(cols) + " FROM raw_signals WHERE scan_run_id=?",
+                    (scan_run_id,)
+                ).fetchall()
         return scan_run_id, [dict(zip(cols, r)) for r in rows]
 
     def insert_scan_stats(self, param_set_id: int, symbol: str, total: int, wins: int, losses: int, open_count: int, stats_json: str) -> int:

@@ -255,6 +255,114 @@ class SMCAnalyzer:
 
         return events
 
+    def detect_fvg_doji(self, candles: List[Dict], params: Dict = None) -> List[Dict]:
+        """
+        Detect FVG + deep retrace + doji/rejection setup.
+
+        Sequence:
+          1. A Fair Value Gap (3-candle gap) formed within fvg_lookback candles.
+          2. Price retraced >= min_retrace_pct into the FVG zone.
+          3. The current (last) candle is a doji: body <= max_doji_body_pct * range.
+          4. Doji closed in the FVG origin direction (rejection confirmed).
+
+        Returns at most one signal per call (the strongest match by retrace depth).
+        """
+        params = params or {}
+        fvg_lookback      = params.get("fvg_lookback", 20)
+        min_fvg_size_atr  = params.get("min_fvg_size_atr", 0.3)
+        min_retrace_pct   = params.get("min_retrace_pct", 0.5)
+        max_doji_body_pct = params.get("max_doji_body_pct", 0.35)
+        min_atr_pct       = params.get("min_atr_pct", 0.0003)
+
+        if not candles or len(candles) < 5:
+            return []
+
+        c   = self._chronological(candles)
+        atr = self.calculate_atr(candles) or 0.0
+        if atr == 0:
+            return []
+
+        cur  = c[-1]
+        body = abs(cur["close"] - cur["open"])
+        rng  = cur["high"] - cur["low"]
+
+        # ATR gate: skip dead-market candles
+        if rng < min_atr_pct * cur["close"]:
+            return []
+
+        # Must be a doji (small body relative to full range)
+        if rng == 0 or body / rng > max_doji_body_pct:
+            return []
+
+        # Search last fvg_lookback candles (exclude current and 1 gap) for a FVG
+        search_start = max(0, len(c) - 2 - fvg_lookback)
+        search = c[search_start : len(c) - 2]
+
+        candidates = []
+        for i in range(len(search) - 2):
+            c1, c2, c3 = search[i], search[i + 1], search[i + 2]
+
+            # --- Bullish FVG: gap above c1.high below c3.low ---
+            if c3["low"] > c1["high"]:
+                fvg_lo, fvg_hi = c1["high"], c3["low"]
+                fvg_size = fvg_hi - fvg_lo
+                if fvg_size < min_fvg_size_atr * atr:
+                    continue
+                retrace_level = fvg_hi - min_retrace_pct * fvg_size
+                if cur["low"] > retrace_level:
+                    continue  # not deep enough
+                if cur["low"] < fvg_lo - atr * 0.3:
+                    continue  # blew through — FVG invalidated
+                mid = (cur["low"] + cur["high"]) / 2
+                if cur["close"] < mid:
+                    continue  # closed weak, not a bullish rejection
+                depth = (fvg_hi - cur["low"]) / fvg_size
+                candidates.append({
+                    "symbol":        params.get("symbol"),
+                    "timeframe":     params.get("timeframe"),
+                    "direction":     "bullish",
+                    "fvg_low":       fvg_lo,
+                    "fvg_high":      fvg_hi,
+                    "fvg_ts":        c2["timestamp"],
+                    "breakout_ts":   cur["timestamp"],
+                    "fvg_size_atr":  round(fvg_size / atr, 2),
+                    "retrace_depth": round(depth, 2),
+                    "doji_body_pct": round(body / rng, 2),
+                })
+
+            # --- Bearish FVG: gap below c1.low above c3.high ---
+            if c1["low"] > c3["high"]:
+                fvg_hi, fvg_lo = c1["low"], c3["high"]
+                fvg_size = fvg_hi - fvg_lo
+                if fvg_size < min_fvg_size_atr * atr:
+                    continue
+                retrace_level = fvg_lo + min_retrace_pct * fvg_size
+                if cur["high"] < retrace_level:
+                    continue
+                if cur["high"] > fvg_hi + atr * 0.3:
+                    continue
+                mid = (cur["low"] + cur["high"]) / 2
+                if cur["close"] > mid:
+                    continue  # closed strong, not a bearish rejection
+                depth = (cur["high"] - fvg_lo) / fvg_size
+                candidates.append({
+                    "symbol":        params.get("symbol"),
+                    "timeframe":     params.get("timeframe"),
+                    "direction":     "bearish",
+                    "fvg_low":       fvg_lo,
+                    "fvg_high":      fvg_hi,
+                    "fvg_ts":        c2["timestamp"],
+                    "breakout_ts":   cur["timestamp"],
+                    "fvg_size_atr":  round(fvg_size / atr, 2),
+                    "retrace_depth": round(depth, 2),
+                    "doji_body_pct": round(body / rng, 2),
+                })
+
+        if not candidates:
+            return []
+        # Return the best match (deepest retrace = most significant rejection)
+        return [max(candidates, key=lambda x: x["retrace_depth"])]
+
     def get_htf_bias(self, candles_htf: List[Dict], bos_ts: int) -> str:
         """
         Determine the HTF (4h) directional bias at the time of a lower-TF BOS.

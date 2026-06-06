@@ -31,6 +31,8 @@ TIMEFRAME_INTERVAL_MINUTES = {
     "60min": 60,
     "4h": 240,
     "h4": 240,
+    "1d": 1440,
+    "1day": 1440,
 }
 
 
@@ -212,6 +214,12 @@ def _ensure_pair_data(symbol: str, timeframe: str, fetcher: "FXFetcher", db: Loc
         logging.warning("  → failed to fetch %s %s: %s", symbol, timeframe, exc)
 
 
+def _candle_limit(timeframe: str, days: int = 365) -> int:
+    """How many candles cover `days` of data for a given timeframe."""
+    interval = TIMEFRAME_INTERVAL_MINUTES.get(timeframe.lower(), 15)
+    return int(days * 24 * 60 / interval) + 200
+
+
 def _hour_to_session(hour: int) -> str:
     if 7 <= hour < 12:  return "london"
     if 12 <= hour < 17: return "ny"
@@ -225,7 +233,7 @@ def _scan_one_symbol(args: tuple) -> tuple:
     Renders charts only for events passing active_params.
     All DB writes are deferred to the main process.
     """
-    symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id = args
+    symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id, strategy = args
 
     from db.local_db import LocalDB
     from alerts.alert_manager import AlertManager
@@ -235,12 +243,12 @@ def _scan_one_symbol(args: tuple) -> tuple:
     alert_manager = AlertManager(settings, db=db)
     dev_mode = settings.dev_mode
 
-    candles_desc = db.query_recent(symbol, timeframe, limit=35000)
+    candles_desc = db.query_recent(symbol, timeframe, limit=_candle_limit(timeframe))
     if not candles_desc:
         db.close()
         return symbol, 0, [], [], [], []
 
-    candles_4h = db.query_recent(symbol, htf, limit=2200)
+    candles_4h = db.query_recent(symbol, htf, limit=_candle_limit(htf))
     n = len(candles_desc)
     count = 0
     seen_raw: set = set()    # dedup for raw_signal storage
@@ -322,6 +330,7 @@ def _scan_one_symbol(args: tuple) -> tuple:
                     "swing_age_candles": ev.get("swing_age_candles"),
                     "session": _hour_to_session(bos_dt.hour),
                     "dow": bos_dt.weekday(),
+                    "strategy": strategy,
                     "scan_run_id": scan_run_id,
                 })
 
@@ -684,37 +693,303 @@ def _send_sweep_summary(
 
 def run_nightly_sweep(db: LocalDB, alert_manager: AlertManager) -> None:
     """Re-run the param sweep on the latest raw_signals in DB (no rescan, takes seconds)."""
-    scan_run_id, raw_signals = db.get_latest_raw_signals()
+    scan_run_id, raw_signals = db.get_latest_raw_signals(strategy="BOS15m")
     if not raw_signals:
-        logging.error("No raw signals in DB. Run --experiment-bos first.")
+        logging.error("No BOS15m raw signals in DB. Run --experiment-bos first.")
         return
     logging.info("Nightly sweep: %d raw signals from scan_run_id=%d", len(raw_signals), scan_run_id)
     all_pair_stats, all_symbols, pset_ids = _run_param_sweep(raw_signals, db)
     _send_sweep_summary(alert_manager, raw_signals, all_pair_stats, all_symbols, pset_ids)
 
 
-def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager) -> None:
-    """
-    CLI dev mode: scans 15m historical data for BOS events in the last 48h.
+# ──────────────────────────── FVG DOJI STRATEGY ────────────────────────────
 
-    For each unique BOS:
-      - Checks the 4h bias (HTF) at the moment of the BOS using swing high/low
-      - Generates a chart with BOS + sweep arrows, HTF bias label, and 10 lookahead candles
-      - Saves chart to data/charts/{alert_id}.png
-      - Telegram is DISABLED in dev mode
+_FVG_SWEEP_BASE = {
+    "fvg_lookback": 20,
+    "max_doji_body_pct": 0.35,
+    "min_fvg_size_atr": 0.3,
+    "min_retrace_pct": 0.5,
+    "scan_days": 365,
+}
 
-    Prints a per-pair count summary at the end.
-    """
+FVG_PARAM_SWEEP_SETS = [
+    # vary FVG size threshold
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.3,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.7,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 1.0,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
+    # vary retrace depth
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.35},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.80, "max_doji_body_pct": 0.35},
+    # vary doji body strictness
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.20},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.25},
+    # combined strict setups
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.7,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.25},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 1.0,  "min_retrace_pct": 0.80, "max_doji_body_pct": 0.20},
+]
+
+
+def _fvg_pset_label(pset: dict) -> str:
+    return f"fvg{pset['min_fvg_size_atr']}+r{pset['min_retrace_pct']}+b{pset['max_doji_body_pct']}"
+
+
+def _apply_fvg_param_filter(raw_signals: list, params: dict) -> list:
+    min_size    = params.get("min_fvg_size_atr", 0.3)
+    min_retrace = params.get("min_retrace_pct", 0.5)
+    max_body    = params.get("max_doji_body_pct", 0.35)
+    return [
+        r for r in raw_signals
+        if (r.get("fvg_size_atr") or 0) >= min_size
+        and (r.get("retrace_depth") or 0) >= min_retrace
+        and (r.get("doji_body_pct") or 1) <= max_body
+    ]
+
+
+def _run_fvg_param_sweep(raw_signals: list, db: LocalDB) -> tuple:
+    """Evaluate FVG_PARAM_SWEEP_SETS against FVG raw signals; print comparison; store in DB."""
+    all_symbols = sorted({r["symbol"] for r in raw_signals})
+    logging.info("")
+    logging.info("=== FVG Param Sweep (%d sets × %d pairs) ===", len(FVG_PARAM_SWEEP_SETS), len(all_symbols))
+    hdr = "  ".join(f"{s[:6]:>6}" for s in all_symbols)
+    logging.info("  %-32s  %s  %s  %s", "Params", hdr, "OVERAL", "EV1:2")
+    logging.info("  " + "-" * 102)
+
+    all_pair_stats: dict = {}
+    pset_ids: list = []
+
+    for pset in FVG_PARAM_SWEEP_SETS:
+        pset_id = db.get_or_create_param_set(pset)
+        pset_ids.append(pset_id)
+        filtered = _apply_fvg_param_filter(raw_signals, pset)
+        trades   = [_raw_to_trade_result(r) for r in filtered]
+
+        for sym in all_symbols:
+            s = _compute_stats([t for t in trades if t["symbol"] == sym])
+            all_pair_stats[(pset_id, sym)] = s
+            db.insert_scan_stats(pset_id, sym, s["total"], s["wins"], s["losses"], s["open"], json.dumps(s))
+
+        ov = _compute_stats(trades)
+        all_pair_stats[(pset_id, "ALL")] = ov
+        db.insert_scan_stats(pset_id, "ALL", ov["total"], ov["wins"], ov["losses"], ov["open"], json.dumps(ov))
+
+        lbl       = _fvg_pset_label(pset)
+        pair_cols = "  ".join(f"{all_pair_stats[(pset_id, s)]['win_rate']*100:>5.1f}%" for s in all_symbols)
+        ev_12     = ov.get("expected_value", {}).get("1:2", 0)
+        logging.info("  v%-3d %-27s  %s  %5.1f%%  %+.3fR",
+                     pset_id, lbl, pair_cols, ov["win_rate"] * 100, ev_12)
+
+    logging.info("")
+    logging.info("Best FVG param set per pair (min 20 resolved trades):")
+    for sym in all_symbols:
+        candidates = [
+            (pid, pset) for pid, pset in zip(pset_ids, FVG_PARAM_SWEEP_SETS)
+            if all_pair_stats.get((pid, sym), {}).get("resolved", 0) >= 20
+        ]
+        if not candidates:
+            logging.info("  %-10s  (no param set with ≥20 trades)", sym)
+            continue
+        best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)]["win_rate"])
+        s = all_pair_stats[(best_pid, sym)]
+        logging.info("  %-10s  v%-3d %-27s  WR: %5.1f%%  Trades: %d  EV 1:2: %+.3fR",
+                     sym, best_pid, _fvg_pset_label(best_pset), s["win_rate"] * 100, s["resolved"],
+                     s.get("expected_value", {}).get("1:2", 0))
+    return all_pair_stats, all_symbols, pset_ids
+
+
+def _fvg_alert_id(symbol: str, timestamp: int) -> str:
+    dt   = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    pair = symbol.lower().replace("/", "")
+    return f"fvg_{dt.minute:02d}-{dt.hour:02d}-{dt.day:02d}-{dt.month:02d}-{dt.year}-{pair}"
+
+
+def _scan_one_symbol_fvg(args: tuple) -> tuple:
+    """Worker: scan 30m candles for FVG doji setups. Returns raw signal records."""
+    symbol, settings, param_set_id, cutoff_ts, scan_run_id = args
+
+    from db.local_db import LocalDB
+    from analysis.smc_analyzer import SMCAnalyzer
+    from alerts.alert_manager import AlertManager
+
+    db       = LocalDB(settings.db_path)
+    analyzer = SMCAnalyzer()
+    dev_mode = settings.dev_mode
+    timeframe, htf = "30m", "4h"
+
+    candles_desc = db.query_recent(symbol, timeframe, limit=_candle_limit(timeframe))
+    if not candles_desc:
+        db.close()
+        return symbol, 0, [], [], []
+
+    candles_htf = db.query_recent(symbol, htf, limit=_candle_limit(htf))
+    n = len(candles_desc)
+    seen: set = set()
+    trade_results, log_lines, raw_signal_records = [], [], []
+
+    for k in range(50, n):
+        bos_ts = candles_desc[n - 1 - k]["timestamp"]
+        if bos_ts < cutoff_ts:
+            continue
+
+        # Pass only 50-candle slice for detection: avoids O(n²) from ATR/reverse on full window.
+        # FVG lookback=20 + ATR period=14 fit easily in 50 candles.
+        idx       = n - 1 - k
+        det_slice = candles_desc[idx : idx + 50]
+        lookahead = candles_desc[max(0, idx - 51) : idx] if dev_mode else None
+
+        fvg_events = analyzer.detect_fvg_doji(
+            det_slice, params={"symbol": symbol, "timeframe": timeframe,
+                               "min_fvg_size_atr": 0.0, "min_retrace_pct": 0.0,
+                               "max_doji_body_pct": 1.0}
+        )
+        if not fvg_events:
+            continue
+
+        htf_bias        = analyzer.get_htf_bias(candles_htf, bos_ts) if candles_htf else None
+        lookahead_chron = list(reversed(lookahead)) if lookahead else []
+        sig_dt          = datetime.fromtimestamp(bos_ts, tz=timezone.utc)
+
+        for ev in fvg_events:
+            key = (ev["direction"], round(ev["fvg_low"], 5), round(ev["fvg_high"], 5))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            outcome  = AlertManager.evaluate_fvg_outcome(det_slice, ev, lookahead_chron, candles_htf)
+            alert_id = _fvg_alert_id(symbol, ev.get("breakout_ts", bos_ts))
+
+            raw_signal_records.append({
+                "symbol":           symbol,
+                "timeframe":        timeframe,
+                "breakout_ts":      ev["breakout_ts"],
+                "alert_id":         alert_id,
+                "direction":        ev["direction"],
+                "broken_level":     (ev["fvg_low"] + ev["fvg_high"]) / 2,
+                "break_strength":   ev.get("fvg_size_atr", 0.0),
+                "htf_bias":         htf_bias,
+                "confluences":      json.dumps([]),
+                "outcome":          outcome,
+                "hour":             sig_dt.hour,
+                "month":            sig_dt.strftime("%Y-%m"),
+                "has_liquidity_sweep": 0,
+                "swing_age_candles": None,
+                "session":          _hour_to_session(sig_dt.hour),
+                "dow":              sig_dt.weekday(),
+                "fvg_size_atr":     ev.get("fvg_size_atr"),
+                "retrace_depth":    ev.get("retrace_depth"),
+                "doji_body_pct":    ev.get("doji_body_pct"),
+                "strategy":         "FVG30m",
+                "scan_run_id":      scan_run_id,
+            })
+            trade_results.append({
+                "alert_id":       alert_id,
+                "outcome":        outcome,
+                "confluences":    [],
+                "symbol":         symbol,
+                "hour":           sig_dt.hour,
+                "month":          sig_dt.strftime("%Y-%m"),
+                "break_strength": ev.get("fvg_size_atr", 0.0),
+                "htf_bias":       htf_bias,
+                "bos_direction":  ev["direction"],
+            })
+            log_lines.append(
+                f"  [{symbol}] FVG DOJI {ev['direction'].upper()}"
+                f"  zone=[{ev['fvg_low']:.5f}-{ev['fvg_high']:.5f}]"
+                f"  size={ev['fvg_size_atr']:.2f}ATR  retrace={ev['retrace_depth']:.0%}"
+                f"  4H={( htf_bias or '?').upper():<8}  ts={sig_dt.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+    db.close()
+    return symbol, len(raw_signal_records), trade_results, log_lines, raw_signal_records
+
+
+def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager) -> None:
+    """Scan 365 days of 30m candles for FVG doji setups; run 10-set param sweep."""
     from datetime import timedelta
-    timeframe = "15m"
-    htf = "4h"
-    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
-    dev_mode = getattr(settings, "dev_mode", True)
+    cutoff_ts  = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
+    timeframe, htf = "30m", "4h"
 
-    logging.info("Scanning 15m BOS (last 365 days) — MTF bias from 4h — Telegram OFF")
+    logging.info("Scanning 30m FVG doji (last 365 days) — HTF bias from 4h")
     logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
 
-    # Register current parameter set as a version in the DB
+    base_params = {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.0, "min_retrace_pct": 0.0, "max_doji_body_pct": 1.0}
+    param_set_id = db.get_or_create_param_set(base_params)
+
+    try:
+        fetcher = FXFetcher(settings)
+        for symbol in settings.fx_pairs:
+            _ensure_pair_data(symbol, timeframe, fetcher, db)
+            _ensure_pair_data(symbol, htf, fetcher, db)
+    except Exception as exc:
+        logging.warning("Auto-fetch unavailable: %s", exc)
+
+    scan_run_id = int(datetime.now(timezone.utc).timestamp())
+    n_workers   = len(settings.fx_pairs)
+    worker_args = [
+        (symbol, settings, param_set_id, cutoff_ts, scan_run_id)
+        for symbol in settings.fx_pairs
+    ]
+    logging.info("Launching %d FVG workers...", n_workers)
+
+    pair_counts: dict = {}
+    all_trade_results: list = []
+    all_raw_signals:   list = []
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_scan_one_symbol_fvg, args): args[0] for args in worker_args}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                sym, count, trade_results, log_lines, raw_signal_recs = future.result()
+            except Exception as exc:
+                logging.error("FVG worker for %s failed: %s", symbol, exc)
+                pair_counts[symbol] = 0
+                continue
+            pair_counts[sym] = count
+            all_trade_results.extend(trade_results)
+            all_raw_signals.extend(raw_signal_recs)
+            for line in log_lines:
+                logging.info(line)
+
+    try:
+        db.insert_raw_signals(scan_run_id, all_raw_signals)
+        logging.info("FVG raw signals stored: %d (scan_run_id=%d)", len(all_raw_signals), scan_run_id)
+    except Exception as exc:
+        logging.warning("Failed to store FVG raw signals: %s", exc)
+
+    logging.info("")
+    logging.info("=== 30m FVG doji count (last 365 days) ===")
+    for sym, cnt in pair_counts.items():
+        logging.info("  %-10s %d", sym, cnt)
+    logging.info("  %-10s %d", "TOTAL", sum(pair_counts.values()))
+
+    overall = _compute_stats(all_trade_results)
+    ev = overall.get("expected_value", {})
+    logging.info("")
+    logging.info("=== FVG Scan Stats ===")
+    logging.info("  Resolved: %d  Wins: %d  Losses: %d  Open: %d",
+                 overall["resolved"], overall["wins"], overall["losses"], overall["open"])
+    logging.info("  Win rate: %.1f%%  |  EV 1:2: %+.3fR", overall["win_rate"] * 100, ev.get("1:2", 0))
+
+    if all_raw_signals:
+        _run_fvg_param_sweep(all_raw_signals, db)
+
+
+def run_bos_experiment(
+    settings: Settings,
+    db: LocalDB,
+    alert_manager: AlertManager,
+    timeframe: str = "15m",
+    htf: str = "4h",
+) -> None:
+    """Scan historical BOS events on the given timeframe / HTF pair."""
+    from datetime import timedelta
+    strategy = f"BOS{timeframe}"
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
+
+    logging.info("Scanning %s BOS (last 365 days) — MTF bias from %s", timeframe.upper(), htf.upper())
+    logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
+
     active_params = {
         "min_break_strength": 0.7,
         "min_break_distance_atr_mult": 0.3,
@@ -747,7 +1022,7 @@ def run_bos_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
     scan_run_id = int(datetime.now(timezone.utc).timestamp())
     n_workers = len(settings.fx_pairs)
     worker_args = [
-        (symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id)
+        (symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id, strategy)
         for symbol in settings.fx_pairs
     ]
     logging.info("Launching %d parallel workers (one per pair)...", n_workers)
@@ -882,6 +1157,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Re-run param sweep on latest DB raw_signals (no rescan); send Telegram summary",
     )
+    parser.add_argument(
+        "--experiment-bos-4h",
+        action="store_true",
+        help="Same as --experiment-bos but on 4h timeframe with 1d HTF bias",
+    )
+    parser.add_argument(
+        "--experiment-fvg",
+        action="store_true",
+        help="Scan 30m data for FVG + deep retrace + doji rejection setups",
+    )
     return parser.parse_args()
 
 
@@ -905,6 +1190,16 @@ def main() -> None:
 
     if args.nightly:
         run_nightly_sweep(db, alert_manager)
+        db.close()
+        return
+
+    if args.experiment_bos_4h:
+        run_bos_experiment(settings, db, alert_manager, timeframe="4h", htf="1d")
+        db.close()
+        return
+
+    if args.experiment_fvg:
+        run_fvg_experiment(settings, db, alert_manager)
         db.close()
         return
 

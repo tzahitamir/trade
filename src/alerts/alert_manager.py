@@ -466,6 +466,229 @@ class AlertManager:
         plt.close(fig)
         return str(chart_path), outcome
 
+    @staticmethod
+    def evaluate_fvg_outcome(
+        candles: List[Dict],
+        ev: Dict,
+        lookahead_chron: List[Dict],
+        candles_htf: Optional[List[Dict]] = None,
+    ) -> str:
+        """Compute WIN/LOSS/HTF WIN/HTF LOSS/OPEN for a FVG doji signal."""
+        from analysis.smc_analyzer import SMCAnalyzer as _SA
+        direction = ev.get("direction", "bullish")
+        bullish   = direction == "bullish"
+        atr       = _SA.calculate_atr(candles) or 1e-6
+        fvg_lo    = ev["fvg_low"]
+        fvg_hi    = ev["fvg_high"]
+        entry     = list(reversed(candles))[0]["close"] if candles else ev.get("breakout_ts", 0)
+        sl        = (fvg_lo - atr * 0.3) if bullish else (fvg_hi + atr * 0.3)
+        risk      = abs(entry - sl) or atr
+        tp        = (entry + risk * 2) if bullish else (entry - risk * 2)
+        outcome   = "OPEN"
+        for bar in lookahead_chron:
+            if bullish:
+                if bar["low"]  <= sl: outcome = "LOSS"; break
+                if bar["high"] >= tp: outcome = "WIN";  break
+            else:
+                if bar["high"] >= sl: outcome = "LOSS"; break
+                if bar["low"]  <= tp: outcome = "WIN";  break
+        if outcome == "OPEN" and candles_htf:
+            sig_ts   = ev.get("breakout_ts", 0)
+            future   = [b for b in reversed(candles_htf) if b["timestamp"] > sig_ts]
+            for bar in future:
+                if bullish:
+                    if bar["low"]  <= sl: outcome = "HTF LOSS"; break
+                    if bar["high"] >= tp: outcome = "HTF WIN";  break
+                else:
+                    if bar["high"] >= sl: outcome = "HTF LOSS"; break
+                    if bar["low"]  <= tp: outcome = "HTF WIN";  break
+        return outcome
+
+    def render_fvg_alert(
+        self,
+        symbol: str,
+        timeframe: str,
+        ev: Dict,
+        candles: List[Dict],
+        lookahead_candles: Optional[List[Dict]] = None,
+        htf_bias: Optional[str] = None,
+        candles_htf: Optional[List[Dict]] = None,
+        param_set_id: Optional[int] = None,
+        skip_db: bool = False,
+    ) -> Dict:
+        """Generate FVG doji chart + DB record. Returns alert dict."""
+        alert_id = "fvg_" + self._generate_alert_id(symbol, ev.get("breakout_ts", 0))
+        outcome  = "OPEN"
+        fig_path = None
+        try:
+            fig_path, outcome = self._render_fvg_chart(
+                candles, ev, alert_id, lookahead_candles, htf_bias, candles_htf
+            )
+        except Exception:
+            import logging, traceback
+            logging.error("FVG chart render failed for %s: %s", alert_id, traceback.format_exc())
+        direction = ev.get("direction", "bullish")
+        message = (
+            f"FVG DOJI {direction.upper()} @ fvg=[{ev['fvg_low']:.5f}-{ev['fvg_high']:.5f}]"
+            f"  size={ev.get('fvg_size_atr', 0):.2f}ATR"
+            f"  retrace={ev.get('retrace_depth', 0):.0%}"
+            f"  body={ev.get('doji_body_pct', 0):.0%}"
+        )
+        alert = {
+            "alert_id":    alert_id,
+            "symbol":      symbol,
+            "timeframe":   timeframe,
+            "event":       ev,
+            "message":     message,
+            "image_path":  fig_path,
+            "htf_bias":    htf_bias,
+            "confluences": [],
+            "outcome":     outcome,
+            "param_set_id": param_set_id,
+        }
+        if not skip_db:
+            try:
+                db_id = self.db.insert_alert(
+                    symbol, timeframe, ev.get("breakout_ts", 0), "FVG",
+                    message, fig_path, "{}", alert_id=alert_id, param_set_id=param_set_id,
+                )
+                alert["db_id"] = db_id
+            except Exception:
+                alert["db_id"] = None
+        return alert
+
+    def _render_fvg_chart(
+        self,
+        candles: List[Dict],
+        ev: Dict,
+        alert_id: str,
+        lookahead_candles: Optional[List[Dict]] = None,
+        htf_bias: Optional[str] = None,
+        candles_htf: Optional[List[Dict]] = None,
+    ) -> tuple:
+        """Render FVG doji candlestick chart, save to data/charts/{alert_id}.png."""
+        from analysis.smc_analyzer import SMCAnalyzer as _SA
+        PRE  = 50
+        c    = list(reversed(candles))[-(PRE + 1):]
+        c_ahead: List[Dict] = []
+        if lookahead_candles and self.dev_mode:
+            c_ahead = list(reversed(lookahead_candles))
+
+        fig, ax = plt.subplots(figsize=(10, 4))
+        self._draw_candles(ax, c, x_offset=0, alpha=1.0)
+        if c_ahead:
+            self._draw_candles(ax, c_ahead, x_offset=len(c), alpha=0.45)
+
+        all_bars = c + c_ahead
+        ax.set_xlim(-1, len(all_bars))
+        all_lows  = [b["low"]  for b in all_bars]
+        all_highs = [b["high"] for b in all_bars]
+        pad = (max(all_highs) - min(all_lows)) * 0.08
+        ax.set_ylim(min(all_lows) - pad, max(all_highs) + pad)
+
+        # FVG zone: shaded rectangle
+        fvg_lo = ev["fvg_low"]
+        fvg_hi = ev["fvg_high"]
+        ax.axhspan(fvg_lo, fvg_hi, color="gold", alpha=0.25, zorder=1, label="FVG zone")
+
+        # FVG impulse candle marker
+        fvg_ts   = ev.get("fvg_ts")
+        fvg_x    = next((i for i, b in enumerate(c) if b["timestamp"] == fvg_ts), None)
+        direction = ev.get("direction", "bullish")
+        bullish   = direction == "bullish"
+        price_range = max(all_highs) - min(all_lows) or all_highs[0] * 0.001
+        arrow_offset = price_range * 0.15
+        arrow_props  = dict(arrowstyle="-|>", lw=1.3)
+
+        if fvg_x is not None:
+            tip_y  = c[fvg_x]["high"] if bullish else c[fvg_x]["low"]
+            text_y = tip_y + arrow_offset if bullish else tip_y - arrow_offset
+            ax.annotate(
+                "FVG", xy=(fvg_x, tip_y), xytext=(fvg_x, text_y),
+                fontsize=8, fontweight="bold", color="goldenrod", ha="center", zorder=5,
+                arrowprops={**arrow_props, "color": "goldenrod"},
+            )
+
+        # Doji (entry signal) arrow
+        doji_x  = len(c) - 1
+        tip_y   = c[-1]["low"] if bullish else c[-1]["high"]
+        text_y  = tip_y - arrow_offset if bullish else tip_y + arrow_offset
+        action  = "BUY" if bullish else "SELL"
+        ax.annotate(
+            action, xy=(doji_x, tip_y), xytext=(doji_x, text_y),
+            fontsize=8, fontweight="bold", color="green", ha="center", zorder=5,
+            arrowprops={**arrow_props, "color": "green"},
+        )
+
+        # SL / TP
+        atr   = _SA.calculate_atr(candles) or (price_range * 0.05)
+        entry = c[-1]["close"]
+        sl    = (fvg_lo - atr * 0.3) if bullish else (fvg_hi + atr * 0.3)
+        risk  = abs(entry - sl) or atr
+        tp    = (entry + risk * 2) if bullish else (entry - risk * 2)
+
+        new_lo = min(ax.get_ylim()[0], sl - atr * 0.5)
+        new_hi = max(ax.get_ylim()[1], tp + atr * 0.5)
+        ax.set_ylim(new_lo, new_hi)
+
+        ax.hlines(sl, doji_x, len(all_bars) - 1, colors="red",      linestyles="--", linewidth=1.2, zorder=3)
+        ax.hlines(tp, doji_x, len(all_bars) - 1, colors="limegreen", linestyles="--", linewidth=1.2, zorder=3)
+        ax.text(len(all_bars) - 0.3, sl, " SL", fontsize=7, color="red",      va="center", fontweight="bold")
+        ax.text(len(all_bars) - 0.3, tp, " TP", fontsize=7, color="limegreen", va="center", fontweight="bold")
+
+        # Outcome check
+        outcome = self.evaluate_fvg_outcome(candles, ev, c_ahead, candles_htf)
+        outcome_color = "#26a69a" if "WIN" in outcome else ("#ef5350" if "LOSS" in outcome else "gray")
+        ax.text(
+            0.98, 0.03, outcome, transform=ax.transAxes, fontsize=11, fontweight="bold",
+            color=outcome_color, ha="right", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9, edgecolor=outcome_color),
+        )
+
+        # HTF bias label
+        if htf_bias and htf_bias != "neutral":
+            bias_color = "#26a69a" if htf_bias == "bullish" else "#ef5350"
+            tf_label   = ev.get("timeframe", "30m").upper()
+            ax.text(
+                0.98, 0.97, f"{tf_label} {direction.upper()}  |  4H {htf_bias.upper()}",
+                transform=ax.transAxes, fontsize=9, fontweight="bold", color=bias_color,
+                ha="right", va="top",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, edgecolor=bias_color),
+            )
+
+        # Stats label: FVG size / retrace / doji body
+        stats_txt = (
+            f"FVG {ev.get('fvg_size_atr', 0):.2f}ATR  "
+            f"retrace {ev.get('retrace_depth', 0):.0%}  "
+            f"body {ev.get('doji_body_pct', 0):.0%}"
+        )
+        ax.text(
+            0.02, 0.03, stats_txt, transform=ax.transAxes, fontsize=8,
+            color="goldenrod", ha="left", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="goldenrod"),
+        )
+
+        legend_items = [
+            mpatches.Patch(color="#26a69a", label="bullish candle"),
+            mpatches.Patch(color="#ef5350", label="bearish candle"),
+            mpatches.Patch(color="gold",    alpha=0.4, label="FVG zone"),
+        ]
+        if c_ahead:
+            legend_items.append(mpatches.Patch(color="gray", alpha=0.45, label="next 50 candles"))
+        ax.legend(handles=legend_items, fontsize=7, loc="upper left")
+
+        mode_tag = " [DEV]" if self.dev_mode and c_ahead else ""
+        ax.set_title(
+            f"{ev.get('symbol')} {ev.get('timeframe')} FVG DOJI {direction.upper()}{mode_tag}  |  {alert_id}",
+            fontsize=9,
+        )
+        ax.tick_params(labelsize=7)
+        chart_path = self.charts_dir / f"{alert_id}.png"
+        fig.tight_layout()
+        fig.savefig(str(chart_path), dpi=100)
+        plt.close(fig)
+        return str(chart_path), outcome
+
     def format_alert(self, alert: Dict) -> str:
         return f"[{alert.get('alert_id')}] {alert.get('message')}"
 
