@@ -2,7 +2,7 @@
 
 1. this is the development stage
 
-FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd , gbp/jpy , eur/gbp , usd/jpy , dax cfd (ger40)
+FX pairs that the app follows are  eur/usd , eur/jpy , usd/cad , usd/chf , nzd/usd , gbp/jpy , eur/gbp , usd/jpy , dax cfd (ger40) , xau/usd
 
 download 365 days past data for the pairs if not present
 
@@ -26,6 +26,31 @@ pull data from tweleve of the last 365 days , of 5m,15m,30m,1h,4h, 1d and save t
 
 if i ask for data that is not availble , go ahead and fetch it , but during dev stage, if the most new data is less tha 24 hours ago , dont attempt to fetch the latest for exising data , and just continue running the script on the availble data
 
+
+3. data integrity — gap detection and backfill
+
+the live scheduler may miss candles due to API failures, network outages, or
+process restarts. a gap-detection scan finds contiguous ranges of missing data
+and backfills them from the api on demand or on a schedule.
+
+detection: load all stored timestamps for each (symbol, timeframe), walk
+consecutive pairs, and flag any span wider than 2.5× the candle interval as
+a gap. weekend / market-closure gaps (≤ 80 hours, starting friday evening or
+later) are excluded automatically.
+
+backfill: for each real gap, fetch from twelve data using end_date to target
+the missing window. gaps larger than 4800 candles are split into sequential
+chunks with an 8-second delay between requests to stay within the free-tier
+rate limit (8 calls / min).
+
+triggers:
+  - --check-gaps cli flag: manual on-demand scan across all pairs + timeframes
+  - --check-gaps --dry-run: report gaps without inserting anything
+  - daily scheduler job at 06:00 utc (runs before market open for most pairs)
+  - automatic on scheduler startup (recovers any downtime immediately)
+
+dax is excluded from the gap check — it is served by yahoo finance with a 59-day
+intraday cap and is refreshed separately by --experiment-dax.
 
 4. smc 
 
@@ -165,8 +190,9 @@ _apply_param_filter — pass sl_mode through to outcome re-evaluation (note: out
 _compute_stats — add avg_R_win and EV with variable R to output
 Per pair and per timeframe — 4h swings are wider so broken_level may be proportionally tighter than on 15m; optimal mode will differ
 
+60. instructions for xau/usd , check 15m charts similar to smc , but here for xau/usd , liquidity sweep is mandatory before bos
 
-80. 
+
 80. DAX (DE40) — Frankfurt Open Session Strategy
 
 Instrument: DE40 via CFD (data from Twelve Data, symbol DE40).
