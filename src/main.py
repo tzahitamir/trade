@@ -20,6 +20,11 @@ from alerts.log_monitor import LogMonitor
 
 FETCH_CHECK_SECOND = 10
 INITIAL_LOOKBACK_HOURS = 8760  # 365 days
+
+API_DAILY_LIMIT = 800
+
+# Fetch order: highest EV alert pairs first; USDJPY last (no live alerts, drop first under pressure)
+FETCH_PRIORITY = ["NZDUSD", "EURJPY", "EURUSD", "USDCHF", "USDCAD", "XAUUSD", "USDJPY"]
 TIMEFRAME_INTERVAL_MINUTES = {
     "5m": 5,
     "5min": 5,
@@ -39,28 +44,26 @@ TIMEFRAME_INTERVAL_MINUTES = {
 
 def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
     """
-    Minimal fetch schedule — only 15m and 4h are needed for production BOS alerts.
-    Skips weekends and dead hours (18-21 UTC) to stay under 800 calls/day.
+    Fetch schedule — only 15m and 4h are needed for production BOS alerts.
+    Covers all FX trading hours (Mon 00:00 – Fri 22:00 UTC); skips Sat/Sun.
+    Budget is enforced separately in fetch_job via the API daily counter.
 
-    Daily estimate (avg across 7 days):
-      15m: 4/hr × 20 active hours × 9 symbols × 5/7 ≈ 514 calls
-      4h:  5 fetches/day × 9 symbols × 5/7 ≈ 32 calls
-      Total ≈ 546/day  (well under 800 free-tier limit)
+    Daily estimate on a full weekday (7 pairs):
+      15m: 4/hr × 24h × 7 = 672 calls
+      4h:  6/day  × 7  = 42 calls
+      Total ≈ 714/day  (under 800 free-tier limit)
     """
     timeframe = timeframe.lower()
     minute  = now.minute
-    hour    = now.hour
     weekday = now.weekday()  # 0=Mon … 6=Sun
 
-    if weekday >= 5:          # Saturday / Sunday — gold filters skip these too
-        return False
-    if hour in {18, 19, 20, 21}:  # dead hours — no edge in these windows
+    if weekday >= 5:  # Saturday / Sunday — markets closed
         return False
 
     if timeframe in {"15m", "15min"}:
         return minute % 15 == 4
     if timeframe in {"4h", "h4"}:  # once per 4-hour bar close
-        return minute == 0 and hour % 4 == 0
+        return minute == 0 and now.hour % 4 == 0
 
     return False  # 5m, 30m, 1h not used in production
 
@@ -265,13 +268,39 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
         logging.debug("No scheduled timeframes at %s", now)
         return
 
-    logging.info("Running scheduled fetch for timeframes: %s", ", ".join(timeframes))
-    for symbol in settings.fx_pairs:
+    calls_today = db.get_api_calls_today()
+    if calls_today >= API_DAILY_LIMIT:
+        logging.debug("API daily limit reached (%d/%d) — skipping fetch", calls_today, API_DAILY_LIMIT)
+        return
+
+    # Order pairs by priority (best EV first); any pair not in FETCH_PRIORITY goes last
+    configured = set(settings.fx_pairs)
+    ordered = [p for p in FETCH_PRIORITY if p in configured]
+    ordered += [p for p in settings.fx_pairs if p not in set(FETCH_PRIORITY)]
+
+    logging.info("Fetch: %s | used %d/%d API calls today",
+                 ", ".join(timeframes), calls_today, API_DAILY_LIMIT)
+
+    for symbol in ordered:
+        remaining = API_DAILY_LIMIT - db.get_api_calls_today()
+        if remaining <= 0:
+            if not db.api_limit_already_alerted():
+                skipped = [p for p in ordered if p != symbol and p not in
+                           ordered[:ordered.index(symbol)]]
+                alert_manager.send_alert(
+                    f"⚠️ [trade] Daily API limit reached ({API_DAILY_LIMIT} calls). "
+                    f"Data fetch paused until UTC midnight. "
+                    f"Unfetched pairs this cycle: {', '.join(ordered[ordered.index(symbol):])}."
+                )
+                db.mark_api_limit_alerted()
+            logging.warning("API daily limit hit — skipping %s and remaining pairs", symbol)
+            break
+
         for timeframe in timeframes:
             try:
                 process_symbol_timeframe(symbol, timeframe, fetcher, db, alert_manager)
-                # Delay to stay within API rate limits (8/min on free tier).
-                # 9 symbols × 8s = 72s > 60s rolling window — guaranteed safe.
+                db.increment_api_calls(1)
+                # 8s between calls keeps 7 symbols × 8s = 56s within the 60s rolling window
                 time.sleep(8)
             except Exception as exc:
                 message = f"Failed to fetch {symbol} {timeframe}: {exc}"
@@ -2367,25 +2396,45 @@ def run_gap_check(
     then backfill any real gaps (non-weekend) from the Twelve Data API.
 
     DAX is excluded because it is fetched via Yahoo Finance, not TwelveData.
+    Skips backfill (dry-run only) if the daily API budget is exhausted.
     """
     from data.gap_detector import check_and_backfill
 
+    calls_today = db.get_api_calls_today()
+    budget_left = API_DAILY_LIMIT - calls_today
+    if budget_left <= 0 and not dry_run:
+        logging.warning("Gap check: no API credits remaining today (%d/%d) — skipping backfill",
+                        calls_today, API_DAILY_LIMIT)
+        return
+
     # Only pairs served by the TwelveData fetcher (exclude DAX / Yahoo symbols)
-    pairs      = [p for p in settings.fx_pairs if p.upper() not in ("DAX",)]
-    timeframes = settings.timeframes
+    # Use FETCH_PRIORITY order so best pairs get backfilled first if budget is tight
+    configured = set(p for p in settings.fx_pairs if p.upper() not in ("DAX",))
+    pairs = [p for p in FETCH_PRIORITY if p in configured]
+    pairs += [p for p in configured if p not in set(FETCH_PRIORITY)]
+    timeframes = ["15m", "4h"]  # only production timeframes need gap coverage
 
     total_gaps     = 0
     total_inserted = 0
+    api_calls_made = 0
 
-    logging.info("=== Gap check: %d pairs × %d timeframes ===", len(pairs), len(timeframes))
+    logging.info("=== Gap check: %d pairs × %d timeframes (budget: %d/%d used) ===",
+                 len(pairs), len(timeframes), calls_today, API_DAILY_LIMIT)
     for symbol in pairs:
         for tf in timeframes:
+            if not dry_run and (API_DAILY_LIMIT - db.get_api_calls_today()) <= 0:
+                logging.warning("Gap check: budget exhausted mid-run — stopping at %s %s", symbol, tf)
+                break
             try:
                 gaps, inserted = check_and_backfill(
                     db, fetcher, symbol, tf, dry_run=dry_run
                 )
                 total_gaps     += gaps
                 total_inserted += inserted
+                if not dry_run and gaps > 0:
+                    # Each gap triggers at least one fetch_historical call
+                    db.increment_api_calls(gaps)
+                    api_calls_made += gaps
             except Exception as exc:
                 logging.warning("Gap check failed for %s %s: %s", symbol, tf, exc)
 
@@ -2393,8 +2442,8 @@ def run_gap_check(
         logging.info("Gap check (dry-run) complete — %d gap(s) found", total_gaps)
     else:
         logging.info(
-            "Gap check complete — %d gap(s) found, %d candles inserted",
-            total_gaps, total_inserted,
+            "Gap check complete — %d gap(s) found, %d candles inserted, %d API calls used",
+            total_gaps, total_inserted, api_calls_made,
         )
 
 

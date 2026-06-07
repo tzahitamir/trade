@@ -138,6 +138,15 @@ class LocalDB:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS api_daily_usage (
+                date TEXT PRIMARY KEY,
+                calls_used INTEGER NOT NULL DEFAULT 0,
+                limit_alerted INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         # migrate: add columns to existing DBs that predate this schema
         for col_sql in [
             "ALTER TABLE smc_alerts ADD COLUMN alert_id TEXT",
@@ -499,3 +508,63 @@ class LocalDB:
                    "trade_count": r[4], "set_at": r[5]}
             for r in rows
         }
+
+    # ------------------------------------------------------------------
+    # API credit tracking
+    # ------------------------------------------------------------------
+
+    def increment_api_calls(self, n: int = 1) -> int:
+        """Increment today's API call counter (UTC date). Returns new total."""
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                INSERT INTO api_daily_usage (date, calls_used) VALUES (?, ?)
+                ON CONFLICT(date) DO UPDATE SET calls_used = calls_used + ?
+                """,
+                (today, n, n),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT calls_used FROM api_daily_usage WHERE date = ?", (today,)
+            ).fetchone()
+            return row[0] if row else n
+
+    def get_api_calls_today(self) -> int:
+        """Return number of API calls made today (UTC date)."""
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT calls_used FROM api_daily_usage WHERE date = ?", (today,)
+            ).fetchone()
+            return row[0] if row else 0
+
+    def mark_api_limit_alerted(self) -> None:
+        """Record that the daily-limit Telegram alert has already been sent today."""
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                INSERT INTO api_daily_usage (date, calls_used, limit_alerted) VALUES (?, 0, 1)
+                ON CONFLICT(date) DO UPDATE SET limit_alerted = 1
+                """,
+                (today,),
+            )
+            conn.commit()
+
+    def api_limit_already_alerted(self) -> bool:
+        """Return True if the daily-limit alert has already been sent today."""
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT limit_alerted FROM api_daily_usage WHERE date = ?", (today,)
+            ).fetchone()
+            return bool(row and row[0])

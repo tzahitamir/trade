@@ -1,25 +1,22 @@
 fx_pairs:
-  - EURUSD
-  - EURJPY
-  - USDCAD
-  - USDCHF
-  - NZDUSD
-  - GBPJPY
-  - EURGBP
-  - USDJPY   # data fetched for manual review; excluded from alerts via alert_pairs below
-  - XAUUSD   # XAU/USD gold — liquidity sweep mandatory (project plan item 60)
+  - NZDUSD   # WR 68.8%  EV +3.447R  n=48
+  - EURJPY   # WR 59.0%  EV +2.678R  n=78
+  - EURUSD   # WR 62.7%  EV +2.487R  n=75
+  - USDCHF   # WR 58.8%  EV +2.374R  n=80
+  - USDCAD   # WR 61.1%  EV +2.148R  n=54
+  - XAUUSD   # WR 58.6%  EV +1.854R  n=58  — liquidity sweep mandatory
+  - USDJPY   # WR 64.7%  EV +2.429R  n=51  — data fetched; excluded from alerts
 
 # Pairs that generate live Telegram alerts. Subset of fx_pairs.
-# USDJPY excluded: gold params underperforming on recent 30d data (WR 7.7%, EV -0.55R).
+# GBPJPY (WR 52.4%) and EURGBP (WR 48.4%) removed to stay within 800 API calls/day.
+# USDJPY excluded from alerts (no live gold params active).
 alert_pairs:
-  - EURUSD
-  - EURJPY
-  - USDCAD
-  - USDCHF
   - NZDUSD
-  - GBPJPY
-  - EURGBP
-  - XAUUSD   # gold: v235 swp+htf+mx2+nowe+nodh+mxs2+bl  WR=58.6%  EV=+1.854R  n=58
+  - EURJPY
+  - EURUSD
+  - USDCHF
+  - USDCAD
+  - XAUUSD
 
 timeframes:
   - 5m
