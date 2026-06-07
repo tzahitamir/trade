@@ -39,32 +39,30 @@ TIMEFRAME_INTERVAL_MINUTES = {
 
 def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
     """
-    Staggered fetch schedule to stay within Twelve Data free tier (8 API calls/minute).
-    Each timeframe fetches at a different minute to avoid rate limit hits.
-    
-    Schedule (repeats every 15 minutes):
-    - Minute 2, 17, 32, 47: 5m (4x/hour, 3 calls)
-    - Minute 4, 19, 34, 49: 15m (4x/hour, 3 calls)
-    - Minute 7, 22, 37, 52: 30m (4x/hour, 3 calls)
-    - Minute 9, 24, 39, 54: 1h (4x/hour, 3 calls)
-    - Minute 11, 26, 41, 56: 4h (4x/hour, 3 calls)
-    
-    Max calls per minute: 3 (always safe)
+    Minimal fetch schedule — only 15m and 4h are needed for production BOS alerts.
+    Skips weekends and dead hours (18-21 UTC) to stay under 800 calls/day.
+
+    Daily estimate (avg across 7 days):
+      15m: 4/hr × 20 active hours × 9 symbols × 5/7 ≈ 514 calls
+      4h:  5 fetches/day × 9 symbols × 5/7 ≈ 32 calls
+      Total ≈ 546/day  (well under 800 free-tier limit)
     """
     timeframe = timeframe.lower()
-    minute = now.minute
+    minute  = now.minute
+    hour    = now.hour
+    weekday = now.weekday()  # 0=Mon … 6=Sun
 
-    if timeframe in {"5m", "5min"}:
-        return minute % 15 == 2
+    if weekday >= 5:          # Saturday / Sunday — gold filters skip these too
+        return False
+    if hour in {18, 19, 20, 21}:  # dead hours — no edge in these windows
+        return False
+
     if timeframe in {"15m", "15min"}:
         return minute % 15 == 4
-    if timeframe in {"30m", "30min"}:
-        return minute % 30 == 7
-    if timeframe in {"1h", "h1", "60min"}:
-        return minute % 15 == 9
-    if timeframe in {"4h", "h4"}:
-        return minute % 15 == 11
-    return False
+    if timeframe in {"4h", "h4"}:  # once per 4-hour bar close
+        return minute == 0 and hour % 4 == 0
+
+    return False  # 5m, 30m, 1h not used in production
 
 
 def get_timeframes_to_fetch(timeframes: List[str], now: datetime) -> List[str]:
