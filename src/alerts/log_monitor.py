@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -10,13 +10,11 @@ class LogMonitor:
     def __init__(self, log_file: Path, notifier: Optional[TelegramNotifier] = None):
         self.log_file = log_file
         self.notifier = notifier
-        self.last_check = datetime.now(timezone.utc)
+        self.last_check = datetime.now()  # naive local time, matches log timestamps
 
     def scan(self) -> None:
         lines = self._read_recent_lines()
         issues = []
-        now = datetime.now(timezone.utc)
-
         for line in lines:
             timestamp = self._parse_timestamp(line)
             if not timestamp or timestamp <= self.last_check:
@@ -24,7 +22,7 @@ class LogMonitor:
             if "ERROR" in line or "CRITICAL" in line or "[trade] fetch error" in line:
                 issues.append(line.strip())
 
-        self.last_check = now
+        self.last_check = datetime.now()  # update after scan, not before (avoids gap)
 
         if issues:
             alert_text = "[trade] log monitor detected issues:\n" + "\n".join(issues[:10])
