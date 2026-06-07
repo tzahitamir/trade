@@ -56,7 +56,8 @@ intraday cap and is refreshed separately by --experiment-dax.
 
 identify bos 
 
-image should show candles , not a line
+image should show candles , not a line , image should print the confluence name , and a short explanation on the confluence
+the print of the confluence explanation should be below the image 
 
 during development stage , in order to tune parameters , i want to go throgh past data and tune parameters, so when the app thinks a bos is presented, create a mark on the image  of bos, and a mark of the liquidity , with a small arrow that point to each  when development stage is done , the image will be sent right away to telegram , but in dev stage , add the next 50 candles, to the chart ,and then trigger the alert. this way i can see what was the result of the bos and feedback 
 
@@ -132,6 +133,7 @@ when the app run as script in dev mode such as when running stats etc. if you ar
 
 the app runs in production as a service and send alerts based on the chosen best set of parameters, i will instruct when to run in production mode.
 the app should be able to run in production mode and dev mode in parallell on the same node, meaning that the dev and prod process should be ready to co exist on the same node
+the app should save to disk all the images  of production , in a seperate directory next to dev , which is called prod
 
 
 12. SL mode sweep — early trade invalidation
@@ -189,6 +191,9 @@ PARAM_SWEEP_SETS in main.py — add sl_mode variants to existing sets (doubles s
 _apply_param_filter — pass sl_mode through to outcome re-evaluation (note: outcomes must be re-evaluated per sl_mode since they differ, unlike current filters which are post-hoc)
 _compute_stats — add avg_R_win and EV with variable R to output
 Per pair and per timeframe — 4h swings are wider so broken_level may be proportionally tighter than on 15m; optimal mode will differ
+
+13. invalidation of alert
+
 
 60. instructions for xau/usd , check 15m charts similar to smc , but here for xau/usd , liquidity sweep is mandatory before bos
 
@@ -248,11 +253,37 @@ Scan only within the daily session window; discard any signal outside it
 Chart labels: 15m expansion leg, 50% equilibrium line, discount/premium zone shading, 5m signal candle, entry/SL/TP lines
 Statistics: same schema as BOS 15m — WR, avgR, EV, broken down by hour of day within the window and by signal type (BOS vs CHoCH)
 
+Item 90. Loss reduction filters — based on loss pattern analysis (2026-06-07)
+
+Analysis of 6,815 resolved BOS 15m signals over 1 year across 9 pairs revealed five filters that combined improve WR from 37.5% to 58.4% (+20.9pp) and EV from +0.125R to +0.751R per trade (+500%), while retaining 27% of signals (~200 trades/pair/year).
+
+Findings and filters to implement:
+
+No weekend trading — exclude signals on Saturday and Sunday. WR on Sat=21.1%, Sun=29.4% vs weekday average 38–42%. Thin weekend liquidity produces fake BOS that immediately reverse. Filter: dow NOT IN (5, 6).
+
+No dead hours 18–21h UTC (= 21:00–00:00 Israel / 14:00–17:00 NY close) — WR drops to 24–31% in this window vs 45–46% in early London (05–06h UTC). Market wind-down produces low-conviction moves. Filter: hour NOT IN (18, 19, 20, 21).
+
+Max confluence count ≤ 3 — single most powerful filter. WR by count: 1=68.7%, 2=63.4%, 3=40%, 4=24%, 5=21%. Zones where 4–5 confluence types all align are well-known crowded zones — prime stop-hunt targets. A setup with 1–2 specific confluences is stronger than one where the algorithm finds 5 reasons simultaneously. Filter: json_array_length(confluences) <= 3. With ≤ 2 (stricter): WR reaches 69.2%, EV +1.076R, but only 13% of signals remain.
+
+Exclude exhaustion breaks (break_strength ≥ 2.0) — WR drops to 33.6% for very strong breaks vs 37–38% for 0.7–1.5. Extended impulse candles are often end-of-move exhaustion, not the start of a new leg. Filter: break_strength < 2.0.
+
+HTF alignment required — aligned trades: WR=40.2%, counter-trend: WR=30.5%. Nearly 10pp gap. Filter: require 4H bias matches trade direction. (Already implemented in gold params for most pairs but should be a hard filter in the param sweep.)
+
+Momentum early-exit rule (post-entry monitoring):
+91.3% of winning trades reach 1R favorable within 2 candles of entry. 95.4% within 3 candles. Median = 1 candle. If a trade has not moved 1R favorable within 4 candles of trigger, it almost certainly will not succeed. Quartile analysis confirms: trades with minimal progress in first 6 candles (bottom 25%) have WR=30.1% vs WR=47.8% for the top quartile. Closing stalled trades at breakeven (0R) instead of waiting for the full -1R loss improves EV by +0.025R per trade.
+
+Implementation tasks:
+
+Add max_confluences as a swept parameter in PARAM_SWEEP_SETS (values: 2, 3, unlimited)
+Add exclude_weekend: true and dead_hours_filter: true as swept parameters
+Re-run --experiment-bos --update-gold to get new gold params incorporating these filters
+Add --analyze-losses CLI command (already implemented) to re-run this analysis on any new data
+Implement post-entry momentum monitor: after alert is sent, watch each subsequent 15m candle; if price has not reached 0.5R favorable by candle 4, send a Telegram "momentum stalling" warning with suggestion to close at breakeven
+
 100. future features - ignore that section for now
 
-params
-trade duration
-target price 
+log production 
+trade duration 
 trade invalidation
 add a strategy of liquidation, going from one liquidity pool to the other
 loop feedback , how to ensure strategy stll works
