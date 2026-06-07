@@ -1,5 +1,6 @@
 import sqlite3
 import threading
+import time as _time_mod
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -104,6 +105,39 @@ class LocalDB:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gold_params (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                param_set_id INTEGER NOT NULL,
+                win_rate REAL NOT NULL,
+                ev_1_2 REAL NOT NULL,
+                trade_count INTEGER NOT NULL,
+                set_at INTEGER NOT NULL,
+                UNIQUE(strategy, symbol)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_monitors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                entry REAL NOT NULL,
+                sl REAL NOT NULL,
+                tp REAL NOT NULL,
+                breakout_ts INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at INTEGER NOT NULL,
+                notified_stall INTEGER NOT NULL DEFAULT 0,
+                notified_close INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
         # migrate: add columns to existing DBs that predate this schema
         for col_sql in [
             "ALTER TABLE smc_alerts ADD COLUMN alert_id TEXT",
@@ -117,6 +151,10 @@ class LocalDB:
             "ALTER TABLE raw_signals ADD COLUMN doji_body_pct REAL",
             "ALTER TABLE raw_signals ADD COLUMN swing_test_count INTEGER",
             "ALTER TABLE raw_signals ADD COLUMN break_body_pct REAL",
+            "ALTER TABLE raw_signals ADD COLUMN outcome_broken_level TEXT",
+            "ALTER TABLE raw_signals ADD COLUMN outcome_break_candle TEXT",
+            "ALTER TABLE raw_signals ADD COLUMN eff_r_broken_level REAL",
+            "ALTER TABLE raw_signals ADD COLUMN eff_r_break_candle REAL",
         ]:
             try:
                 conn.execute(col_sql)
@@ -202,6 +240,33 @@ class LocalDB:
             row = cursor.fetchone()
         return row[0] if row else None
 
+    def get_all_timestamps(
+        self,
+        symbol: str,
+        timeframe: str,
+        since_ts: Optional[int] = None,
+    ) -> List[int]:
+        """Return all stored timestamps for (symbol, timeframe) in ascending order."""
+        if since_ts is not None:
+            query = """
+                SELECT timestamp FROM fx_candles
+                WHERE symbol = ? AND timeframe = ? AND timestamp >= ?
+                ORDER BY timestamp ASC
+            """
+            params = (symbol, timeframe, since_ts)
+        else:
+            query = """
+                SELECT timestamp FROM fx_candles
+                WHERE symbol = ? AND timeframe = ?
+                ORDER BY timestamp ASC
+            """
+            params = (symbol, timeframe)
+        with self._lock:
+            conn = self._get_conn()
+            cursor = conn.execute(query, params)
+            rows = cursor.fetchall()
+        return [row[0] for row in rows]
+
     def get_or_create_param_set(self, params: dict) -> int:
         """Return the ID of this parameter set, inserting it if it doesn't exist yet."""
         import json, hashlib, time as _time
@@ -220,6 +285,16 @@ class LocalDB:
             )
             conn.commit()
             return cursor.lastrowid
+
+    def get_param_set_by_id(self, param_set_id: int) -> dict:
+        """Return the params dict for a given param_set_id, or {} if not found."""
+        import json
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT params FROM param_sets WHERE id = ?", (param_set_id,)
+            ).fetchone()
+        return json.loads(row[0]) if row else {}
 
     def close(self) -> None:
         # close thread-local connection if exists
@@ -258,8 +333,11 @@ class LocalDB:
              broken_level, break_strength, htf_bias, confluences, outcome,
              hour, month, has_liquidity_sweep, swing_age_candles, session, dow, strategy,
              fvg_size_atr, retrace_depth, doji_body_pct,
-             swing_test_count, break_body_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             swing_test_count, break_body_pct,
+             outcome_broken_level, outcome_break_candle,
+             eff_r_broken_level, eff_r_break_candle)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?)
         """
         rows = [
             (scan_run_id, r["symbol"], r["timeframe"], r["breakout_ts"], r["alert_id"],
@@ -268,7 +346,9 @@ class LocalDB:
              r.get("has_liquidity_sweep", 0), r.get("swing_age_candles"),
              r.get("session"), r.get("dow"), r.get("strategy", "BOS"),
              r.get("fvg_size_atr"), r.get("retrace_depth"), r.get("doji_body_pct"),
-             r.get("swing_test_count"), r.get("break_body_pct"))
+             r.get("swing_test_count"), r.get("break_body_pct"),
+             r.get("outcome_broken_level"), r.get("outcome_break_candle"),
+             r.get("eff_r_broken_level"), r.get("eff_r_break_candle"))
             for r in signals
         ]
         with self._lock:
@@ -282,7 +362,9 @@ class LocalDB:
                 "direction", "broken_level", "break_strength", "htf_bias", "confluences",
                 "outcome", "hour", "month", "has_liquidity_sweep",
                 "swing_age_candles", "session", "dow", "strategy",
-                "swing_test_count", "break_body_pct"]
+                "swing_test_count", "break_body_pct",
+                "outcome_broken_level", "outcome_break_candle",
+                "eff_r_broken_level", "eff_r_break_candle"]
         with self._lock:
             conn = self._get_conn()
             if strategy:
@@ -327,3 +409,93 @@ class LocalDB:
             conn = self._get_conn()
             conn.execute(query, (feedback, alert_id))
             conn.commit()
+
+    def upsert_gold_params(self, strategy: str, symbol: str, param_set_id: int,
+                           win_rate: float, ev_1_2: float, trade_count: int) -> None:
+        import time as _time
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                INSERT INTO gold_params (strategy, symbol, param_set_id, win_rate, ev_1_2, trade_count, set_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(strategy, symbol) DO UPDATE SET
+                    param_set_id=excluded.param_set_id,
+                    win_rate=excluded.win_rate,
+                    ev_1_2=excluded.ev_1_2,
+                    trade_count=excluded.trade_count,
+                    set_at=excluded.set_at
+                """,
+                (strategy, symbol, param_set_id, win_rate, ev_1_2, trade_count, int(_time.time())),
+            )
+            conn.commit()
+
+    # ── trade monitor helpers ──────────────────────────────────────────────────
+
+    def insert_monitor(self, alert_id: str, symbol: str, direction: str,
+                       entry: float, sl: float, tp: float, breakout_ts: int) -> None:
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """INSERT OR IGNORE INTO trade_monitors
+                   (alert_id, symbol, direction, entry, sl, tp, breakout_ts, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,'open',?)""",
+                (alert_id, symbol, direction, entry, sl, tp, breakout_ts, int(_time_mod.time())),
+            )
+            conn.commit()
+
+    def get_open_monitors(self) -> List[Dict]:
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT id, alert_id, symbol, direction, entry, sl, tp, breakout_ts, "
+                "notified_stall, notified_close FROM trade_monitors WHERE status='open'"
+            ).fetchall()
+        keys = ["id", "alert_id", "symbol", "direction", "entry", "sl", "tp",
+                "breakout_ts", "notified_stall", "notified_close"]
+        return [dict(zip(keys, r)) for r in rows]
+
+    def update_monitor(self, alert_id: str, **kwargs) -> None:
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [alert_id]
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(f"UPDATE trade_monitors SET {sets} WHERE alert_id=?", vals)
+            conn.commit()
+
+    def query_candles_after(self, symbol: str, timeframe: str, after_ts: int,
+                             limit: int = 100) -> List[Dict]:
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT timestamp, open, high, low, close FROM fx_candles "
+                "WHERE symbol=? AND timeframe=? AND timestamp>? "
+                "ORDER BY timestamp ASC LIMIT ?",
+                (symbol, timeframe, after_ts, limit),
+            ).fetchall()
+        return [{"timestamp": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4]}
+                for r in rows]
+
+    def get_gold_params(self, strategy: str, symbol: str = None) -> dict:
+        """Return dict keyed by symbol → {param_set_id, win_rate, ev_1_2, trade_count, set_at}."""
+        with self._lock:
+            conn = self._get_conn()
+            if symbol:
+                rows = conn.execute(
+                    "SELECT symbol, param_set_id, win_rate, ev_1_2, trade_count, set_at "
+                    "FROM gold_params WHERE strategy=? AND symbol=?",
+                    (strategy, symbol),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT symbol, param_set_id, win_rate, ev_1_2, trade_count, set_at "
+                    "FROM gold_params WHERE strategy=?",
+                    (strategy,),
+                ).fetchall()
+        return {
+            r[0]: {"param_set_id": r[1], "win_rate": r[2], "ev_1_2": r[3],
+                   "trade_count": r[4], "set_at": r[5]}
+            for r in rows
+        }

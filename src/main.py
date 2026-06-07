@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
@@ -146,11 +147,117 @@ def process_symbol_timeframe(
     db.insert_candles(symbol, timeframe, new_candles)
     logging.info("Inserted %d new candles for %s %s", len(new_candles), symbol, timeframe)
 
-    alerts = alert_manager.evaluate(symbol, timeframe, new_candles)
+    if not settings.should_alert(symbol):
+        logging.debug("Alerts suppressed for %s (not in alert_pairs)", symbol)
+        return
+
+    if timeframe != "15m":
+        return  # only 15m signals for now
+
+    # Load gold params for this symbol/strategy to filter signals
+    gold_map = db.get_gold_params("BOS15m", symbol)
+    gold = gold_map.get(symbol)
+    gold_params: dict = {}
+    if gold:
+        gold_params = db.get_param_set_by_id(gold["param_set_id"])
+
+    # Fetch 4h candles for HTF bias
+    candles_4h = db.query_recent(symbol, "4h", limit=500)
+    htf_bias = None
+    if candles_4h and new_candles:
+        htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, new_candles[-1]["timestamp"])
+
+    # Evaluate with gold params applied
+    alerts = alert_manager.evaluate_production(
+        symbol, timeframe, new_candles, candles_4h=candles_4h,
+        htf_bias=htf_bias, gold_params=gold_params,
+    )
     for alert in alerts:
-        text = alert_manager.format_alert(alert)
+        text = alert_manager.format_production_alert(alert)
         logging.info(text)
         alert_manager.send_alert(text)
+        # register for post-entry momentum monitoring (Task B)
+        try:
+            ev = alert["event"]
+            db.insert_monitor(
+                alert_id=alert["alert_id"],
+                symbol=symbol,
+                direction=ev.get("direction", "bullish"),
+                entry=alert["entry"],
+                sl=alert["sl"],
+                tp=alert["tp"],
+                breakout_ts=ev.get("breakout_ts", 0),
+            )
+        except Exception:
+            logging.exception("Failed to insert trade monitor for %s", alert.get("alert_id"))
+
+
+def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
+    """Check open trade monitors every 15 minutes.
+
+    - candle 4+ with <50% progress toward TP → send stall warning (once per trade)
+    - SL hit → send 🔴 notification and close monitor
+    - TP hit → send ✅ notification and close monitor
+    - >50 candles old → expire silently
+    """
+    monitors = db.get_open_monitors()
+    if not monitors:
+        return
+
+    for m in monitors:
+        symbol    = m["symbol"]
+        direction = m["direction"]
+        entry     = m["entry"]
+        sl        = m["sl"]
+        tp        = m["tp"]
+        b_ts      = m["breakout_ts"]
+        bullish   = direction == "bullish"
+
+        candles = db.query_candles_after(symbol, "15m", b_ts, limit=60)
+        if not candles:
+            continue
+
+        n = len(candles)
+
+        # expire stale monitors
+        if n > 50:
+            db.update_monitor(m["alert_id"], status="expired")
+            continue
+
+        # check SL/TP
+        sl_hit = any(c["low"] <= sl for c in candles) if bullish else any(c["high"] >= sl for c in candles)
+        tp_hit = any(c["high"] >= tp for c in candles) if bullish else any(c["low"] <= tp for c in candles)
+
+        if tp_hit and not m["notified_close"]:
+            alert_manager.send_alert(
+                f"✅ TP HIT: {symbol} {direction.upper()} | entry {entry:.5f} → TP {tp:.5f} | {m['alert_id']}"
+            )
+            db.update_monitor(m["alert_id"], status="tp_hit", notified_close=1)
+            continue
+
+        if sl_hit and not m["notified_close"]:
+            alert_manager.send_alert(
+                f"🔴 SL HIT: {symbol} {direction.upper()} | entry {entry:.5f} → SL {sl:.5f} | {m['alert_id']}"
+            )
+            db.update_monitor(m["alert_id"], status="sl_hit", notified_close=1)
+            continue
+
+        # stall check: after 4 candles, progress < 50% of TP distance
+        if n >= 4 and not m["notified_stall"]:
+            first4 = candles[:4]
+            if bullish:
+                best      = max(c["high"] for c in first4)
+                progress  = (best - entry) / (tp - entry) if (tp - entry) > 0 else 1.0
+            else:
+                best      = min(c["low"] for c in first4)
+                progress  = (entry - best) / (entry - tp) if (entry - tp) > 0 else 1.0
+
+            if progress < 0.5:
+                alert_manager.send_alert(
+                    f"⚠️ Momentum stalling: {symbol} {direction.upper()} — "
+                    f"{progress:.0%} toward TP after 4 candles | {m['alert_id']}"
+                )
+                db.update_monitor(m["alert_id"], notified_stall=1)
 
 
 def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager: AlertManager) -> None:
@@ -174,9 +281,8 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
                 alert_manager.send_fetch_error(symbol, timeframe, str(exc))
 
 
-def _ensure_pair_data(symbol: str, timeframe: str, fetcher: "FXFetcher", db: LocalDB) -> None:
-    """Fetch up to 365 days of historical data for a pair/timeframe, paginating if needed."""
-    target_days = 365
+def _ensure_pair_data(symbol: str, timeframe: str, fetcher: "FXFetcher", db: LocalDB, target_days: int = 365) -> None:
+    """Fetch up to target_days of historical data for a pair/timeframe, paginating if needed."""
     target_cutoff = datetime.now(timezone.utc).timestamp() - target_days * 24 * 3600
     earliest = db.get_earliest_timestamp(symbol, timeframe)
     if earliest is not None and earliest <= target_cutoff:
@@ -194,7 +300,7 @@ def _ensure_pair_data(symbol: str, timeframe: str, fetcher: "FXFetcher", db: Loc
     else:
         end_dt = datetime.now(timezone.utc)
 
-    logging.info("Fetching 365-day history for %s %s (paginating)...", symbol, timeframe)
+    logging.info("Fetching %d-day history for %s %s (paginating)...", target_days, symbol, timeframe)
     try:
         while end_dt.timestamp() > target_cutoff:
             end_date_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -233,7 +339,7 @@ def _scan_one_symbol(args: tuple) -> tuple:
     Renders charts only for events passing active_params.
     All DB writes are deferred to the main process.
     """
-    symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id, strategy = args
+    symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id, strategy, scan_days = args
 
     from db.local_db import LocalDB
     from alerts.alert_manager import AlertManager
@@ -243,16 +349,19 @@ def _scan_one_symbol(args: tuple) -> tuple:
     alert_manager = AlertManager(settings, db=db)
     dev_mode = settings.dev_mode
 
-    candles_desc = db.query_recent(symbol, timeframe, limit=_candle_limit(timeframe))
+    candles_desc = db.query_recent(symbol, timeframe, limit=_candle_limit(timeframe, days=scan_days))
     if not candles_desc:
         db.close()
         return symbol, 0, [], [], [], []
 
-    candles_4h = db.query_recent(symbol, htf, limit=_candle_limit(htf))
+    candles_4h = db.query_recent(symbol, htf, limit=_candle_limit(htf, days=scan_days))
+    gold_map = db.get_gold_params(strategy)
+    gold_wr  = gold_map.get(symbol, {}).get("win_rate")
     n = len(candles_desc)
     count = 0
-    seen_raw: set = set()    # dedup for raw_signal storage
-    seen_active: set = set() # dedup for chart rendering (active_params)
+    seen_raw: set = set()      # dedup for raw_signal storage
+    seen_active: set = set()   # dedup for active_params counting / chart rendering
+    outcome_cache: dict = {}   # key → (outcome_swing, outcome_bl, outcome_bc)
     trade_results = []
     alert_records = []
     log_lines = []
@@ -267,7 +376,9 @@ def _scan_one_symbol(args: tuple) -> tuple:
             continue
 
         window = candles_desc[n - 1 - k:]
-        lookahead = candles_desc[max(0, n - k - 51) : n - 1 - k] if dev_mode else None
+        # Always compute lookahead for confluence detection and outcome evaluation.
+        # Chart renderer only gets it in dev_mode to hide future candles from the chart.
+        lookahead = candles_desc[max(0, n - k - 51) : n - 1 - k]
 
         # Detect with no break_strength filter to capture all potential signals
         bos_events = alert_manager.analyzer.detect_bos(
@@ -282,7 +393,7 @@ def _scan_one_symbol(args: tuple) -> tuple:
 
         htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, bos_ts) if candles_4h else None
         pre_bos_chron = list(reversed(window))
-        lookahead_chron = list(reversed(lookahead)) if lookahead else []
+        lookahead_chron = list(reversed(lookahead))
         atr = alert_manager.analyzer.calculate_atr(window) or 0.0
 
         for ev in bos_events:
@@ -310,20 +421,27 @@ def _scan_one_symbol(args: tuple) -> tuple:
             # Store raw signal (first occurrence per level across the full scan)
             if key not in seen_raw:
                 seen_raw.add(key)
-                outcome_raw = AlertManager.evaluate_bos_outcome(
-                    window, ev, lookahead_chron, candles_4h, trigger_ts_val
+                outcome_swing, eff_r_swing = AlertManager.evaluate_bos_outcome(
+                    window, ev, lookahead_chron, candles_4h, trigger_ts_val, sl_mode="swing"
                 )
+                outcome_bl, eff_r_bl = AlertManager.evaluate_bos_outcome(
+                    window, ev, lookahead_chron, candles_4h, trigger_ts_val, sl_mode="broken_level"
+                )
+                outcome_bc, eff_r_bc = AlertManager.evaluate_bos_outcome(
+                    window, ev, lookahead_chron, candles_4h, trigger_ts_val, sl_mode="break_candle"
+                )
+                outcome_cache[key] = (outcome_swing, outcome_bl, outcome_bc)
                 raw_signal_records.append({
                     "symbol": symbol,
                     "timeframe": timeframe,
                     "breakout_ts": ev["breakout_ts"],
-                    "alert_id": AlertManager._generate_alert_id(symbol, ev["breakout_ts"]),
+                    "alert_id": AlertManager._generate_alert_id(symbol, ev["breakout_ts"], prefix=strategy.lower()),
                     "direction": ev["direction"],
                     "broken_level": ev["broken_level"],
                     "break_strength": ev.get("break_strength", 0.0),
                     "htf_bias": htf_bias,
                     "confluences": json.dumps(confluences),
-                    "outcome": outcome_raw,
+                    "outcome": outcome_swing,
                     "hour": bos_dt.hour,
                     "month": bos_dt.strftime("%Y-%m"),
                     "has_liquidity_sweep": 1 if ev.get("liquidity_sweep") else 0,
@@ -334,6 +452,10 @@ def _scan_one_symbol(args: tuple) -> tuple:
                     "dow": bos_dt.weekday(),
                     "strategy": strategy,
                     "scan_run_id": scan_run_id,
+                    "outcome_broken_level": outcome_bl,
+                    "outcome_break_candle": outcome_bc,
+                    "eff_r_broken_level": eff_r_bl,
+                    "eff_r_break_candle": eff_r_bc,
                 })
 
             # Apply active_params filter for chart rendering (separate dedup)
@@ -347,16 +469,18 @@ def _scan_one_symbol(args: tuple) -> tuple:
             seen_active.add(key)
             count += 1
 
-            alert = alert_manager.render_alert(
-                symbol, timeframe, ev, window, lookahead, htf_bias, confluences,
-                trigger_ts=trigger_ts_val, candles_4h=candles_4h,
-                param_set_id=param_set_id, skip_db=True,
-            )
+            # Build trade result from cached outcomes — avoids expensive chart I/O for historical signals.
+            active_sl_mode = active_params.get("sl_mode", "swing")
+            cached = outcome_cache.get(key, ("OPEN", "OPEN", "OPEN"))
+            active_outcome = {
+                "swing": cached[0], "broken_level": cached[1], "break_candle": cached[2],
+            }.get(active_sl_mode, cached[0])
+            alert_id = AlertManager._generate_alert_id(symbol, ev["breakout_ts"], prefix=strategy.lower())
 
             trade_results.append({
-                "alert_id": alert["alert_id"],
-                "outcome": alert.get("outcome", "OPEN"),
-                "confluences": alert.get("confluences", []),
+                "alert_id": alert_id,
+                "outcome": active_outcome,
+                "confluences": confluences,
                 "symbol": symbol,
                 "hour": bos_dt.hour,
                 "month": bos_dt.strftime("%Y-%m"),
@@ -364,21 +488,33 @@ def _scan_one_symbol(args: tuple) -> tuple:
                 "htf_bias": htf_bias,
                 "bos_direction": ev["direction"],
             })
-            alert_records.append({
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "ts": ev.get("breakout_ts", 0),
-                "message": alert["message"],
-                "image_path": alert.get("image_path"),
-                "params_used": json.dumps(ev.get("params_used", {})),
-                "alert_id": alert["alert_id"],
-                "param_set_id": param_set_id,
-            })
+
+            # Render chart only for recent signals (last 7 days) — skip for bulk historical scan
+            if ev["breakout_ts"] >= time.time() - 7 * 86400:
+                try:
+                    alert = alert_manager.render_alert(
+                        symbol, timeframe, ev, window, lookahead if dev_mode else None, htf_bias, confluences,
+                        trigger_ts=trigger_ts_val, candles_4h=candles_4h,
+                        param_set_id=param_set_id, skip_db=True,
+                        strategy=strategy.lower(), gold_wr=gold_wr,
+                    )
+                    alert_records.append({
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "ts": ev.get("breakout_ts", 0),
+                        "message": alert["message"],
+                        "image_path": alert.get("image_path"),
+                        "params_used": json.dumps(ev.get("params_used", {})),
+                        "alert_id": alert["alert_id"],
+                        "param_set_id": param_set_id,
+                    })
+                except Exception as exc:
+                    log_lines.append(f"  [{symbol}] Chart render failed for {alert_id}: {exc}")
 
             sweep = ev.get("liquidity_sweep") or {}
             sweep_str = ("  sweep@" + datetime.fromtimestamp(sweep["timestamp"], tz=timezone.utc).strftime("%H:%M")) if sweep else ""
             log_lines.append(
-                f"  [{symbol}] {ev['direction'].upper()} BOS  id={alert['alert_id']}"
+                f"  [{symbol}] {ev['direction'].upper()} BOS  id={alert_id}"
                 f"  level={ev['broken_level']:.5f}  str={ev['break_strength']:.2f}"
                 f"  4H={( htf_bias or '?').upper():<8}  ts={bos_dt.strftime('%Y-%m-%d %H:%M')}{sweep_str}"
                 f"  conf={','.join(confluences)}"
@@ -399,6 +535,12 @@ _SWEEP_BASE = {
     "htf_aligned_only": False,
     "session": "all",
     "exclude_pairs": [],
+    "sl_mode": "swing",
+    # item-90 loss-reduction filters
+    "max_confluences": None,   # None = no cap; 2 or 3 to limit crowded setups
+    "exclude_weekend": False,  # True = skip Sat/Sun signals
+    "dead_hours_utc": [],      # e.g. [18,19,20,21] to skip late-NY wind-down
+    "max_break_strength": None, # None = no cap; 2.0 to exclude exhaustion candles
 }
 
 PARAM_SWEEP_SETS = [
@@ -445,6 +587,99 @@ PARAM_SWEEP_SETS = [
     {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "min_break_body_pct": 0.4},
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "session": "active", "exclude_pairs": ["GBPJPY"]},
     {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "session": "active"},
+    # ── Tier 11: SL mode comparison (same signal quality, vary exit logic) ────
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "sl_mode": "break_candle"},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "sl_mode": "break_candle"},
+    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "sl_mode": "break_candle"},
+    # ── Tier 12: liquidity sweep required — used for XAU/USD gold selection ──────
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True, "htf_aligned_only": True},
+    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": True},
+    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": True, "htf_aligned_only": True},
+    {**_SWEEP_BASE, "min_break_strength": 1.5,  "require_brt_confluence": False, "require_liquidity_sweep": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE, "min_break_strength": 1.0,  "require_brt_confluence": False, "require_liquidity_sweep": True, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True, "htf_aligned_only": True, "sl_mode": "broken_level"},
+    # ── Tier 13: max-confluence cap (item 90 — counterintuitive: more confs → lower WR) ─
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "max_confluences": 3},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "max_confluences": 2},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 3},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 2},
+    # ── Tier 14: weekend + dead-hours exclusion ───────────────────────────────
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "exclude_weekend": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "dead_hours_utc": [18, 19, 20, 21]},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21]},
+    # ── Tier 15: all loss-reduction filters combined (FX) ────────────────────
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 3, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 3, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level"},
+    # ── Tier 16: all loss-reduction filters combined + sweep-required (XAUUSD) ─
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True,  "htf_aligned_only": True, "max_confluences": 3, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True,  "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level"},
+]
+
+# Symbols for which gold params must come from sweep-required param sets only.
+SWEEP_REQUIRED_SYMBOLS: frozenset = frozenset({"XAUUSD"})
+
+
+# ── 4h-specific parameter sweep ───────────────────────────────────────────────
+# 4h candles span 4 hours each; swing_lookback=10 means 40h of context for swing
+# detection (vs 15m where 10 candles = 2.5h). SL mode is the primary variable
+# to test since 4h swing SLs are very wide and tight exits can dramatically lift R.
+_SWEEP_BASE_4H = {
+    "min_break_distance_atr_mult": 0.3,
+    "min_atr_pct": 0.0003,
+    "min_swing_age_candles": 3,
+    "swing_lookback": 10,
+    "lookahead_candles": 50,
+    "require_brt_confluence": False,
+    "require_liquidity_sweep": False,
+    "scan_days": 730,
+    "min_conf_count": 1,
+    "htf_aligned_only": False,
+    "session": "all",
+    "exclude_pairs": [],
+    "sl_mode": "swing",
+}
+
+PARAM_SWEEP_SETS_4H = [
+    # ── Tier 1: swing lookback variants (baseline SL) ────────────────────────
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "swing_lookback": 5},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "swing_lookback": 10},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "swing_lookback": 15},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "swing_lookback": 20},
+    # ── Tier 2: break-strength variants ──────────────────────────────────────
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.5},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.5},
+    {**_SWEEP_BASE_4H, "min_break_strength": 2.0},
+    # ── Tier 3: HTF alignment filter ─────────────────────────────────────────
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "htf_aligned_only": True},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0,  "htf_aligned_only": True},
+    # ── Tier 4: SL mode — broken_level (tighter than swing) ──────────────────
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "sl_mode": "broken_level"},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "sl_mode": "broken_level", "swing_lookback": 10},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0,  "sl_mode": "broken_level"},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "sl_mode": "broken_level", "htf_aligned_only": True},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0,  "sl_mode": "broken_level", "htf_aligned_only": True},
+    # ── Tier 5: SL mode — break_candle (tightest) ────────────────────────────
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "sl_mode": "break_candle"},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "sl_mode": "break_candle", "swing_lookback": 10},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0,  "sl_mode": "break_candle"},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "sl_mode": "break_candle", "htf_aligned_only": True},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0,  "sl_mode": "break_candle", "htf_aligned_only": True},
+    # ── Tier 6: swing age and confluence count ────────────────────────────────
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "min_swing_age_candles": 5},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "min_swing_age_candles": 5,  "htf_aligned_only": True},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "min_conf_count": 2},
+    # ── Tier 7: best combos of str + htf + sl_mode ───────────────────────────
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0,  "htf_aligned_only": True, "sl_mode": "broken_level"},
+    {**_SWEEP_BASE_4H, "min_break_strength": 1.0,  "htf_aligned_only": True, "sl_mode": "break_candle"},
+    {**_SWEEP_BASE_4H, "min_break_strength": 0.7,  "htf_aligned_only": True, "sl_mode": "broken_level", "min_conf_count": 2},
 ]
 
 
@@ -459,10 +694,17 @@ def _apply_param_filter(raw_signals: list, params: dict) -> list:
     min_swing_age      = params.get("min_swing_age_candles", 5)
     min_swing_tests    = params.get("min_swing_test_count", 0)
     min_break_body     = params.get("min_break_body_pct", 0.0)
+    # item-90 loss-reduction filters
+    max_conf_cap       = params.get("max_confluences")     # None = no cap
+    excl_weekend       = params.get("exclude_weekend", False)
+    dead_hours         = set(params.get("dead_hours_utc", []))
+    max_str_cap        = params.get("max_break_strength")  # None = no cap
 
     result = []
     for r in raw_signals:
         if r["break_strength"] < min_str:
+            continue
+        if max_str_cap is not None and r["break_strength"] >= max_str_cap:
             continue
         confs = json.loads(r["confluences"]) if isinstance(r["confluences"], str) else r["confluences"]
         if req_brt and "BRT" not in confs:
@@ -470,6 +712,8 @@ def _apply_param_filter(raw_signals: list, params: dict) -> list:
         if req_sweep and not r.get("has_liquidity_sweep"):
             continue
         if len(confs) < min_conf:
+            continue
+        if max_conf_cap is not None and len(confs) > max_conf_cap:
             continue
         if htf_aligned_only and (not r.get("htf_bias") or r["htf_bias"] != r["direction"]):
             continue
@@ -489,6 +733,10 @@ def _apply_param_filter(raw_signals: list, params: dict) -> list:
             continue
         break_body = r.get("break_body_pct")
         if min_break_body > 0 and (break_body is None or break_body < min_break_body):
+            continue
+        if excl_weekend and r.get("dow", 0) in (5, 6):
+            continue
+        if dead_hours and r.get("hour") in dead_hours:
             continue
         result.append({**r, "confluences": confs})
     return result
@@ -520,21 +768,45 @@ def _pset_label(pset: dict) -> str:
     bb = pset.get("min_break_body_pct", 0.0)
     if bb > 0:
         parts.append(f"body{int(bb*100)}")
+    mc = pset.get("max_confluences")
+    if mc is not None:
+        parts.append(f"mx{mc}")
+    if pset.get("exclude_weekend"):
+        parts.append("nowe")
+    dh = pset.get("dead_hours_utc", [])
+    if dh:
+        parts.append("nodh")
+    ms = pset.get("max_break_strength")
+    if ms is not None:
+        parts.append(f"mxs{ms:.0f}")
+    slm = pset.get("sl_mode", "swing")
+    if slm != "swing":
+        parts.append("bl" if slm == "broken_level" else "bc")
     return "+".join(parts)
 
 
-def _raw_to_trade_result(r: dict) -> dict:
+def _raw_to_trade_result(r: dict, sl_mode: str = "swing") -> dict:
     confs = r["confluences"] if isinstance(r["confluences"], list) else json.loads(r["confluences"])
+    if sl_mode == "broken_level":
+        outcome = r.get("outcome_broken_level") or r["outcome"]
+        r_win = r.get("eff_r_broken_level") or 2.0
+    elif sl_mode == "break_candle":
+        outcome = r.get("outcome_break_candle") or r["outcome"]
+        r_win = r.get("eff_r_break_candle") or 2.0
+    else:
+        outcome = r["outcome"]
+        r_win = 2.0
     return {
-        "alert_id":     r["alert_id"],
-        "outcome":      r["outcome"],
-        "confluences":  confs,
-        "symbol":       r["symbol"],
-        "hour":         r["hour"],
-        "month":        r["month"],
+        "alert_id":       r["alert_id"],
+        "outcome":        outcome or "OPEN",
+        "r_win":          r_win,
+        "confluences":    confs,
+        "symbol":         r["symbol"],
+        "hour":           r["hour"],
+        "month":          r["month"],
         "break_strength": r["break_strength"],
-        "htf_bias":     r.get("htf_bias"),
-        "bos_direction": r["direction"],
+        "htf_bias":       r.get("htf_bias"),
+        "bos_direction":  r["direction"],
     }
 
 
@@ -551,6 +823,10 @@ def _compute_stats(trade_results: list) -> dict:
     n_losses = n_res - n_wins
     wr = n_wins / n_res if n_res else 0.0
     lr = 1.0 - wr
+
+    r_wins = [r.get("r_win", 2.0) for r in resolved if is_win(r["outcome"]) and r.get("r_win") is not None]
+    avg_r_win = round(sum(r_wins) / len(r_wins), 3) if r_wins else 2.0
+    ev_var = round(avg_r_win * wr - lr, 4)
 
     def _count_group(items, key_fn):
         data = {}
@@ -602,6 +878,8 @@ def _compute_stats(trade_results: list) -> dict:
         "open":     all_oc.get("OPEN", 0),
         "resolved": n_res,
         "win_rate": round(wr, 4),
+        "avg_r_win": avg_r_win,
+        "ev_variable_r": ev_var,
         "expected_value": {
             "1:2":   round(wr * 2 - lr, 4),
             "1:1.5": round(wr * 1.5 - lr, 4),
@@ -616,11 +894,15 @@ def _compute_stats(trade_results: list) -> dict:
     }
 
 
-def _run_param_sweep(raw_signals: list, db: LocalDB) -> tuple:
-    """Evaluate all PARAM_SWEEP_SETS against raw_signals; print comparison table; store in DB."""
+def _run_param_sweep(raw_signals: list, db: LocalDB,
+                     strategy: str = "BOS15m", update_gold: bool = False,
+                     param_sets: list = None) -> tuple:
+    """Evaluate param_sets (defaults to PARAM_SWEEP_SETS) against raw_signals."""
+    if param_sets is None:
+        param_sets = PARAM_SWEEP_SETS
     all_symbols = sorted({r["symbol"] for r in raw_signals})
     logging.info("")
-    logging.info("=== Parameter Sweep (%d sets × %d pairs) ===", len(PARAM_SWEEP_SETS), len(all_symbols))
+    logging.info("=== Parameter Sweep (%d sets × %d pairs) ===", len(param_sets), len(all_symbols))
     hdr_pairs = "  ".join(f"{s[:6]:>6}" for s in all_symbols)
     logging.info("  %-30s  %s  %s  %s", "Params", hdr_pairs, "OVERAL", "EV1:2")
     logging.info("  " + "-" * 102)
@@ -628,12 +910,13 @@ def _run_param_sweep(raw_signals: list, db: LocalDB) -> tuple:
     all_pair_stats: dict = {}
     pset_ids: list = []
 
-    for pset in PARAM_SWEEP_SETS:
+    for pset in param_sets:
         pset_id = db.get_or_create_param_set(pset)
         pset_ids.append(pset_id)
+        sl_mode = pset.get("sl_mode", "swing")
 
         filtered = _apply_param_filter(raw_signals, pset)
-        trades   = [_raw_to_trade_result(r) for r in filtered]
+        trades   = [_raw_to_trade_result(r, sl_mode=sl_mode) for r in filtered]
 
         for sym in all_symbols:
             sym_trades = [t for t in trades if t["symbol"] == sym]
@@ -645,27 +928,51 @@ def _run_param_sweep(raw_signals: list, db: LocalDB) -> tuple:
         all_pair_stats[(pset_id, "ALL")] = ov
         db.insert_scan_stats(pset_id, "ALL", ov["total"], ov["wins"], ov["losses"], ov["open"], json.dumps(ov))
 
-        lbl       = _pset_label(pset)
+        lbl      = _pset_label(pset)
         pair_cols = "  ".join(f"{all_pair_stats[(pset_id, s)]['win_rate']*100:>5.1f}%" for s in all_symbols)
-        ev_12     = ov.get("expected_value", {}).get("1:2", 0)
-        logging.info("  v%-3d %-25s  %s  %5.1f%%  %+.3fR",
-                     pset_id, lbl, pair_cols, ov["win_rate"] * 100, ev_12)
+        ev_disp  = ov.get("ev_variable_r", ov.get("expected_value", {}).get("1:2", 0))
+        avg_r    = ov.get("avg_r_win", 2.0)
+        r_tag    = f"avgR:{avg_r:.2f}" if sl_mode != "swing" else ""
+        logging.info("  v%-3d %-25s  %s  %5.1f%%  %s%+.3fR",
+                     pset_id, lbl, pair_cols, ov["win_rate"] * 100,
+                     f"{r_tag}  " if r_tag else "", ev_disp)
 
     logging.info("")
     logging.info("Best param set per pair (min 20 resolved trades):")
+    gold_map = db.get_gold_params(strategy)
     for sym in all_symbols:
         candidates = [
-            (pid, pset) for pid, pset in zip(pset_ids, PARAM_SWEEP_SETS)
+            (pid, pset) for pid, pset in zip(pset_ids, param_sets)
             if all_pair_stats.get((pid, sym), {}).get("resolved", 0) >= 20
         ]
+        if sym in SWEEP_REQUIRED_SYMBOLS:
+            sweep_cands = [(pid, pset) for pid, pset in candidates
+                           if pset.get("require_liquidity_sweep", False)]
+            if sweep_cands:
+                candidates = sweep_cands
+            else:
+                logging.info("  %-10s  (no sweep-required set with ≥20 trades)", sym)
         if not candidates:
             logging.info("  %-10s  (no param set with ≥20 trades)", sym)
             continue
-        best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)]["win_rate"])
+        best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)].get("ev_variable_r", 0))
         s = all_pair_stats[(best_pid, sym)]
-        logging.info("  %-10s  v%-3d %-25s  WR: %5.1f%%  Trades: %d  EV 1:2: %+.3fR",
-                     sym, best_pid, _pset_label(best_pset), s["win_rate"] * 100, s["resolved"],
-                     s.get("expected_value", {}).get("1:2", 0))
+        ev_var = s.get("ev_variable_r", s.get("expected_value", {}).get("1:2", 0))
+        avg_r  = s.get("avg_r_win", 2.0)
+        gold = gold_map.get(sym)
+        if gold:
+            delta_wr = s["win_rate"] - gold["win_rate"]
+            delta_ev = ev_var - gold["ev_1_2"]
+            gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV]"
+            if update_gold:
+                db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_var, s["resolved"])
+                gold_note += " ← GOLD UPDATED"
+        else:
+            db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_var, s["resolved"])
+            gold_note = " ← GOLD SET"
+        logging.info("  %-10s  v%-3d %-25s  WR: %5.1f%%  avgR: %.2f  Trades: %d  EV: %+.3fR%s",
+                     sym, best_pid, _pset_label(best_pset), s["win_rate"] * 100, avg_r,
+                     s["resolved"], ev_var, gold_note)
 
     return all_pair_stats, all_symbols, pset_ids
 
@@ -676,13 +983,16 @@ def _send_sweep_summary(
     all_pair_stats: dict,
     all_symbols: list,
     pset_ids: list,
+    param_sets: list = None,
 ) -> None:
     """Send a concise Telegram summary of the sweep results."""
+    if param_sets is None:
+        param_sets = PARAM_SWEEP_SETS
     try:
         pset_ev = []
-        for pid, pset in zip(pset_ids, PARAM_SWEEP_SETS):
+        for pid, pset in zip(pset_ids, param_sets):
             ov = all_pair_stats.get((pid, "ALL"), {})
-            ev = ov.get("expected_value", {}).get("1:2", -999)
+            ev = ov.get("ev_variable_r", ov.get("expected_value", {}).get("1:2", -999))
             wr = ov.get("win_rate", 0)
             n  = ov.get("resolved", 0)
             if n >= 20:
@@ -691,9 +1001,9 @@ def _send_sweep_summary(
 
         lines = [
             f"BOS Param Sweep — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-            f"Signals: {len(raw_signals):,}  Sets: {len(PARAM_SWEEP_SETS)}",
+            f"Signals: {len(raw_signals):,}  Sets: {len(param_sets)}",
             "",
-            "Top 5 by EV (1:2 R:R):",
+            "Top 5 by EV:",
         ]
         for i, (pid, pset, ev, wr, n) in enumerate(pset_ev[:5], 1):
             lines.append(f"  {i}. v{pid} {_pset_label(pset)}: WR={wr*100:.1f}% EV={ev:+.3f}R (n={n})")
@@ -701,20 +1011,301 @@ def _send_sweep_summary(
         lines += ["", "Best per pair (>=20 trades):"]
         for sym in all_symbols:
             candidates = [
-                (pid, pset) for pid, pset in zip(pset_ids, PARAM_SWEEP_SETS)
+                (pid, pset) for pid, pset in zip(pset_ids, param_sets)
                 if all_pair_stats.get((pid, sym), {}).get("resolved", 0) >= 20
             ]
             if not candidates:
                 lines.append(f"  {sym}: (no qualifying set)")
                 continue
-            best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)]["win_rate"])
+            best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)].get("ev_variable_r", 0))
             s = all_pair_stats[(best_pid, sym)]
             lines.append(f"  {sym}: {_pset_label(best_pset)} WR={s['win_rate']*100:.1f}% (n={s['resolved']})")
 
         alert_manager.notifier.send_message("\n".join(lines))
         logging.info("Sweep summary sent to Telegram")
+
+        # Send most recent chart per pair so setups are visible without needing local disk access
+        charts_dir = alert_manager.charts_dir
+        for sym in all_symbols:
+            matches = sorted(
+                charts_dir.glob(f"bos15m-*-{sym.lower()}-*.png"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not matches:
+                continue
+            best_cands = [
+                (pid, pset) for pid, pset in zip(pset_ids, param_sets)
+                if all_pair_stats.get((pid, sym), {}).get("resolved", 0) >= 20
+            ]
+            if best_cands:
+                best_pid, best_pset = max(
+                    best_cands, key=lambda x: all_pair_stats[(x[0], sym)].get("ev_variable_r", 0)
+                )
+                s = all_pair_stats[(best_pid, sym)]
+                caption = (
+                    f"{sym} — {_pset_label(best_pset)}\n"
+                    f"WR={s['win_rate']*100:.1f}%  "
+                    f"avgR={s.get('avg_r_win', 0):.2f}  "
+                    f"EV={s.get('ev_variable_r', 0):+.3f}R  "
+                    f"n={s['resolved']}"
+                )
+            else:
+                caption = f"{sym} — most recent BOS signal"
+            try:
+                alert_manager.send_alert({"message": caption, "image_path": str(matches[0]), "alert_id": ""})
+            except Exception as chart_exc:
+                logging.warning("Failed to send chart for %s: %s", sym, chart_exc)
     except Exception as exc:
         logging.warning("Failed to send sweep summary: %s", exc)
+
+
+def run_loss_analysis(db: LocalDB, alert_manager: AlertManager,
+                      strategy: str = "BOS15m", timeframe: str = "15m") -> None:
+    """Analyse what predicts losing trades and whether early-exit rules improve EV."""
+    import sqlite3 as _sq, bisect as _bs, statistics as _st
+
+    conn = _sq.connect(db.db_path)
+    conn.row_factory = _sq.Row
+    cur = conn.cursor()
+
+    row = cur.execute(
+        "SELECT scan_run_id FROM raw_signals WHERE strategy=? "
+        "GROUP BY scan_run_id ORDER BY COUNT(*) DESC LIMIT 1", (strategy,)
+    ).fetchone()
+    if not row:
+        logging.error("No raw signals for strategy=%s — run --experiment-bos first", strategy)
+        return
+    scan_run_id = row["scan_run_id"]
+
+    run_date = datetime.fromtimestamp(scan_run_id, tz=timezone.utc).strftime("%Y-%m-%d")
+    lines: list = [f"=== Loss Pattern Analysis ({strategy}) — {run_date} ===", ""]
+
+    def _section(title: str, rows, label_fn, min_n: int = 10) -> None:
+        lines.append(title)
+        for r in rows:
+            n, w = r["n"], r["wins"]
+            if n < min_n:
+                continue
+            lines.append(f"  {label_fn(r):<18} WR={w/n*100:5.1f}%  n={n:4d}")
+        lines.append("")
+
+    DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    q, s = (scan_run_id, strategy)
+
+    # ── 1. Day of week ─────────────────────────────────────────────────
+    _section("Day of week:", cur.execute(
+        "SELECT dow, COUNT(*) n, SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "GROUP BY dow ORDER BY dow", (q, s)).fetchall(),
+        lambda r: DOW[r["dow"]] if r["dow"] is not None and 0 <= r["dow"] <= 6 else "?")
+
+    # ── 2. Session ─────────────────────────────────────────────────────
+    _section("Session:", cur.execute(
+        "SELECT COALESCE(session,'?') session, COUNT(*) n, "
+        "SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "GROUP BY session", (q, s)).fetchall(),
+        lambda r: r["session"])
+
+    # ── 3. Hour of day ─────────────────────────────────────────────────
+    h_rows = cur.execute(
+        "SELECT hour, COUNT(*) n, SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "GROUP BY hour ORDER BY hour", (q, s)).fetchall()
+    qual = [r for r in h_rows if r["n"] >= 20]
+    lines.append("Best hours (UTC):  " + "  ".join(
+        f"{r['hour']:02d}h={r['wins']/r['n']*100:.0f}%(n={r['n']})"
+        for r in sorted(qual, key=lambda r: r["wins"]/r["n"], reverse=True)[:5]))
+    lines.append("Worst hours (UTC): " + "  ".join(
+        f"{r['hour']:02d}h={r['wins']/r['n']*100:.0f}%(n={r['n']})"
+        for r in sorted(qual, key=lambda r: r["wins"]/r["n"])[:5]))
+    lines.append("")
+
+    # ── 4. Break strength ─────────────────────────────────────────────
+    _section("Break strength:", cur.execute(
+        "SELECT CASE WHEN break_strength<1.0 THEN '0.7-1.0' "
+        "           WHEN break_strength<1.5 THEN '1.0-1.5' "
+        "           WHEN break_strength<2.0 THEN '1.5-2.0' "
+        "           ELSE '2.0+' END bucket, "
+        "COUNT(*) n, SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "GROUP BY bucket ORDER BY MIN(break_strength)", (q, s)).fetchall(),
+        lambda r: "str " + r["bucket"])
+
+    # ── 5. HTF alignment ──────────────────────────────────────────────
+    _section("HTF alignment:", cur.execute(
+        "SELECT CASE WHEN (direction='bullish' AND htf_bias='bullish') "
+        "                 OR (direction='bearish' AND htf_bias='bearish') "
+        "            THEN 'aligned' ELSE 'counter' END align, "
+        "COUNT(*) n, SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "AND htf_bias IS NOT NULL GROUP BY align", (q, s)).fetchall(),
+        lambda r: r["align"])
+
+    # ── 6. Confluence count ───────────────────────────────────────────
+    _section("Confluence count:", cur.execute(
+        "SELECT json_array_length(confluences) n_conf, COUNT(*) n, "
+        "SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "GROUP BY n_conf ORDER BY n_conf", (q, s)).fetchall(),
+        lambda r: f"confs={r['n_conf']}")
+
+    # ── 7. Liquidity sweep ────────────────────────────────────────────
+    _section("Liquidity sweep:", cur.execute(
+        "SELECT has_liquidity_sweep, COUNT(*) n, "
+        "SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "GROUP BY has_liquidity_sweep", (q, s)).fetchall(),
+        lambda r: "sweep" if r["has_liquidity_sweep"] else "no_sweep")
+
+    # ── 8. Monthly trend ──────────────────────────────────────────────
+    lines.append("Monthly trend:")
+    for r in cur.execute(
+        "SELECT month, COUNT(*) n, SUM(CASE WHEN outcome LIKE '%WIN%' THEN 1 ELSE 0 END) wins "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "GROUP BY month ORDER BY month", (q, s)).fetchall():
+        wr = r["wins"] / r["n"] * 100
+        bar = "▲" if wr >= 35 else ("▼" if wr < 25 else "─")
+        lines.append(f"  {r['month']}  WR={wr:5.1f}%  n={r['n']:3d}  {bar}")
+    lines.append("")
+
+    # ── 9. Candle-by-candle momentum analysis ────────────────────────
+    logging.info("Loading candle data for momentum analysis...")
+    sig_rows = cur.execute(
+        "SELECT breakout_ts, symbol, direction, broken_level, outcome "
+        "FROM raw_signals WHERE scan_run_id=? AND strategy=? AND outcome!='OPEN' "
+        "ORDER BY symbol, breakout_ts", (q, s)).fetchall()
+
+    # Load all candles into parallel arrays (one pass per pair)
+    pair_ts: dict = {}; pair_hi: dict = {}; pair_lo: dict = {}
+    for sym in set(r["symbol"] for r in sig_rows):
+        rows_c = cur.execute(
+            "SELECT timestamp, high, low FROM fx_candles "
+            "WHERE symbol=? AND timeframe=? ORDER BY timestamp ASC", (sym, timeframe)).fetchall()
+        pair_ts[sym] = [c["timestamp"] for c in rows_c]
+        pair_hi[sym] = [c["high"] for c in rows_c]
+        pair_lo[sym] = [c["low"] for c in rows_c]
+
+    logging.info("Candles loaded. Running momentum analysis over %d signals...", len(sig_rows))
+
+    CHKPTS = [1, 2, 3, 4, 5, 6, 8, 10]
+    win_fav: dict = {k: [] for k in CHKPTS}
+    loss_fav: dict = {k: [] for k in CHKPTS}
+    fav6_records: list = []       # (fav6_atr, is_win)
+    time_to_1r: list = []         # candles to reach 1×ATR from entry for WIN signals
+
+    for sig in sig_rows:
+        sym, ts, drn, entry = sig["symbol"], sig["breakout_ts"], sig["direction"], sig["broken_level"]
+        is_win = "WIN" in sig["outcome"]
+        ts_list = pair_ts.get(sym, [])
+        if not ts_list:
+            continue
+
+        idx = _bs.bisect_right(ts_list, ts)
+
+        # ATR from prior 14 candles
+        p0 = max(0, idx - 14)
+        ph, pl = pair_hi[sym][p0:idx], pair_lo[sym][p0:idx]
+        atr = _st.mean(h - l for h, l in zip(ph, pl)) if len(ph) >= 2 else entry * 0.001
+        if atr <= 0:
+            atr = entry * 0.001
+
+        fh, fl = pair_hi[sym][idx:idx+20], pair_lo[sym][idx:idx+20]
+        if not fh:
+            continue
+
+        bullish = (drn == "bullish")
+
+        for k in CHKPTS:
+            if k > len(fh):
+                continue
+            wh, wl = fh[:k], fl[:k]
+            fav = ((max(wh) - entry) if bullish else (entry - min(wl))) / atr
+            (win_fav if is_win else loss_fav)[k].append(fav)
+
+        if len(fh) >= 6:
+            fav6 = ((max(fh[:6]) - entry) if bullish else (entry - min(fl[:6]))) / atr
+            fav6_records.append((fav6, is_win))
+
+        # Time to reach 1×ATR favorable (approx 1R with broken_level SL)
+        if is_win:
+            target = (entry + atr) if bullish else (entry - atr)
+            for k, (h, l) in enumerate(zip(fh, fl)):
+                hit = (h >= target) if bullish else (l <= target)
+                if hit:
+                    time_to_1r.append(k + 1)
+                    break
+
+    lines.append("Momentum: max favorable move in first N candles (ATR units)")
+    lines.append(f"  {'k':>3}  {'WIN':>7}  {'LOSS':>8}  {'diff':>6}")
+    for k in CHKPTS:
+        wl, ll = win_fav[k], loss_fav[k]
+        if not wl or not ll:
+            continue
+        wa, la = _st.mean(wl), _st.mean(ll)
+        lines.append(f"  {k:3d}  {wa:7.2f}  {la:8.2f}  {wa-la:+6.2f}")
+    lines.append("")
+
+    # ── 10. Stall test: quartile analysis at k=6 ─────────────────────
+    if fav6_records:
+        fav6_sorted = sorted(fav6_records, key=lambda x: x[0])
+        n4 = len(fav6_sorted) // 4
+        quartiles = [("Q1 stalled ", fav6_sorted[:n4]),
+                     ("Q2         ", fav6_sorted[n4:2*n4]),
+                     ("Q3         ", fav6_sorted[2*n4:3*n4]),
+                     ("Q4 strong  ", fav6_sorted[3*n4:])]
+        lines.append("WR by momentum quartile at candle 6  (Q1=stalled, Q4=strong):")
+        for label, qd in quartiles:
+            if not qd:
+                continue
+            qw = sum(1 for _, w in qd if w)
+            avg_fav = _st.mean(f for f, _ in qd)
+            lines.append(f"  {label}  WR={qw/len(qd)*100:5.1f}%  n={len(qd):4d}  avg_move={avg_fav:.2f}ATR")
+        lines.append("")
+
+        # EV simulation: exit Q1 stalled trades at 0R (breakeven) instead of waiting
+        active = fav6_sorted[n4:]
+        q1 = fav6_sorted[:n4]
+        ev_current = _st.mean((2.0 if w else -1.0) for _, w in fav6_records)
+        ev_exit_q1 = sum((2.0 if w else -1.0) for _, w in active) / len(fav6_records)
+        delta = ev_exit_q1 - ev_current
+        lines.append("Simulated EV: if stalled Q1 trades are closed at 0R (breakeven):")
+        lines.append(f"  Current EV:   {ev_current:+.3f}R/trade")
+        lines.append(f"  Simulated EV: {ev_exit_q1:+.3f}R/trade  (delta {delta:+.3f}R  "
+                     f"{'↑ BETTER' if delta > 0 else '↓ WORSE'})")
+        lines.append("")
+
+    # ── 11. Time to 1R for WIN signals ────────────────────────────────
+    if time_to_1r:
+        lines.append(f"WIN signals: candles to reach 1R favorable (n={len(time_to_1r)}):")
+        for threshold in [2, 3, 4, 6, 8, 10]:
+            pct = sum(1 for x in time_to_1r if x <= threshold) / len(time_to_1r) * 100
+            lines.append(f"  ≤{threshold:2d} candles: {pct:5.1f}%")
+        median_t = sorted(time_to_1r)[len(time_to_1r) // 2]
+        lines.append(f"  Median: {median_t} candles")
+        lines.append("")
+
+    conn.close()
+
+    for line in lines:
+        logging.info(line)
+
+    try:
+        # Telegram has a 4096-char message limit — split if needed
+        chunk, chunks = [], []
+        for line in lines:
+            chunk.append(line)
+            if sum(len(l)+1 for l in chunk) > 3800:
+                chunks.append("\n".join(chunk))
+                chunk = []
+        if chunk:
+            chunks.append("\n".join(chunk))
+        for part in chunks:
+            alert_manager.notifier.send_message(part)
+        logging.info("Loss analysis sent to Telegram (%d message(s))", len(chunks))
+    except Exception as exc:
+        logging.warning("Failed to send loss analysis: %s", exc)
 
 
 def run_nightly_sweep(db: LocalDB, alert_manager: AlertManager) -> None:
@@ -726,6 +1317,86 @@ def run_nightly_sweep(db: LocalDB, alert_manager: AlertManager) -> None:
     logging.info("Nightly sweep: %d raw signals from scan_run_id=%d", len(raw_signals), scan_run_id)
     all_pair_stats, all_symbols, pset_ids = _run_param_sweep(raw_signals, db)
     _send_sweep_summary(alert_manager, raw_signals, all_pair_stats, all_symbols, pset_ids)
+
+
+def run_decay_check(db: LocalDB, alert_manager: AlertManager,
+                    min_live_trades: int = 5, decay_threshold: float = 0.15) -> None:
+    """Compare live WR (from trade_monitors) against gold historical WR per pair.
+
+    Sends a Telegram report flagging any pair where live WR has dropped more than
+    decay_threshold (default 15pp) below the historical gold WR.
+    Requires at least min_live_trades closed trades per pair to report.
+    """
+    gold_map = db.get_gold_params("BOS15m")
+
+    conn = db._get_conn()
+    rows = conn.execute(
+        "SELECT symbol, status, COUNT(*) FROM trade_monitors "
+        "WHERE status IN ('tp_hit','sl_hit') GROUP BY symbol, status"
+    ).fetchall()
+
+    # Aggregate live counts per symbol
+    live: dict = {}
+    for symbol, status, count in rows:
+        if symbol not in live:
+            live[symbol] = {"tp_hit": 0, "sl_hit": 0}
+        live[symbol][status] = count
+
+    if not live:
+        logging.info("Decay check: no closed live trades in trade_monitors yet.")
+        return
+
+    lines = ["📊 *Weekly Decay Report* — live WR vs gold historical WR\n"]
+    any_flagged = False
+
+    for symbol in sorted(live):
+        wins   = live[symbol].get("tp_hit", 0)
+        losses = live[symbol].get("sl_hit", 0)
+        n      = wins + losses
+        if n < min_live_trades:
+            lines.append(f"  {symbol}: n={n} (below min {min_live_trades}, skipping)")
+            continue
+
+        live_wr = wins / n
+        gold     = gold_map.get(symbol)
+        gold_wr  = gold["win_rate"] if gold else None
+
+        if gold_wr is None:
+            lines.append(f"  {symbol}: live WR={live_wr*100:.1f}% (n={n}) — no gold baseline")
+            continue
+
+        delta = live_wr - gold_wr
+        if delta <= -decay_threshold:
+            flag = "🔴 DEGRADED"
+            any_flagged = True
+        elif delta <= -decay_threshold / 2:
+            flag = "🟡 watch"
+        else:
+            flag = "🟢 ok"
+
+        lines.append(
+            f"  {flag} {symbol}: live {live_wr*100:.1f}% vs gold {gold_wr*100:.1f}% "
+            f"(Δ{delta*100:+.1f}pp, n={n})"
+        )
+
+    if any_flagged:
+        lines.append("\n⚠️ Degraded pairs may need manual review. Run --experiment-bos --update-gold to re-evaluate.")
+    else:
+        lines.append("\n✅ All pairs within tolerance.")
+
+    msg = "\n".join(lines)
+    logging.info("Decay check:\n%s", msg)
+    if alert_manager.notifier:
+        alert_manager.notifier.send_message(msg)
+
+
+def run_weekly_report(settings: "Settings", db: LocalDB,
+                      alert_manager: AlertManager) -> None:
+    """Full weekly job: rescan BOS experiment (no gold update) + decay check."""
+    logging.info("=== Weekly report: running full BOS experiment (no gold update) ===")
+    run_bos_experiment(settings, db, alert_manager, update_gold=False)
+    logging.info("=== Weekly report: running decay check ===")
+    run_decay_check(db, alert_manager)
 
 
 # ──────────────────────────── FVG DOJI STRATEGY ────────────────────────────
@@ -753,33 +1424,52 @@ FVG_PARAM_SWEEP_SETS = [
     # combined strict setups
     {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.7,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.25},
     {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 1.0,  "min_retrace_pct": 0.80, "max_doji_body_pct": 0.20},
+    # HTF-aligned only variants (4h bias must match FVG direction)
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.3,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.35, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.7,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.25, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 1.0,  "min_retrace_pct": 0.80, "max_doji_body_pct": 0.20, "htf_aligned_only": True},
 ]
 
 
 def _fvg_pset_label(pset: dict) -> str:
-    return f"fvg{pset['min_fvg_size_atr']}+r{pset['min_retrace_pct']}+b{pset['max_doji_body_pct']}"
+    lbl = f"fvg{pset['min_fvg_size_atr']}+r{pset['min_retrace_pct']}+b{pset['max_doji_body_pct']}"
+    if pset.get("htf_aligned_only"):
+        lbl += "+htf"
+    return lbl
 
 
 def _apply_fvg_param_filter(raw_signals: list, params: dict) -> list:
     min_size    = params.get("min_fvg_size_atr", 0.3)
     min_retrace = params.get("min_retrace_pct", 0.5)
     max_body    = params.get("max_doji_body_pct", 0.35)
-    return [
-        r for r in raw_signals
-        if (r.get("fvg_size_atr") or 0) >= min_size
-        and (r.get("retrace_depth") or 0) >= min_retrace
-        and (r.get("doji_body_pct") or 1) <= max_body
-    ]
+    htf_only    = params.get("htf_aligned_only", False)
+    result = []
+    for r in raw_signals:
+        if (r.get("fvg_size_atr") or 0) < min_size:
+            continue
+        if (r.get("retrace_depth") or 0) < min_retrace:
+            continue
+        if (r.get("doji_body_pct") or 1) > max_body:
+            continue
+        if htf_only:
+            htf = (r.get("htf_bias") or "").lower()
+            direction = (r.get("direction") or "").lower()
+            if not htf or htf != direction:
+                continue
+        result.append(r)
+    return result
 
 
-def _run_fvg_param_sweep(raw_signals: list, db: LocalDB) -> tuple:
+def _run_fvg_param_sweep(raw_signals: list, db: LocalDB,
+                         strategy: str = "FVG30m", update_gold: bool = False) -> tuple:
     """Evaluate FVG_PARAM_SWEEP_SETS against FVG raw signals; print comparison; store in DB."""
     all_symbols = sorted({r["symbol"] for r in raw_signals})
     logging.info("")
     logging.info("=== FVG Param Sweep (%d sets × %d pairs) ===", len(FVG_PARAM_SWEEP_SETS), len(all_symbols))
     hdr = "  ".join(f"{s[:6]:>6}" for s in all_symbols)
-    logging.info("  %-32s  %s  %s  %s", "Params", hdr, "OVERAL", "EV1:2")
-    logging.info("  " + "-" * 102)
+    logging.info("  %-36s  %s  %s  %s", "Params", hdr, "OVERAL", "EV1:2")
+    logging.info("  " + "-" * 106)
 
     all_pair_stats: dict = {}
     pset_ids: list = []
@@ -802,11 +1492,12 @@ def _run_fvg_param_sweep(raw_signals: list, db: LocalDB) -> tuple:
         lbl       = _fvg_pset_label(pset)
         pair_cols = "  ".join(f"{all_pair_stats[(pset_id, s)]['win_rate']*100:>5.1f}%" for s in all_symbols)
         ev_12     = ov.get("expected_value", {}).get("1:2", 0)
-        logging.info("  v%-3d %-27s  %s  %5.1f%%  %+.3fR",
+        logging.info("  v%-3d %-31s  %s  %5.1f%%  %+.3fR",
                      pset_id, lbl, pair_cols, ov["win_rate"] * 100, ev_12)
 
     logging.info("")
     logging.info("Best FVG param set per pair (min 20 resolved trades):")
+    gold_map = db.get_gold_params(strategy)
     for sym in all_symbols:
         candidates = [
             (pid, pset) for pid, pset in zip(pset_ids, FVG_PARAM_SWEEP_SETS)
@@ -817,10 +1508,504 @@ def _run_fvg_param_sweep(raw_signals: list, db: LocalDB) -> tuple:
             continue
         best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)]["win_rate"])
         s = all_pair_stats[(best_pid, sym)]
-        logging.info("  %-10s  v%-3d %-27s  WR: %5.1f%%  Trades: %d  EV 1:2: %+.3fR",
+        ev_12 = s.get("expected_value", {}).get("1:2", 0)
+        gold = gold_map.get(sym)
+        if gold:
+            delta_wr = s["win_rate"] - gold["win_rate"]
+            delta_ev = ev_12 - gold["ev_1_2"]
+            gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV]"
+            if update_gold:
+                db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_12, s["resolved"])
+                gold_note += " ← GOLD UPDATED"
+        else:
+            db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_12, s["resolved"])
+            gold_note = " ← GOLD SET"
+        logging.info("  %-10s  v%-3d %-31s  WR: %5.1f%%  Trades: %d  EV 1:2: %+.3fR%s",
                      sym, best_pid, _fvg_pset_label(best_pset), s["win_rate"] * 100, s["resolved"],
-                     s.get("expected_value", {}).get("1:2", 0))
+                     ev_12, gold_note)
     return all_pair_stats, all_symbols, pset_ids
+
+
+# ──────────────────────────────── DAX STRATEGY ────────────────────────────────
+
+try:
+    from zoneinfo import ZoneInfo as _ZI
+    _ISRAEL_TZ = _ZI("Asia/Jerusalem")
+except Exception:
+    from datetime import timezone as _tz, timedelta as _td
+    _ISRAEL_TZ = _tz(_td(hours=3))   # fallback: IDT (summer, UTC+3)
+
+
+def _dax_session_window(trade_date) -> tuple:
+    """Return (start_ts_utc, end_ts_utc) for 09:00-12:30 Israel time on trade_date."""
+    from datetime import datetime as _dt
+    start = _dt(trade_date.year, trade_date.month, trade_date.day, 9,  0,  tzinfo=_ISRAEL_TZ)
+    end   = _dt(trade_date.year, trade_date.month, trade_date.day, 12, 30, tzinfo=_ISRAEL_TZ)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+_dax_alerted_dates: set = set()
+
+
+def _format_dax_alert(sig: dict) -> str:
+    """Format a DAX counter-trend signal for Telegram."""
+    ct_dir   = sig["direction"].upper()        # direction of our trade
+    exp_dir  = sig.get("expansion_dir", "").upper()  # direction of the expansion we fade
+    entry    = sig["entry"]
+    sl       = sig["sl"]
+    tp       = sig["tp"]
+    eq       = sig.get("eq_level")
+    risk     = abs(entry - sl)
+    r        = round(abs(tp - entry) / risk, 1) if risk else 0.0
+    ep_pct   = sig.get("entry_pct_from_origin", 0) * 100
+    eq_str   = f"\nEQ: {eq:.0f}" if eq else ""
+    return (
+        f"[DAX] COUNTER-TREND {ct_dir} (fades {exp_dir} expansion)\n"
+        f"Entry: {entry:.0f}  SL: {sl:.0f}  TP: {tp:.0f}\n"
+        f"R: 1:{r}  Entry zone: {ep_pct:.0f}% from origin{eq_str}"
+    )
+
+
+def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertManager") -> None:
+    """Check for DAX counter-trend setup; runs every 5 min during Frankfurt session."""
+    from datetime import date as _date
+    from data.yahoo_fetcher import fetch_yahoo
+    from analysis.smc_analyzer import SMCAnalyzer
+
+    now_il  = datetime.now(_ISRAEL_TZ)
+    today   = now_il.date()
+
+    # Skip weekends
+    if today.weekday() >= 5:
+        return
+
+    # Only within session window 09:00-12:30 Israel time
+    t = now_il.time()
+    from datetime import time as _time
+    if not (_time(9, 0) <= t <= _time(12, 30)):
+        return
+
+    # One alert per session day
+    if today in _dax_alerted_dates:
+        return
+
+    # Load gold params
+    gold_map = db.get_gold_params("DAX")
+    gold = gold_map.get("DAX") or gold_map.get("dax")
+    if not gold:
+        logging.warning("DAX session job: no gold params — run --experiment-dax --update-gold first")
+        return
+    gold_params = db.get_param_set_by_id(gold["param_set_id"])
+
+    # Fetch fresh data from Yahoo Finance
+    try:
+        candles_15m = fetch_yahoo("DAX", "15m", days=7)
+        candles_5m  = fetch_yahoo("DAX", "5m",  days=5)
+    except Exception as exc:
+        logging.error("DAX session job: Yahoo fetch failed: %s", exc)
+        return
+
+    if not candles_15m or not candles_5m:
+        return
+
+    start_ts, end_ts = _dax_session_window(today)
+    sess_15m = [c for c in candles_15m if start_ts <= c["timestamp"] <= end_ts]
+    if len(sess_15m) < 3:
+        return
+
+    # Last 16 pre-session 15m candles for context
+    pre_15m = sorted(
+        [c for c in candles_15m if c["timestamp"] < start_ts],
+        key=lambda c: c["timestamp"],
+    )[-16:]
+
+    # All 5m candles for today
+    day_5m = sorted(
+        [c for c in candles_5m if c["timestamp"] >= start_ts],
+        key=lambda c: c["timestamp"],
+    )
+
+    analyzer = SMCAnalyzer()
+    try:
+        sigs = analyzer.detect_dax_session_setup(
+            sess_15m, day_5m,
+            params={**gold_params, "symbol": "DAX"},
+            candles_15m_presession=pre_15m,
+        )
+    except Exception as exc:
+        logging.error("DAX session job: detection failed: %s", exc)
+        return
+
+    if not sigs:
+        return
+
+    sig = sigs[0]
+    _dax_alerted_dates.add(today)
+
+    msg = _format_dax_alert(sig)
+    logging.info("DAX SIGNAL: %s", msg)
+    try:
+        chart_path = alert_manager.render_dax_alert(sig, day_5m, outcome="OPEN")
+    except Exception as exc:
+        logging.warning("DAX chart render failed: %s", exc)
+        chart_path = None
+    if getattr(settings, "dax_alerts_enabled", False):
+        alert_manager.send_alert({"message": msg, "image_path": chart_path, "alert_id": sig.get("signal_id", "dax")})
+    else:
+        logging.info("DAX alert suppressed (dax_alerts_enabled=false) — chart saved to %s", chart_path)
+
+
+def _evaluate_dax_outcome(signal: dict, candles_5m_after_entry: list) -> tuple:
+    """Return (outcome, eff_r) for a DAX signal. outcome = WIN/LOSS/OPEN."""
+    tp      = signal["tp"]
+    sl      = signal["sl"]
+    entry   = signal["entry"]
+    bullish = signal["direction"] == "bullish"
+    risk    = signal["risk"] or abs(tp - sl) or 1.0
+    outcome = "OPEN"
+    for bar in candles_5m_after_entry:
+        if bullish:
+            if bar["low"]  <= sl: outcome = "LOSS"; break
+            if bar["high"] >= tp: outcome = "WIN";  break
+        else:
+            if bar["high"] >= sl: outcome = "LOSS"; break
+            if bar["low"]  <= tp: outcome = "WIN";  break
+    if "WIN" in outcome:
+        eff_r = round(abs(tp - entry) / risk, 2)
+    elif "LOSS" in outcome:
+        eff_r = 1.0
+    else:
+        eff_r = None
+    return outcome, eff_r
+
+
+_DAX_SWEEP_BASE = {
+    "tp_pct":             0.5,   # TP at 50% of expansion = eq_level (mean reversion)
+    "sl_atr_mult":        0.5,   # SL buffer beyond signal candle extreme
+    "min_expansion_atr":  1.0,   # minimum expansion size in ATR multiples
+    "entry_zone_min_pct": 0.5,   # signal must fire at ≥ 50% from origin (at/above eq)
+    "swing_lookback_5m":  12,
+    "min_break_str_5m":   0.3,
+    # loss-reduction filters (from analysis 2026-06-07)
+    "exclude_dow":        [],    # e.g. [0,4] to skip Mon+Fri
+    "bearish_only":       False, # True = only fade bearish expansions (→ LONG)
+}
+
+DAX_PARAM_SWEEP_SETS = [
+    # baseline
+    {**_DAX_SWEEP_BASE},
+    # vary TP depth (distance from origin to target)
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.3},   # ambitious — further into retracement
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.4},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.6},   # conservative — barely past eq
+    # vary SL tightness
+    {**_DAX_SWEEP_BASE, "sl_atr_mult": 0.3},
+    {**_DAX_SWEEP_BASE, "sl_atr_mult": 0.7},
+    {**_DAX_SWEEP_BASE, "sl_atr_mult": 1.0},
+    {**_DAX_SWEEP_BASE, "sl_atr_mult": 1.5},
+    # entry zone — how deep into premium zone must signal fire
+    {**_DAX_SWEEP_BASE, "entry_zone_min_pct": 0.6},
+    {**_DAX_SWEEP_BASE, "entry_zone_min_pct": 0.7},
+    {**_DAX_SWEEP_BASE, "entry_zone_min_pct": 0.8},
+    # expansion size filter
+    {**_DAX_SWEEP_BASE, "min_expansion_atr": 1.5},
+    {**_DAX_SWEEP_BASE, "min_expansion_atr": 2.0},
+    # combined candidates — tp0.5 variants
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.4, "sl_atr_mult": 0.3},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.4, "entry_zone_min_pct": 0.6},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.5, "sl_atr_mult": 0.3, "entry_zone_min_pct": 0.6},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.4, "sl_atr_mult": 0.3, "entry_zone_min_pct": 0.6},
+    # combined candidates — tp0.6 variants (winner tier)
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "sl_atr_mult": 0.7},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "sl_atr_mult": 1.0},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "entry_zone_min_pct": 0.6},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "entry_zone_min_pct": 0.7},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "entry_zone_min_pct": 0.8},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "sl_atr_mult": 0.7, "entry_zone_min_pct": 0.7},
+    # ── Tier: day-of-week filter (Mon=0, Fri=4 excluded) ─────────────────
+    {**_DAX_SWEEP_BASE, "exclude_dow": [0, 4]},
+    {**_DAX_SWEEP_BASE, "exclude_dow": [0]},
+    {**_DAX_SWEEP_BASE, "exclude_dow": [4]},
+    # ── Tier: bearish-only (fade bearish expansions → LONG only) ─────────
+    {**_DAX_SWEEP_BASE, "bearish_only": True},
+    {**_DAX_SWEEP_BASE, "bearish_only": True, "tp_pct": 0.6},
+    {**_DAX_SWEEP_BASE, "bearish_only": True, "entry_zone_min_pct": 0.7},
+    # ── Tier: combined — no Mon/Fri + bearish only ────────────────────────
+    {**_DAX_SWEEP_BASE, "exclude_dow": [0, 4], "bearish_only": True},
+    {**_DAX_SWEEP_BASE, "exclude_dow": [0, 4], "bearish_only": True, "tp_pct": 0.6},
+    {**_DAX_SWEEP_BASE, "exclude_dow": [0, 4], "bearish_only": True, "tp_pct": 0.6, "entry_zone_min_pct": 0.7},
+    {**_DAX_SWEEP_BASE, "exclude_dow": [0, 4], "bearish_only": True, "tp_pct": 0.6, "sl_atr_mult": 0.7},
+    {**_DAX_SWEEP_BASE, "exclude_dow": [0, 4], "bearish_only": True, "tp_pct": 0.6, "sl_atr_mult": 0.7, "entry_zone_min_pct": 0.7},
+]
+
+
+def _dax_pset_label(pset: dict) -> str:
+    parts = [f"tp{pset['tp_pct']}"]
+    if pset.get("sl_atr_mult", 0.5) != 0.5:
+        parts.append(f"sl{pset['sl_atr_mult']}")
+    if pset.get("entry_zone_min_pct", 0.5) != 0.5:
+        parts.append(f"ez{pset['entry_zone_min_pct']}")
+    if pset.get("min_expansion_atr", 1.0) != 1.0:
+        parts.append(f"exp{pset['min_expansion_atr']}")
+    if pset.get("min_break_str_5m", 0.3) != 0.3:
+        parts.append(f"str{pset['min_break_str_5m']}")
+    if pset.get("swing_lookback_5m", 12) != 12:
+        parts.append(f"lb{pset['swing_lookback_5m']}")
+    dow = pset.get("exclude_dow", [])
+    if dow:
+        _day = {0:"mo",1:"tu",2:"we",3:"th",4:"fr"}
+        parts.append("no" + "".join(_day[d] for d in sorted(dow)))
+    if pset.get("bearish_only"):
+        parts.append("bearonly")
+    return "+".join(parts)
+
+
+def run_dax_experiment(
+    settings: Settings,
+    db: LocalDB,
+    alert_manager: AlertManager,
+    scan_days: int = 365,
+    update_gold: bool = False,
+) -> None:
+    """Scan DE40 for DAX Frankfurt open session setups; run param sweep."""
+    from datetime import timedelta, date as _date
+    from analysis.smc_analyzer import SMCAnalyzer
+
+    symbol = "DAX"
+    strategy = "DAX"
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=scan_days)).timestamp())
+
+    logging.info("Scanning DAX session setups via Yahoo Finance (last %d days)", scan_days)
+    logging.info("Session window: 09:00-12:30 Israel time  |  Cutoff: %s UTC",
+                 datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"))
+
+    # Fetch via Yahoo Finance and store in DB
+    from data.yahoo_fetcher import fetch_yahoo
+    for tf in ("15m", "5m"):
+        existing = db.query_recent(symbol, tf, limit=1)
+        if existing:
+            age_hours = (datetime.now(timezone.utc).timestamp() - existing[0]["timestamp"]) / 3600
+            if age_hours < 24:
+                logging.info("DAX %s: using cached data (%.0fh old)", tf, age_hours)
+                continue
+        logging.info("Fetching DAX %s from Yahoo Finance...", tf)
+        try:
+            candles = fetch_yahoo(symbol, tf, days=scan_days)
+            db.insert_candles(symbol, tf, candles)
+            logging.info("  → stored %d %s candles", len(candles), tf)
+        except Exception as exc:
+            logging.error("Failed to fetch DAX %s from Yahoo: %s", tf, exc)
+
+    candles_15m_desc = db.query_recent(symbol, "15m", limit=_candle_limit("15m", days=scan_days))
+    candles_5m_desc  = db.query_recent(symbol, "5m",  limit=_candle_limit("5m",  days=scan_days))
+
+    if not candles_15m_desc or not candles_5m_desc:
+        logging.error("No DAX data in DB after fetch attempt.")
+        return
+
+    # Convert to chronological (oldest→newest) and filter to scan period
+    c15m = [c for c in reversed(candles_15m_desc) if c["timestamp"] >= cutoff_ts]
+    c5m  = [c for c in reversed(candles_5m_desc)  if c["timestamp"] >= cutoff_ts]
+    logging.info("Loaded %d 15m and %d 5m candles", len(c15m), len(c5m))
+
+    # Get unique trading dates
+    trading_dates = sorted(set(
+        datetime.fromtimestamp(c["timestamp"], tz=timezone.utc).date()
+        for c in c15m
+    ))
+    logging.info("Trading dates to scan: %d", len(trading_dates))
+
+    scan_run_id = int(datetime.now(timezone.utc).timestamp())
+    analyzer    = SMCAnalyzer()
+    all_raw: list = []
+
+    # Pre-collect per-session data once; reused by base scan and all sweep iterations
+    sessions_data: list = []
+    for trade_date in trading_dates:
+        if trade_date.weekday() >= 5:
+            continue
+        start_ts, end_ts = _dax_session_window(trade_date)
+        lookahead_end    = end_ts + 6 * 3600
+        sess_15m = [c for c in c15m if start_ts <= c["timestamp"] <= end_ts]
+        day_5m   = [c for c in c5m  if start_ts <= c["timestamp"] <= lookahead_end]
+        pre_15m  = [c for c in c15m if c["timestamp"] < start_ts][-16:]
+        if len(sess_15m) >= 3:
+            sessions_data.append((start_ts, end_ts, sess_15m, day_5m, pre_15m))
+
+    # Base scan using _DAX_SWEEP_BASE params
+    base_params = {**_DAX_SWEEP_BASE, "symbol": symbol}
+    base_wins: list = []
+    base_losses: int = 0
+    base_opens: int  = 0
+
+    for start_ts, end_ts, sess_15m, day_5m, pre_15m in sessions_data:
+        signals = analyzer.detect_dax_session_setup(
+            sess_15m, day_5m, params=base_params,
+            candles_15m_presession=pre_15m,
+        )
+        for sig in signals:
+            entry_ts      = sig["breakout_ts"]
+            post_entry_5m = [c for c in day_5m if c["timestamp"] > entry_ts]
+            outcome, eff_r = _evaluate_dax_outcome(sig, post_entry_5m)
+
+            bos_dt   = datetime.fromtimestamp(entry_ts, tz=timezone.utc)
+            alert_id = f"dax-{bos_dt.minute:02d}-{bos_dt.hour:02d}-{bos_dt.day:02d}-{bos_dt.month:02d}-{bos_dt.year}"
+
+            if outcome == "WIN":
+                base_wins.append(eff_r or 2.0)
+            elif outcome == "LOSS":
+                base_losses += 1
+            else:
+                base_opens += 1
+
+            all_raw.append({
+                "symbol":                symbol,
+                "timeframe":             "15m",
+                "breakout_ts":           entry_ts,
+                "alert_id":              alert_id,
+                "direction":             sig["direction"],
+                "broken_level":          sig["eq_level"],
+                "break_strength":        sig["retrace_depth_pct"],
+                "htf_bias":              None,
+                "confluences":           json.dumps([]),
+                "outcome":               outcome,
+                "hour":                  bos_dt.hour,
+                "month":                 bos_dt.strftime("%Y-%m"),
+                "has_liquidity_sweep":   0,
+                "swing_age_candles":     None,
+                "session":               "frankfurt",
+                "dow":                   bos_dt.weekday(),
+                "strategy":              strategy,
+                "scan_run_id":           scan_run_id,
+                "fvg_size_atr":          sig["expansion_range"],
+                "retrace_depth":         sig["retrace_depth_pct"],
+                "doji_body_pct":         None,
+                "outcome_broken_level":  None,
+                "outcome_break_candle":  None,
+                "eff_r_broken_level":    None,
+                "eff_r_break_candle":    None,
+            })
+
+    logging.info("DAX raw signals: %d", len(all_raw))
+    if not all_raw:
+        logging.warning("No DAX counter-trend setups found — check session window or expansion params")
+        return
+
+    try:
+        db.insert_raw_signals(scan_run_id, all_raw)
+    except Exception as exc:
+        logging.warning("Failed to store DAX raw signals: %s", exc)
+
+    # Base stats using actual variable-R
+    b_res = len(base_wins) + base_losses
+    b_wr  = len(base_wins) / b_res if b_res else 0
+    b_avg_r = sum(base_wins) / len(base_wins) if base_wins else 2.0
+    b_ev  = round(b_avg_r * b_wr - 1.0 * (1 - b_wr), 4) if b_res else -1.0
+    logging.info("")
+    logging.info("=== DAX Raw Scan Stats (base params) ===")
+    logging.info("  Total: %d  Resolved: %d  WR: %.1f%%  avgR: %.2f  EV: %+.3fR",
+                 len(all_raw), b_res, b_wr * 100, b_avg_r, b_ev)
+    logging.info("  Wins: %d  Losses: %d  Open: %d", len(base_wins), base_losses, base_opens)
+
+    # Param sweep — re-run detector for each pset to get correct SL/TP/outcome
+    logging.info("")
+    logging.info("=== DAX Param Sweep (%d sets) ===", len(DAX_PARAM_SWEEP_SETS))
+    logging.info("  %-35s  %5s  %5s  %5s  %5s", "Params", "WR%", "avgR", "EV", "n")
+    logging.info("  " + "-" * 60)
+
+    all_pset_stats: dict = {}
+    pset_ids_dax: list = []
+    gold_map = db.get_gold_params(strategy)
+
+    for pset in DAX_PARAM_SWEEP_SETS:
+        pset_id = db.get_or_create_param_set(pset)
+        pset_ids_dax.append(pset_id)
+
+        pset_params = {**pset, "symbol": symbol}
+        p_wins: list = []; p_losses = 0; p_opens = 0
+
+        excl_dow    = set(pset.get("exclude_dow", []))
+        bearish_only = pset.get("bearish_only", False)
+
+        for start_ts, end_ts, sess_15m, day_5m, pre_15m in sessions_data:
+            sess_dow = datetime.fromtimestamp(start_ts, tz=timezone.utc).weekday()
+            if sess_dow in excl_dow:
+                continue
+            sigs = analyzer.detect_dax_session_setup(
+                sess_15m, day_5m, params=pset_params,
+                candles_15m_presession=pre_15m,
+            )
+            for sig in sigs:
+                if bearish_only and sig.get("direction") != "bearish":
+                    continue
+                post_5m = [c for c in day_5m if c["timestamp"] > sig["breakout_ts"]]
+                outcome, eff_r = _evaluate_dax_outcome(sig, post_5m)
+                if outcome == "WIN":
+                    p_wins.append(eff_r or 2.0)
+                elif outcome == "LOSS":
+                    p_losses += 1
+                else:
+                    p_opens += 1
+
+        p_res   = len(p_wins) + p_losses
+        p_wr    = len(p_wins) / p_res if p_res else 0
+        p_avg_r = sum(p_wins) / len(p_wins) if p_wins else 2.0
+        p_ev    = round(p_avg_r * p_wr - 1.0 * (1 - p_wr), 4) if p_res else -1.0
+        s = {
+            "total": len(p_wins) + p_losses + p_opens,
+            "wins": len(p_wins), "losses": p_losses, "open": p_opens,
+            "resolved": p_res, "win_rate": p_wr,
+            "avg_r_win": p_avg_r, "ev_variable_r": p_ev,
+        }
+        all_pset_stats[pset_id] = s
+        db.insert_scan_stats(pset_id, symbol, s["total"], s["wins"], s["losses"], s["open"], json.dumps(s))
+
+        logging.info("  v%-3d %-31s  %4.1f%%  %4.2f  %+.3fR  n=%d",
+                     pset_id, _dax_pset_label(pset), p_wr * 100, p_avg_r, p_ev, p_res)
+
+    # Best param set
+    best_pid = max(pset_ids_dax,
+                   key=lambda pid: all_pset_stats[pid].get("ev_variable_r", -999))
+    best_pset = DAX_PARAM_SWEEP_SETS[pset_ids_dax.index(best_pid)]
+    bs = all_pset_stats[best_pid]
+    ev_best = bs.get("ev_variable_r", 0)
+    gold = gold_map.get(symbol)
+
+    if gold:
+        delta_wr = bs["win_rate"] - gold["win_rate"]
+        delta_ev = ev_best - gold["ev_1_2"]
+        gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV]"
+        if update_gold:
+            db.upsert_gold_params(strategy, symbol, best_pid, bs["win_rate"], ev_best, bs["resolved"])
+            gold_note += " ← GOLD UPDATED"
+    else:
+        db.upsert_gold_params(strategy, symbol, best_pid, bs["win_rate"], ev_best, bs["resolved"])
+        gold_note = " ← GOLD SET"
+
+    logging.info("")
+    logging.info("Best DAX params: v%-3d %-31s  WR: %.1f%%  avgR: %.2f  Trades: %d  EV: %+.3fR%s",
+                 best_pid, _dax_pset_label(best_pset),
+                 bs["win_rate"] * 100, bs.get("avg_r_win", 2.0), bs["resolved"], ev_best, gold_note)
+
+    # Render charts for all signals under gold (best) params
+    logging.info("")
+    logging.info("Rendering DAX charts with gold params (v%d)...", best_pid)
+    gold_params_chart = {**best_pset, "symbol": symbol}
+    chart_count = 0
+    for start_ts, end_ts, sess_15m, day_5m, pre_15m in sessions_data:
+        sigs = analyzer.detect_dax_session_setup(
+            sess_15m, day_5m, params=gold_params_chart,
+            candles_15m_presession=pre_15m,
+        )
+        for sig in sigs:
+            post_5m = [c for c in day_5m if c["timestamp"] > sig["breakout_ts"]]
+            outcome, _ = _evaluate_dax_outcome(sig, post_5m)
+            try:
+                alert_manager.render_dax_alert(sig, day_5m, outcome=outcome)
+                chart_count += 1
+            except Exception as exc:
+                logging.warning("DAX chart render failed: %s", exc)
+    logging.info("DAX charts saved: %d  →  %s", chart_count, str(alert_manager.charts_dir))
 
 
 def _fvg_alert_id(symbol: str, timestamp: int) -> str:
@@ -929,8 +2114,9 @@ def _scan_one_symbol_fvg(args: tuple) -> tuple:
     return symbol, len(raw_signal_records), trade_results, log_lines, raw_signal_records
 
 
-def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager) -> None:
-    """Scan 365 days of 30m candles for FVG doji setups; run 10-set param sweep."""
+def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager,
+                       update_gold: bool = False) -> None:
+    """Scan 365 days of 30m candles for FVG doji setups; run param sweep."""
     from datetime import timedelta
     cutoff_ts  = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
     timeframe, htf = "30m", "4h"
@@ -950,7 +2136,7 @@ def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
         logging.warning("Auto-fetch unavailable: %s", exc)
 
     scan_run_id = int(datetime.now(timezone.utc).timestamp())
-    n_workers   = len(settings.fx_pairs)
+    n_workers   = min(len(settings.fx_pairs), max(1, (os.cpu_count() or 4) // 2))
     worker_args = [
         (symbol, settings, param_set_id, cutoff_ts, scan_run_id)
         for symbol in settings.fx_pairs
@@ -998,7 +2184,7 @@ def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
     logging.info("  Win rate: %.1f%%  |  EV 1:2: %+.3fR", overall["win_rate"] * 100, ev.get("1:2", 0))
 
     if all_raw_signals:
-        _run_fvg_param_sweep(all_raw_signals, db)
+        _run_fvg_param_sweep(all_raw_signals, db, strategy="FVG30m", update_gold=update_gold)
 
 
 def run_bos_experiment(
@@ -1007,13 +2193,15 @@ def run_bos_experiment(
     alert_manager: AlertManager,
     timeframe: str = "15m",
     htf: str = "4h",
+    update_gold: bool = False,
+    scan_days: int = 365,
 ) -> None:
     """Scan historical BOS events on the given timeframe / HTF pair."""
     from datetime import timedelta
     strategy = f"BOS{timeframe}"
-    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=scan_days)).timestamp())
 
-    logging.info("Scanning %s BOS (last 365 days) — MTF bias from %s", timeframe.upper(), htf.upper())
+    logging.info("Scanning %s BOS (last %d days) — MTF bias from %s", timeframe.upper(), scan_days, htf.upper())
     logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
 
     active_params = {
@@ -1030,12 +2218,12 @@ def run_bos_experiment(
     param_set_id = db.get_or_create_param_set(active_params)
     logging.info("Parameter set v%d: %s", param_set_id, active_params)
 
-    # Auto-fetch 365 days of data for pairs that are missing or stale
+    # Auto-fetch required history for all pairs
     try:
         fetcher = FXFetcher(settings)
         for symbol in settings.fx_pairs:
-            _ensure_pair_data(symbol, timeframe, fetcher, db)
-            _ensure_pair_data(symbol, htf, fetcher, db)
+            _ensure_pair_data(symbol, timeframe, fetcher, db, target_days=scan_days)
+            _ensure_pair_data(symbol, htf, fetcher, db, target_days=scan_days)
     except Exception as exc:
         logging.warning("Auto-fetch unavailable (no API key?): %s", exc)
 
@@ -1046,9 +2234,9 @@ def run_bos_experiment(
     # Run all pairs in parallel — workers render charts and return results,
     # main process handles all DB writes to avoid SQLite contention.
     scan_run_id = int(datetime.now(timezone.utc).timestamp())
-    n_workers = len(settings.fx_pairs)
+    n_workers = min(len(settings.fx_pairs), max(1, (os.cpu_count() or 4) // 2))
     worker_args = [
-        (symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id, strategy)
+        (symbol, settings, param_set_id, cutoff_ts, timeframe, htf, active_params, scan_run_id, strategy, scan_days)
         for symbol in settings.fx_pairs
     ]
     logging.info("Launching %d parallel workers (one per pair)...", n_workers)
@@ -1090,7 +2278,7 @@ def run_bos_experiment(
         logging.warning("Failed to store raw signals: %s", exc)
 
     logging.info("")
-    logging.info("=== 15m BOS count (last 365 days) ===")
+    logging.info("=== %s BOS count (last %d days) ===", timeframe.upper(), scan_days)
     for sym, cnt in pair_counts.items():
         logging.info("  %-10s %d", sym, cnt)
     logging.info("  %-10s %d", "TOTAL", sum(pair_counts.values()))
@@ -1129,8 +2317,12 @@ def run_bos_experiment(
         logging.warning("No raw signals collected — skipping param sweep")
         return
 
-    all_pair_stats, all_symbols, pset_ids = _run_param_sweep(all_raw_signals, db)
-    _send_sweep_summary(alert_manager, all_raw_signals, all_pair_stats, all_symbols, pset_ids)
+    sweep_sets = PARAM_SWEEP_SETS_4H if timeframe == "4h" else PARAM_SWEEP_SETS
+    all_pair_stats, all_symbols, pset_ids = _run_param_sweep(
+        all_raw_signals, db, strategy=strategy, update_gold=update_gold,
+        param_sets=sweep_sets)
+    _send_sweep_summary(alert_manager, all_raw_signals, all_pair_stats, all_symbols, pset_ids,
+                        param_sets=sweep_sets)
 
 
 def setup_logging(log_dir: Path) -> Path:
@@ -1166,6 +2358,56 @@ def check_logs_job(log_monitor: LogMonitor) -> None:
         logging.exception("Log monitor failed")
 
 
+def run_gap_check(
+    settings: Settings,
+    fetcher: "FXFetcher",
+    db: LocalDB,
+    dry_run: bool = False,
+) -> None:
+    """
+    Scan DB for missing candle ranges across all configured pairs + timeframes,
+    then backfill any real gaps (non-weekend) from the Twelve Data API.
+
+    DAX is excluded because it is fetched via Yahoo Finance, not TwelveData.
+    """
+    from data.gap_detector import check_and_backfill
+
+    # Only pairs served by the TwelveData fetcher (exclude DAX / Yahoo symbols)
+    pairs      = [p for p in settings.fx_pairs if p.upper() not in ("DAX",)]
+    timeframes = settings.timeframes
+
+    total_gaps     = 0
+    total_inserted = 0
+
+    logging.info("=== Gap check: %d pairs × %d timeframes ===", len(pairs), len(timeframes))
+    for symbol in pairs:
+        for tf in timeframes:
+            try:
+                gaps, inserted = check_and_backfill(
+                    db, fetcher, symbol, tf, dry_run=dry_run
+                )
+                total_gaps     += gaps
+                total_inserted += inserted
+            except Exception as exc:
+                logging.warning("Gap check failed for %s %s: %s", symbol, tf, exc)
+
+    if dry_run:
+        logging.info("Gap check (dry-run) complete — %d gap(s) found", total_gaps)
+    else:
+        logging.info(
+            "Gap check complete — %d gap(s) found, %d candles inserted",
+            total_gaps, total_inserted,
+        )
+
+
+def gap_check_job(settings: Settings, fetcher: "FXFetcher", db: LocalDB) -> None:
+    """Scheduled wrapper for run_gap_check — runs once daily at 06:00 UTC."""
+    try:
+        run_gap_check(settings, fetcher, db)
+    except Exception:
+        logging.exception("Scheduled gap check failed")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="trade FX data fetcher and alert runner")
     parser.add_argument(
@@ -1193,6 +2435,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Scan 30m data for FVG + deep retrace + doji rejection setups",
     )
+    parser.add_argument(
+        "--experiment-dax",
+        action="store_true",
+        help="Scan DE40 for DAX Frankfurt open session setups (09:00-12:30 Israel time)",
+    )
+    parser.add_argument(
+        "--update-gold",
+        action="store_true",
+        help="Force-update gold params with results from this scan (default: auto-set only if none exist)",
+    )
+    parser.add_argument(
+        "--scan-days",
+        type=int,
+        default=None,
+        help="Override number of days to scan (default: 365 for 15m, 730 for 4h)",
+    )
+    parser.add_argument(
+        "--check-gaps",
+        action="store_true",
+        help="Detect and backfill missing candle ranges across all pairs and timeframes, then exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --check-gaps: report gaps without fetching or inserting anything",
+    )
+    parser.add_argument(
+        "--analyze-losses",
+        action="store_true",
+        help="Analyse loss patterns from latest raw_signals: DoW, session, momentum fade, EV simulation",
+    )
+    parser.add_argument(
+        "--weekly-report",
+        action="store_true",
+        help="Full weekly job: rescan BOS experiment (no gold update) + live decay check per pair",
+    )
     return parser.parse_args()
 
 
@@ -1209,8 +2487,19 @@ def main() -> None:
         db.close()
         return
 
+    if args.analyze_losses:
+        run_loss_analysis(db, alert_manager)
+        db.close()
+        return
+
+    if args.weekly_report:
+        run_weekly_report(settings, db, alert_manager)
+        db.close()
+        return
+
     if args.experiment_bos:
-        run_bos_experiment(settings, db, alert_manager)
+        days = args.scan_days or 365
+        run_bos_experiment(settings, db, alert_manager, update_gold=args.update_gold, scan_days=days)
         db.close()
         return
 
@@ -1220,17 +2509,31 @@ def main() -> None:
         return
 
     if args.experiment_bos_4h:
-        run_bos_experiment(settings, db, alert_manager, timeframe="4h", htf="1d")
+        days = args.scan_days or 730
+        run_bos_experiment(settings, db, alert_manager, timeframe="4h", htf="1d",
+                           update_gold=args.update_gold, scan_days=days)
         db.close()
         return
 
     if args.experiment_fvg:
-        run_fvg_experiment(settings, db, alert_manager)
+        run_fvg_experiment(settings, db, alert_manager, update_gold=args.update_gold)
         db.close()
         return
 
-    # FXFetcher and LogMonitor are only needed for the scheduler (service mode)
+    if args.experiment_dax:
+        days = args.scan_days or 365
+        run_dax_experiment(settings, db, alert_manager, scan_days=days, update_gold=args.update_gold)
+        db.close()
+        return
+
+    # FXFetcher is needed for both --check-gaps and service mode
     fetcher = FXFetcher(settings)
+
+    if args.check_gaps:
+        run_gap_check(settings, fetcher, db, dry_run=args.dry_run)
+        db.close()
+        return
+
     log_monitor = LogMonitor(log_file, alert_manager.notifier)
 
     scheduler = BlockingScheduler()
@@ -1250,9 +2553,44 @@ def main() -> None:
         max_instances=1,
         id="trade_log_monitor_job",
     )
+    scheduler.add_job(
+        dax_session_job,
+        trigger="cron",
+        minute="*/5",
+        second=30,
+        args=[settings, db, alert_manager],
+        max_instances=1,
+        id="trade_dax_session_job",
+    )
+    scheduler.add_job(
+        gap_check_job,
+        trigger="cron",
+        hour=6,
+        minute=0,
+        args=[settings, fetcher, db],
+        max_instances=1,
+        id="trade_gap_check_job",
+    )
+    scheduler.add_job(
+        momentum_monitor_job,
+        trigger="interval",
+        minutes=15,
+        args=[db, alert_manager],
+        max_instances=1,
+        id="trade_momentum_monitor_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
+    logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
+    logging.info("Gap check job runs daily at 06:00 UTC")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
+
+    # Run gap check once at startup so any downtime gaps are recovered immediately
+    logging.info("Running startup gap check...")
+    try:
+        run_gap_check(settings, fetcher, db)
+    except Exception:
+        logging.exception("Startup gap check failed (non-fatal)")
 
     try:
         scheduler.start()

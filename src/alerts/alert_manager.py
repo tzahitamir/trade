@@ -1,10 +1,11 @@
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from .telegram_notifier import TelegramNotifier
 from analysis.smc_analyzer import SMCAnalyzer
-from analysis.confluence_detector import confluence_labels
+from analysis.confluence_detector import confluence_labels, confluence_description_text
 from db.local_db import LocalDB
 import matplotlib
 matplotlib.use("Agg")
@@ -25,14 +26,16 @@ class AlertManager:
         self.analyzer = SMCAnalyzer()
         self.charts_dir = Path(getattr(settings, "charts_dir", "data/charts"))
         self.charts_dir.mkdir(parents=True, exist_ok=True)
+        self.prod_charts_dir = self.charts_dir / "prod"
+        self.prod_charts_dir.mkdir(parents=True, exist_ok=True)
         self.dev_mode: bool = getattr(settings, "dev_mode", True)
 
     @staticmethod
-    def _generate_alert_id(symbol: str, timestamp: int) -> str:
-        """Generate alert ID: mm-hh-day-month-year-fxpairname  e.g. 30-09-05-06-2026-eurusd"""
+    def _generate_alert_id(symbol: str, timestamp: int, prefix: str = "bos") -> str:
+        """Generate alert ID: {prefix}-mm-hh-day-month-year-fxpairname  e.g. bos15m-30-09-05-06-2026-eurusd"""
         dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
         pair = symbol.lower().replace("/", "")
-        return f"{dt.minute:02d}-{dt.hour:02d}-{dt.day:02d}-{dt.month:02d}-{dt.year}-{pair}"
+        return f"{prefix}-{dt.minute:02d}-{dt.hour:02d}-{dt.day:02d}-{dt.month:02d}-{dt.year}-{pair}"
 
     def evaluate(
         self,
@@ -83,6 +86,151 @@ class AlertManager:
 
         return alerts
 
+    def evaluate_production(
+        self,
+        symbol: str,
+        timeframe: str,
+        candles: List[Dict],
+        candles_4h: Optional[List[Dict]] = None,
+        htf_bias: Optional[str] = None,
+        gold_params: Optional[Dict] = None,
+    ) -> List[Dict]:
+        """Like evaluate() but applies gold param filters and computes TP/SL/R for each signal."""
+        from analysis.confluence_detector import detect_confluences, find_trigger_candle
+
+        gp = gold_params or {}
+        min_str      = gp.get("min_break_strength", 0.7)
+        req_brt      = gp.get("require_brt_confluence", False)
+        htf_only     = gp.get("htf_aligned_only", False)
+        sl_mode      = gp.get("sl_mode", "swing")
+        req_liq      = gp.get("require_liquidity_sweep", False)
+
+        alerts: List[Dict] = []
+        detect_params = {"symbol": symbol, "timeframe": timeframe, "min_break_strength": 0.0,
+                         "require_liquidity_sweep": False}
+        bos_events = self.analyzer.detect_bos(candles, params=detect_params)
+
+        atr = self.analyzer.calculate_atr(candles) or 0.0
+        pre_bos_chron = list(reversed(candles))
+
+        seen: set = set()
+        for ev in bos_events:
+            key = (ev["direction"], round(ev.get("broken_level", 0), 5))
+            if key in seen:
+                continue
+
+            # Gold param filters
+            if ev.get("break_strength", 0.0) < min_str:
+                continue
+            if req_liq and not ev.get("liquidity_sweep"):
+                continue
+            if htf_only and htf_bias not in ("bullish" if ev["direction"] == "bullish" else ("bearish",)):
+                if htf_bias != ("bullish" if ev["direction"] == "bullish" else "bearish"):
+                    continue
+
+            confluences = detect_confluences(ev, [], pre_bos_chron, candles_4h, atr)
+            if req_brt and "BRT" not in confluences:
+                continue
+
+            seen.add(key)
+
+            # Compute SL and TP using the gold sl_mode
+            window_chron = list(reversed(candles))
+            sl, tp, entry, swing_risk = self._compute_trade_levels(ev, window_chron, candles, sl_mode, atr)
+            r_ratio = round(abs(tp - entry) / abs(entry - sl), 2) if abs(entry - sl) > 0 else None
+
+            alert_id = self._generate_alert_id(symbol, ev.get("breakout_ts", 0))
+            try:
+                fig_path, _ = self._render_bos_chart(
+                    candles, ev, alert_id, None, htf_bias,
+                    confluences=confluences, output_dir=self.prod_charts_dir,
+                )
+            except Exception:
+                fig_path = None
+
+            alert = {
+                "alert_id": alert_id,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "event": ev,
+                "htf_bias": htf_bias,
+                "confluences": confluences,
+                "sl_mode": sl_mode,
+                "entry": entry,
+                "sl": sl,
+                "tp": tp,
+                "r_ratio": r_ratio,
+                "image_path": fig_path,
+            }
+            try:
+                alert["db_id"] = self.db.insert_alert(
+                    symbol, timeframe, ev.get("breakout_ts", 0), "BOS",
+                    self._format_production_message(alert), fig_path,
+                    json.dumps(gp), alert_id=alert_id,
+                )
+            except Exception:
+                alert["db_id"] = None
+            alerts.append(alert)
+
+        return alerts
+
+    def _compute_trade_levels(self, ev: Dict, candles_chron: List[Dict], candles_desc: List[Dict],
+                               sl_mode: str, atr: float):
+        """Return (sl, tp, entry, swing_risk) for a BOS event based on sl_mode."""
+        bullish    = ev["direction"] == "bullish"
+        entry      = ev.get("broken_level", 0.0)
+        buf        = 0.3 * atr
+
+        # Swing SL (always computed — used for TP anchor)
+        swing_low  = min(c["low"]  for c in candles_chron[-30:]) if bullish else None
+        swing_high = max(c["high"] for c in candles_chron[-30:]) if not bullish else None
+        sl_swing   = (swing_low - buf) if bullish else (swing_high + buf)
+        swing_risk = abs(entry - sl_swing) or atr
+
+        if sl_mode == "swing":
+            sl = sl_swing
+        elif sl_mode == "broken_level":
+            level = ev.get("broken_level", entry)
+            sl = (level - buf) if bullish else (level + buf)
+        else:  # break_candle
+            bk_ts = ev.get("breakout_ts")
+            bk_candle = next((c for c in candles_chron if c["timestamp"] == bk_ts), None)
+            if bk_candle:
+                sl = (bk_candle["low"] - buf) if bullish else (bk_candle["high"] + buf)
+            else:
+                sl = sl_swing
+
+        tp = entry + swing_risk * 2 if bullish else entry - swing_risk * 2
+        return sl, tp, entry, swing_risk
+
+    def _format_production_message(self, alert: Dict) -> str:
+        ev        = alert["event"]
+        direction = ev.get("direction", "").upper()
+        symbol    = alert["symbol"]
+        htf       = alert.get("htf_bias", "")
+        confs     = alert.get("confluences") or []
+        sl_mode   = alert.get("sl_mode", "swing")
+        entry     = alert.get("entry")
+        sl        = alert.get("sl")
+        tp        = alert.get("tp")
+        r         = alert.get("r_ratio")
+
+        bias_str  = f" | 4H {htf.upper()}" if htf and htf != "neutral" else ""
+        conf_str  = f" | {','.join(confs)}" if confs else ""
+        sl_str    = f" | SL:{sl:.5f} ({sl_mode})" if sl else ""
+        tp_str    = f" | TP:{tp:.5f}" if tp else ""
+        r_str     = f" | R:{r}" if r else ""
+        wr_str    = ""
+        gold = self.db.get_gold_params("BOS15m", symbol).get(symbol)
+        if gold:
+            wr_str = f" | WR:{gold['win_rate']*100:.0f}%"
+        ts_str = datetime.fromtimestamp(ev.get("breakout_ts", 0), tz=timezone.utc).strftime("%H:%M %d-%b")
+        return (f"BOS {direction} {symbol} @ {entry:.5f}{sl_str}{tp_str}{r_str}"
+                f"{bias_str}{conf_str}{wr_str} [{ts_str}]")
+
+    def format_production_alert(self, alert: Dict) -> str:
+        return self._format_production_message(alert)
+
     def _format_bos_message(self, ev: Dict, htf_bias: Optional[str] = None, confluences: Optional[List[str]] = None) -> str:
         direction = ev.get("direction", "")
         lvl = ev.get("broken_level")
@@ -103,8 +251,18 @@ class AlertManager:
         lookahead_chron: List[Dict],
         candles_4h: Optional[List[Dict]] = None,
         trigger_ts: Optional[int] = None,
-    ) -> str:
-        """Compute WIN/LOSS/HTF WIN/HTF LOSS/OPEN without rendering a chart."""
+        sl_mode: str = "swing",
+    ) -> tuple:
+        """Return (outcome, eff_r) for a BOS signal.
+
+        sl_mode controls where the stop is placed:
+          swing        — current default: prior swing low/high ± 0.3 ATR
+          broken_level — SL just beyond the broken swing level ± 0.3 ATR
+          break_candle — SL at the low/high of the BOS break candle itself
+
+        TP is always entry + 2 × swing_risk (unchanged across modes).
+        eff_r = (swing_risk × 2) / tight_risk for WIN, 1.0 for LOSS, None for OPEN.
+        """
         from analysis.smc_analyzer import SMCAnalyzer as _SA
         PRE_BOS = 50
         c = list(reversed(candles))[-(PRE_BOS + 1):]
@@ -113,20 +271,36 @@ class AlertManager:
         _atr = _SA.calculate_atr(candles) or 1e-6
         _swings = _SA._find_last_swing(candles, lookback=3, search_back=20)
         sweep = ev.get("liquidity_sweep") or {}
+
+        # Swing SL — always computed to anchor TP price
         if bullish:
             sl_anchor = sweep.get("wick_low") or _swings.get("swing_low") or min(b["low"] for b in c[-10:])
-            sl = sl_anchor - _atr * 0.3
+            sl_swing = sl_anchor - _atr * 0.3
         else:
             sl_anchor = sweep.get("wick_high") or _swings.get("swing_high") or max(b["high"] for b in c[-10:])
-            sl = sl_anchor + _atr * 0.3
+            sl_swing = sl_anchor + _atr * 0.3
+
         entry = c[-1]["close"] if c else ev.get("broken_level", 0.0)
         if trigger_ts and lookahead_chron:
             for _b in lookahead_chron:
                 if _b["timestamp"] == trigger_ts:
                     entry = _b["close"]
                     break
-        risk = abs(entry - sl) or _atr
-        tp = (entry + risk * 2) if bullish else (entry - risk * 2)
+
+        swing_risk = abs(entry - sl_swing) or _atr
+        tp = (entry + swing_risk * 2) if bullish else (entry - swing_risk * 2)
+
+        # Mode-specific SL (determines when to stop out)
+        if sl_mode == "broken_level":
+            broken = ev.get("broken_level", entry)
+            sl = (broken - _atr * 0.3) if bullish else (broken + _atr * 0.3)
+        elif sl_mode == "break_candle":
+            sl = c[-1]["low"] if bullish else c[-1]["high"]
+        else:
+            sl = sl_swing
+
+        tight_risk = abs(entry - sl) or swing_risk
+
         outcome = "OPEN"
         if lookahead_chron:
             past_trigger = trigger_ts is None
@@ -151,7 +325,15 @@ class AlertManager:
                 else:
                     if _b["high"] >= sl: outcome = "HTF LOSS"; break
                     if _b["low"] <= tp:  outcome = "HTF WIN";  break
-        return outcome
+
+        if "WIN" in outcome:
+            eff_r = round((swing_risk * 2) / tight_risk, 3)
+        elif "LOSS" in outcome:
+            eff_r = 1.0
+        else:
+            eff_r = None
+
+        return outcome, eff_r
 
     @staticmethod
     def _draw_candles(
@@ -188,13 +370,16 @@ class AlertManager:
         candles_4h: Optional[List[Dict]] = None,
         param_set_id: Optional[int] = None,
         skip_db: bool = False,
+        strategy: str = "bos",
+        gold_wr: Optional[float] = None,
     ) -> Dict:
         """Generate chart and DB record for a confirmed BOS event. Returns alert dict."""
-        alert_id = self._generate_alert_id(symbol, ev.get("breakout_ts", 0))
+        alert_id = self._generate_alert_id(symbol, ev.get("breakout_ts", 0), prefix=strategy)
         outcome = "OPEN"
         try:
             fig_path, outcome = self._render_bos_chart(
-                candles, ev, alert_id, lookahead_candles, htf_bias, confluences, trigger_ts, candles_4h
+                candles, ev, alert_id, lookahead_candles, htf_bias, confluences,
+                trigger_ts, candles_4h, gold_wr=gold_wr,
             )
         except Exception:
             import logging, traceback
@@ -238,6 +423,8 @@ class AlertManager:
         confluences: Optional[List[str]] = None,
         trigger_ts: Optional[int] = None,
         candles_4h: Optional[List[Dict]] = None,
+        gold_wr: Optional[float] = None,
+        output_dir=None,
     ) -> tuple:
         """
         Render BOS candlestick chart and save to data/charts/{alert_id}.png.
@@ -321,11 +508,13 @@ class AlertManager:
                 alert_tip_y  = alert_bar["low"]  if bullish else alert_bar["high"]
                 alert_text_y = alert_tip_y - arrow_offset if bullish else alert_tip_y + arrow_offset
                 action = "BUY" if bullish else "SELL"
+                trigger_dt = datetime.fromtimestamp(trigger_ts, tz=timezone.utc)
+                trigger_label = f"{action}\n{trigger_dt.strftime('%d/%m %H:%M')}"
                 ax.annotate(
-                    action,
+                    trigger_label,
                     xy=(alert_x, alert_tip_y),
                     xytext=(alert_x, alert_text_y),
-                    fontsize=8, fontweight="bold", color="green", ha="center", zorder=5,
+                    fontsize=7, fontweight="bold", color="green", ha="center", zorder=5,
                     arrowprops={**arrow_props, "color": "green"},
                 )
 
@@ -444,14 +633,31 @@ class AlertManager:
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, edgecolor=bias_color),
             )
 
-        # confluence label — bottom left
+        # confluence labels + descriptions — bottom left
         if confluences:
             ax.text(
-                0.02, 0.03, f"✓ {confluence_labels(confluences)}",
-                transform=ax.transAxes, fontsize=8, fontweight="bold",
+                0.02, 0.03, confluence_description_text(confluences),
+                transform=ax.transAxes, fontsize=7,
                 color="#26a69a", ha="left", va="bottom",
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="#26a69a"),
             )
+
+        # Trade info box — entry / SL / TP / R / gold WR
+        r_ratio = round(abs(tp - entry) / risk, 1) if risk else 2.0
+        info_parts = [
+            f"Entry: {entry:.5f}",
+            f"SL: {sl:.5f}",
+            f"TP: {tp:.5f}",
+            f"R: 1:{r_ratio}",
+        ]
+        if gold_wr is not None:
+            info_parts.append(f"Gold WR: {gold_wr*100:.1f}%")
+        ax.text(
+            0.02, 0.97, "  ".join(info_parts),
+            transform=ax.transAxes, fontsize=7,
+            color="black", ha="left", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9, edgecolor="gray"),
+        )
 
         mode_tag = " [DEV]" if self.dev_mode and c_ahead else ""
         ax.set_title(
@@ -460,7 +666,9 @@ class AlertManager:
         )
         ax.tick_params(labelsize=7)
 
-        chart_path = self.charts_dir / f"{alert_id}.png"
+        outcome_tag = outcome.lower().replace(" ", "_")
+        dest_dir = output_dir if output_dir is not None else self.charts_dir
+        chart_path = dest_dir / f"{alert_id}-{outcome_tag}.png"
         fig.tight_layout()
         fig.savefig(str(chart_path), dpi=100)
         plt.close(fig)
@@ -683,11 +891,155 @@ class AlertManager:
             fontsize=9,
         )
         ax.tick_params(labelsize=7)
-        chart_path = self.charts_dir / f"{alert_id}.png"
+        outcome_tag = outcome.lower().replace(" ", "_")
+        chart_path = self.charts_dir / f"{alert_id}-{outcome_tag}.png"
         fig.tight_layout()
         fig.savefig(str(chart_path), dpi=100)
         plt.close(fig)
         return str(chart_path), outcome
+
+    def render_dax_alert(
+        self,
+        sig: Dict,
+        candles_5m: List[Dict],
+        outcome: str = "OPEN",
+    ) -> str:
+        """Render a DAX 5m counter-trend chart with premium/discount zone shading. Returns chart path."""
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _FFM_TZ = _ZI("Europe/Berlin")
+        except Exception:
+            from datetime import timedelta as _td
+            _FFM_TZ = timezone(_td(hours=2))
+
+        entry_ts    = sig["breakout_ts"]
+        peak_ts     = sig.get("peak_ts", entry_ts)
+        bos_15m_ts  = sig.get("bos_15m_ts", peak_ts)
+        origin      = sig["origin"]
+        peak        = sig["peak"]
+        eq_level    = sig["eq_level"]
+        entry       = sig["entry"]
+        sl          = sig["sl"]
+        tp          = sig["tp"]
+        direction   = sig["direction"]
+        exp_dir     = sig.get("expansion_dir", "")
+        bullish_exp = exp_dir == "bullish"
+
+        entry_idx = next(
+            (i for i, c in enumerate(candles_5m) if c["timestamp"] >= entry_ts),
+            len(candles_5m) - 1,
+        )
+        display_5m    = candles_5m[: entry_idx + 1]
+        lookahead_bars = candles_5m[entry_idx + 1: entry_idx + 41]
+        all_bars      = display_5m + lookahead_bars
+        if not display_5m:
+            return ""
+
+        fig, ax = plt.subplots(figsize=(14, 5), constrained_layout=True)
+        self._draw_candles(ax, display_5m, x_offset=0, alpha=1.0)
+        if lookahead_bars:
+            self._draw_candles(ax, lookahead_bars, x_offset=len(display_5m), alpha=0.40)
+
+        x_total = len(all_bars)
+        entry_x = len(display_5m) - 1
+        lows    = [b["low"]  for b in all_bars]
+        highs   = [b["high"] for b in all_bars]
+        pad     = (max(highs) - min(lows)) * 0.06
+        y_lo    = min(min(lows), sl, tp) - pad
+        y_hi    = max(max(highs), sl, tp) + pad
+        ax.set_xlim(-1, x_total)
+        ax.set_ylim(y_lo, y_hi)
+
+        # Premium / discount zone shading
+        if bullish_exp:
+            ax.axhspan(origin,   eq_level, alpha=0.07, color="green")
+            ax.axhspan(eq_level, peak,     alpha=0.07, color="crimson")
+        else:
+            ax.axhspan(peak,     eq_level, alpha=0.07, color="crimson")
+            ax.axhspan(eq_level, origin,   alpha=0.07, color="green")
+
+        # Vertical event markers
+        bos_x  = next((i for i, c in enumerate(all_bars) if c["timestamp"] >= bos_15m_ts), None)
+        peak_x = next((i for i, c in enumerate(all_bars) if c["timestamp"] >= peak_ts),    None)
+        if bos_x is not None:
+            ax.axvline(bos_x, color="steelblue", linestyle=":", linewidth=1.2, alpha=0.8, zorder=1)
+            ax.text(bos_x + 0.3, y_hi - pad * 0.3, "15m BOS", fontsize=6, color="steelblue", va="top")
+        if peak_x is not None:
+            ax.axvline(peak_x, color="darkorange", linestyle="--", linewidth=1.2, alpha=0.8, zorder=1)
+            ax.text(peak_x + 0.3, y_hi - pad * 0.3, "PEAK", fontsize=6, color="darkorange", va="top")
+
+        # Horizontal levels
+        ax.hlines(origin,   0, x_total, colors="gray",       linestyles=":",  linewidth=1.0, zorder=2, label="origin")
+        ax.hlines(peak,     0, x_total, colors="steelblue",  linestyles=":",  linewidth=1.0, zorder=2, label="peak")
+        ax.hlines(eq_level, 0, x_total, colors="orange",     linestyles="--", linewidth=1.2, zorder=2, label="EQ 50%")
+        ax.hlines(sl,  entry_x, x_total, colors="red",       linestyles="--", linewidth=1.3, zorder=3)
+        ax.hlines(tp,  entry_x, x_total, colors="limegreen", linestyles="--", linewidth=1.3, zorder=3)
+        for lvl, lbl, col in [
+            (origin, "orig", "gray"), (peak, "peak", "steelblue"),
+            (eq_level, "EQ", "orange"), (sl, "SL", "red"), (tp, "TP", "limegreen"),
+        ]:
+            ax.text(x_total - 0.2, lvl, f" {lbl}", fontsize=7, color=col, va="center", fontweight="bold")
+
+        # Entry arrow
+        action      = "SELL" if direction == "bearish" else "BUY"
+        tip_y       = display_5m[-1]["high"] if direction == "bearish" else display_5m[-1]["low"]
+        price_range = max(highs) - min(lows) or 1.0
+        offset      = price_range * 0.10
+        text_y      = tip_y + offset if direction == "bearish" else tip_y - offset
+        entry_color = "crimson" if direction == "bearish" else "green"
+        ax.annotate(
+            action, xy=(entry_x, tip_y), xytext=(entry_x, text_y),
+            fontsize=9, fontweight="bold", color="white", ha="center", zorder=6,
+            arrowprops=dict(arrowstyle="-|>", color=entry_color, lw=1.5),
+            bbox=dict(boxstyle="round,pad=0.25", facecolor=entry_color, alpha=0.9),
+        )
+
+        # Outcome badge — bottom right
+        out_color = "#26a69a" if "WIN" in outcome else ("#ef5350" if "LOSS" in outcome else "gray")
+        ax.text(
+            0.98, 0.03, outcome, transform=ax.transAxes, fontsize=11, fontweight="bold",
+            color=out_color, ha="right", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9, edgecolor=out_color),
+        )
+
+        # Trade info box — top left
+        risk   = abs(entry - sl)
+        r      = round(abs(tp - entry) / risk, 1) if risk else 0.0
+        ep_pct = sig.get("entry_pct_from_origin", 0) * 100
+        info   = f"Entry: {entry:.0f}  SL: {sl:.0f}  TP: {tp:.0f}  R: 1:{r}  zone: {ep_pct:.0f}%"
+        ax.text(
+            0.01, 0.98, info, transform=ax.transAxes, fontsize=7,
+            color="black", ha="left", va="top", zorder=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.95, edgecolor="gray"),
+        )
+
+        # X-axis: Frankfurt time at every :00 and :30
+        tick_pos, tick_lbl = [], []
+        for i, bar in enumerate(all_bars):
+            dt_ff = datetime.fromtimestamp(bar["timestamp"], tz=_FFM_TZ)
+            if dt_ff.minute % 30 == 0:
+                tick_pos.append(i)
+                tick_lbl.append(dt_ff.strftime("%H:%M"))
+        ax.set_xticks(tick_pos)
+        ax.set_xticklabels(tick_lbl, fontsize=6, rotation=45, ha="right")
+        ax.set_xlabel("Frankfurt time", fontsize=7)
+        ax.set_title(
+            f"DAX  {direction.upper()} counter-trend (fades {exp_dir.upper()} expansion)"
+            f"  |  {sig.get('symbol', 'DAX')}",
+            fontsize=9,
+        )
+        ax.tick_params(axis="y", labelsize=7)
+        ax.legend(fontsize=7, loc="lower left")
+
+        bos_dt      = datetime.fromtimestamp(entry_ts, tz=timezone.utc)
+        outcome_tag = outcome.lower().replace(" ", "_")
+        alert_id    = (f"dax-{bos_dt.minute:02d}-{bos_dt.hour:02d}"
+                       f"-{bos_dt.day:02d}-{bos_dt.month:02d}-{bos_dt.year}")
+        chart_path  = self.charts_dir / f"{alert_id}-{outcome_tag}.png"
+        fig.savefig(str(chart_path), dpi=100)
+        plt.close(fig)
+        logging.info("DAX chart saved: %s", chart_path.name)
+        return str(chart_path)
 
     def format_alert(self, alert: Dict) -> str:
         return f"[{alert.get('alert_id')}] {alert.get('message')}"

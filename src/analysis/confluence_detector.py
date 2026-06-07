@@ -41,9 +41,22 @@ _LABEL_MAP = {
     "HTF_LEVEL": "HTF Level",
 }
 
+_CONF_DESCRIPTIONS = {
+    "CONF_CANDLE": "First candle after BOS closes in trade direction",
+    "BRT":         "Price retested the broken level before continuing",
+    "OB_RETRACE":  "Price pulled back into the last opposing order block",
+    "FVG":         "Price filled a fair-value gap left by the BOS impulse",
+    "HTF_LEVEL":   "Broken 15m swing aligns with a 4h structural level",
+}
+
 
 def confluence_labels(confluences: List[str]) -> str:
     return "  |  ".join(_LABEL_MAP.get(c, c) for c in confluences)
+
+
+def confluence_description_text(confluences: List[str]) -> str:
+    lines = [f"✓ {_LABEL_MAP.get(c, c)}: {_CONF_DESCRIPTIONS.get(c, '')}" for c in confluences]
+    return "\n".join(lines)
 
 
 def _find_order_block(pre_bos_chron: List[Dict], direction: str) -> Optional[Dict]:

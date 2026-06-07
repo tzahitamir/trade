@@ -278,22 +278,24 @@ class SMCAnalyzer:
 
     def detect_fvg_doji(self, candles: List[Dict], params: Dict = None) -> List[Dict]:
         """
-        Detect FVG + deep retrace + doji/rejection setup.
+        Detect FVG + retrace + doji rejection setup.
 
         Sequence:
-          1. A Fair Value Gap (3-candle gap) formed within fvg_lookback candles.
+          1. A Fair Value Gap (3-candle gap) formed within the last max_bars_after_fvg candles.
           2. Price retraced >= min_retrace_pct into the FVG zone.
           3. The current (last) candle is a doji: body <= max_doji_body_pct * range.
-          4. Doji closed in the FVG origin direction (rejection confirmed).
+          4. Doji INVALIDATES the FVG: close back inside/through the zone (confirms rejection).
+             Bullish: close >= fvg_low  |  Bearish: close <= fvg_high
 
         Returns at most one signal per call (the strongest match by retrace depth).
         """
         params = params or {}
-        fvg_lookback      = params.get("fvg_lookback", 20)
-        min_fvg_size_atr  = params.get("min_fvg_size_atr", 0.3)
-        min_retrace_pct   = params.get("min_retrace_pct", 0.5)
-        max_doji_body_pct = params.get("max_doji_body_pct", 0.35)
-        min_atr_pct       = params.get("min_atr_pct", 0.0003)
+        fvg_lookback        = params.get("fvg_lookback", 20)
+        max_bars_after_fvg  = params.get("max_bars_after_fvg", 8)
+        min_fvg_size_atr    = params.get("min_fvg_size_atr", 0.3)
+        min_retrace_pct     = params.get("min_retrace_pct", 0.5)
+        max_doji_body_pct   = params.get("max_doji_body_pct", 0.35)
+        min_atr_pct         = params.get("min_atr_pct", 0.0003)
 
         if not candles or len(candles) < 5:
             return []
@@ -315,12 +317,18 @@ class SMCAnalyzer:
         if rng == 0 or body / rng > max_doji_body_pct:
             return []
 
-        # Search last fvg_lookback candles (exclude current and 1 gap) for a FVG
+        # Search within fvg_lookback candles (exclude current candle)
         search_start = max(0, len(c) - 2 - fvg_lookback)
         search = c[search_start : len(c) - 2]
 
         candidates = []
         for i in range(len(search) - 2):
+            # How many bars elapsed between FVG formation (c3 = search[i+2]) and the doji (c[-1])
+            fvg_c3_abs_idx = search_start + i + 2  # absolute index in c[]
+            bars_since_fvg = (len(c) - 1) - fvg_c3_abs_idx
+            if bars_since_fvg > max_bars_after_fvg:
+                continue  # FVG too old
+
             c1, c2, c3 = search[i], search[i + 1], search[i + 2]
 
             # --- Bullish FVG: gap above c1.high below c3.low ---
@@ -331,24 +339,25 @@ class SMCAnalyzer:
                     continue
                 retrace_level = fvg_hi - min_retrace_pct * fvg_size
                 if cur["low"] > retrace_level:
-                    continue  # not deep enough
+                    continue  # not deep enough into the zone
                 if cur["low"] < fvg_lo - atr * 0.3:
-                    continue  # blew through — FVG invalidated
-                mid = (cur["low"] + cur["high"]) / 2
-                if cur["close"] < mid:
-                    continue  # closed weak, not a bullish rejection
+                    continue  # blew completely through — no longer a valid test
+                # Rejection: doji must close back inside/above the FVG (invalidates the retrace)
+                if cur["close"] < fvg_lo:
+                    continue
                 depth = (fvg_hi - cur["low"]) / fvg_size
                 candidates.append({
-                    "symbol":        params.get("symbol"),
-                    "timeframe":     params.get("timeframe"),
-                    "direction":     "bullish",
-                    "fvg_low":       fvg_lo,
-                    "fvg_high":      fvg_hi,
-                    "fvg_ts":        c2["timestamp"],
-                    "breakout_ts":   cur["timestamp"],
-                    "fvg_size_atr":  round(fvg_size / atr, 2),
-                    "retrace_depth": round(depth, 2),
-                    "doji_body_pct": round(body / rng, 2),
+                    "symbol":           params.get("symbol"),
+                    "timeframe":        params.get("timeframe"),
+                    "direction":        "bullish",
+                    "fvg_low":          fvg_lo,
+                    "fvg_high":         fvg_hi,
+                    "fvg_ts":           c2["timestamp"],
+                    "breakout_ts":      cur["timestamp"],
+                    "fvg_size_atr":     round(fvg_size / atr, 2),
+                    "retrace_depth":    round(depth, 2),
+                    "doji_body_pct":    round(body / rng, 2),
+                    "bars_since_fvg":   bars_since_fvg,
                 })
 
             # --- Bearish FVG: gap below c1.low above c3.high ---
@@ -362,27 +371,217 @@ class SMCAnalyzer:
                     continue
                 if cur["high"] > fvg_hi + atr * 0.3:
                     continue
-                mid = (cur["low"] + cur["high"]) / 2
-                if cur["close"] > mid:
-                    continue  # closed strong, not a bearish rejection
+                # Rejection: doji must close back inside/below the FVG (invalidates the retrace)
+                if cur["close"] > fvg_hi:
+                    continue
                 depth = (cur["high"] - fvg_lo) / fvg_size
                 candidates.append({
-                    "symbol":        params.get("symbol"),
-                    "timeframe":     params.get("timeframe"),
-                    "direction":     "bearish",
-                    "fvg_low":       fvg_lo,
-                    "fvg_high":      fvg_hi,
-                    "fvg_ts":        c2["timestamp"],
-                    "breakout_ts":   cur["timestamp"],
-                    "fvg_size_atr":  round(fvg_size / atr, 2),
-                    "retrace_depth": round(depth, 2),
-                    "doji_body_pct": round(body / rng, 2),
+                    "symbol":           params.get("symbol"),
+                    "timeframe":        params.get("timeframe"),
+                    "direction":        "bearish",
+                    "fvg_low":          fvg_lo,
+                    "fvg_high":         fvg_hi,
+                    "fvg_ts":           c2["timestamp"],
+                    "breakout_ts":      cur["timestamp"],
+                    "fvg_size_atr":     round(fvg_size / atr, 2),
+                    "retrace_depth":    round(depth, 2),
+                    "doji_body_pct":    round(body / rng, 2),
+                    "bars_since_fvg":   bars_since_fvg,
                 })
 
         if not candidates:
             return []
-        # Return the best match (deepest retrace = most significant rejection)
         return [max(candidates, key=lambda x: x["retrace_depth"])]
+
+    def detect_dax_session_setup(
+        self,
+        candles_15m_session: List[Dict],   # session-window 15m candles, oldest→newest
+        candles_5m_full: List[Dict],        # 5m candles covering session + lookahead, oldest→newest
+        params: Dict = None,
+        candles_15m_presession: List[Dict] = None,
+    ) -> List[Dict]:
+        """
+        Counter-trend DAX Frankfurt Open session strategy.
+
+        1. Detect session expansion via 15m BOS against pre-session structure.
+        2. Find the expansion peak (session high for bull, session low for bear).
+        3. From the peak, scan 5m for a CHoCH/BOS COUNTER-TREND (bearish for bull
+           expansion, bullish for bear expansion).
+        4. Accept signal only while price is still in premium zone (above eq_level
+           for bearish counter-trade; below eq_level for bullish counter-trade).
+        5. TP = origin + tp_pct × expansion_range (mean reversion target).
+        6. SL = recent 5m swing extreme + sl_atr_mult × ATR_5m.
+
+        Returns at most one signal per session (the first qualifying counter-trend entry).
+        """
+        params = params or {}
+        tp_pct         = params.get("tp_pct", 0.5)
+        sl_atr_mult    = params.get("sl_atr_mult", 0.5)
+        min_exp_atr    = params.get("min_expansion_atr", 1.0)
+        entry_zone_pct = params.get("entry_zone_min_pct", 0.5)
+        swing_lb_5m    = params.get("swing_lookback_5m", 12)
+        min_str_5m     = params.get("min_break_str_5m", 0.3)
+
+        if len(candles_15m_session) < 3:
+            return []
+
+        session_start_ts = candles_15m_session[0]["timestamp"]
+        pre      = (candles_15m_presession or [])[-16:]
+        combined = pre + candles_15m_session
+
+        if len(combined) < 6:
+            return []
+
+        atr_15m = self.calculate_atr(list(reversed(combined))) or 1.0
+
+        # Step 1 — detect expansion direction via first session BOS against pre-session structure
+        first_bos             = None
+        first_bos_combined_idx = None
+        for i in range(5, len(combined)):
+            if combined[i]["timestamp"] < session_start_ts:
+                continue
+            window_desc = list(reversed(combined[:i + 1]))
+            events = self.detect_bos(
+                window_desc,
+                params={
+                    "min_break_strength":       0.3,
+                    "min_swing_age_candles":    2,
+                    "swing_lookback":           min(16, i),
+                    "min_break_distance_atr_mult": 0.1,
+                    "min_atr_pct":              0.0001,
+                    "require_liquidity_sweep":  False,
+                    "symbol":                   params.get("symbol"),
+                    "timeframe":                "15m",
+                },
+            )
+            for ev in events:
+                if ev["breakout_ts"] >= session_start_ts:
+                    first_bos              = ev
+                    first_bos_combined_idx = i
+                    break
+            if first_bos:
+                break
+
+        if first_bos is None:
+            return []
+
+        direction   = first_bos["direction"]
+        ct_dir      = "bearish" if direction == "bullish" else "bullish"
+        bullish_exp = direction == "bullish"
+        bos_ts      = first_bos["breakout_ts"]
+
+        # Step 2 — key expansion levels
+        pre_bos  = combined[:first_bos_combined_idx + 1]
+        post_bos = combined[first_bos_combined_idx:]
+
+        if bullish_exp:
+            origin      = min(c["low"]  for c in pre_bos[-16:]) if pre_bos else combined[0]["low"]
+            peak        = max(c["high"] for c in post_bos)      if post_bos else first_bos["broken_level"]
+            peak_candle = max(post_bos, key=lambda c: c["high"])
+        else:
+            origin      = max(c["high"] for c in pre_bos[-16:]) if pre_bos else combined[0]["high"]
+            peak        = min(c["low"]  for c in post_bos)      if post_bos else first_bos["broken_level"]
+            peak_candle = min(post_bos, key=lambda c: c["low"])
+
+        expansion_range = abs(peak - origin)
+        if expansion_range < min_exp_atr * atr_15m:
+            return []
+
+        peak_ts = peak_candle["timestamp"]
+
+        eq_level    = (origin + 0.5          * expansion_range) if bullish_exp else (origin - 0.5          * expansion_range)
+        tp_level    = (origin + tp_pct       * expansion_range) if bullish_exp else (origin - tp_pct       * expansion_range)
+        entry_floor = (origin + entry_zone_pct * expansion_range) if bullish_exp else (origin - entry_zone_pct * expansion_range)
+
+        # Step 3 — scan 5m COUNTER-TREND starting from the expansion peak
+        post_peak_5m = [c for c in candles_5m_full if c["timestamp"] >= peak_ts]
+        if len(post_peak_5m) < 5:
+            return []
+
+        atr_5m = self.calculate_atr(list(reversed(post_peak_5m[:60]))) or (expansion_range * 0.005)
+
+        for i in range(4, min(len(post_peak_5m), 120)):
+            cur = post_peak_5m[i]
+
+            # Stop if price has moved through eq_level — mean reversion already playing out
+            if bullish_exp  and cur["close"] < eq_level:
+                break
+            if not bullish_exp and cur["close"] > eq_level:
+                break
+
+            # Skip if price hasn't pulled back into the premium entry zone yet
+            if bullish_exp  and cur["close"] < entry_floor:
+                continue
+            if not bullish_exp and cur["close"] > entry_floor:
+                continue
+
+            window_5m      = post_peak_5m[max(0, i - swing_lb_5m + 1): i + 1]
+            window_5m_desc = list(reversed(window_5m))
+            if len(window_5m) < 5:
+                continue
+
+            # detect_bos computes ATR internally, but the 5m window is often < 15
+            # candles, making calculate_atr return None → atr=0 → break_strength=0.
+            # Fix: pass min_break_distance as an absolute value from the wider atr_5m,
+            # and disable the relative strength filter (min_break_strength=0.0).
+            events_5m = self.detect_bos(
+                window_5m_desc,
+                params={
+                    "min_break_strength":       0.0,
+                    "min_break_distance":       min_str_5m * atr_5m,
+                    "min_swing_age_candles":    2,
+                    "swing_lookback":           len(window_5m),
+                    "min_break_distance_atr_mult": 0.0,
+                    "min_atr_pct":              0.0,
+                    "require_liquidity_sweep":  False,
+                    "symbol":                   params.get("symbol"),
+                    "timeframe":                "5m",
+                },
+            )
+
+            for ev in events_5m:
+                if ev["direction"] != ct_dir:
+                    continue
+
+                entry_candle = next((c for c in post_peak_5m if c["timestamp"] == ev["breakout_ts"]), cur)
+                entry = entry_candle["close"]
+
+                # Confirm entry is still in premium zone at the signal moment
+                if bullish_exp  and (entry <= eq_level or entry < entry_floor):
+                    continue
+                if not bullish_exp and (entry >= eq_level or entry > entry_floor):
+                    continue
+
+                recent = post_peak_5m[max(0, i - 3): i + 1]
+                sl = (max(c["high"] for c in recent) + sl_atr_mult * atr_5m) if bullish_exp \
+                    else (min(c["low"] for c in recent) - sl_atr_mult * atr_5m)
+
+                risk      = abs(entry - sl) or atr_5m
+                retrace   = abs(peak - entry) / expansion_range if expansion_range else 0.0
+                entry_pct = abs(entry - origin) / expansion_range if expansion_range else 0.0
+
+                return [{
+                    "symbol":                params.get("symbol"),
+                    "timeframe":             "15m+5m",
+                    "direction":             ct_dir,
+                    "expansion_dir":         direction,
+                    "breakout_ts":           ev["breakout_ts"],
+                    "bos_15m_ts":            bos_ts,
+                    "peak_ts":               peak_ts,
+                    "origin":                round(origin, 2),
+                    "peak":                  round(peak, 2),
+                    "eq_level":              round(eq_level, 2),
+                    "expansion_range":       round(expansion_range, 2),
+                    "entry":                 round(entry, 2),
+                    "sl":                    round(sl, 2),
+                    "tp":                    round(tp_level, 2),
+                    "risk":                  round(risk, 2),
+                    "bos_5m_level":          round(ev["broken_level"], 2),
+                    "retrace_depth_pct":     round(retrace, 2),
+                    "entry_pct_from_origin": round(entry_pct, 2),
+                }]
+
+        return []
 
     def get_htf_bias(self, candles_htf: List[Dict], bos_ts: int) -> str:
         """

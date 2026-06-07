@@ -280,6 +280,11 @@ Re-run --experiment-bos --update-gold to get new gold params incorporating these
 Add --analyze-losses CLI command (already implemented) to re-run this analysis on any new data
 Implement post-entry momentum monitor: after alert is sent, watch each subsequent 15m candle; if price has not reached 0.5R favorable by candle 4, send a Telegram "momentum stalling" warning with suggestion to close at breakeven
 
+on the alert  graph , during dev stage print the next 50 candles to see what happend to the price
+
+99. monitor validation of gold params and continous  improvment 
+
+
 100. future features - ignore that section for now
 
 log production 

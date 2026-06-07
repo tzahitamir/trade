@@ -6,7 +6,20 @@ fx_pairs:
   - NZDUSD
   - GBPJPY
   - EURGBP
-  - USDJPY
+  - USDJPY   # data fetched for manual review; excluded from alerts via alert_pairs below
+  - XAUUSD   # XAU/USD gold — liquidity sweep mandatory (project plan item 60)
+
+# Pairs that generate live Telegram alerts. Subset of fx_pairs.
+# USDJPY excluded: gold params underperforming on recent 30d data (WR 7.7%, EV -0.55R).
+alert_pairs:
+  - EURUSD
+  - EURJPY
+  - USDCAD
+  - USDCHF
+  - NZDUSD
+  - GBPJPY
+  - EURGBP
+  - XAUUSD   # gold: v235 swp+htf+mx2+nowe+nodh+mxs2+bl  WR=58.6%  EV=+1.854R  n=58
 
 timeframes:
   - 5m
@@ -25,4 +38,5 @@ telegram:
   chat_id: ""
 
 alert_threshold: 0.0
-dev_mode: true
+dev_mode: false
+dax_alerts_enabled: false  # n=5 is too thin; gathering more data before enabling
