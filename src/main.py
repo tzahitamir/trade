@@ -147,7 +147,7 @@ def process_symbol_timeframe(
     db.insert_candles(symbol, timeframe, new_candles)
     logging.info("Inserted %d new candles for %s %s", len(new_candles), symbol, timeframe)
 
-    if not settings.should_alert(symbol):
+    if not alert_manager.settings.should_alert(symbol):
         logging.debug("Alerts suppressed for %s (not in alert_pairs)", symbol)
         return
 
@@ -272,9 +272,9 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
         for timeframe in timeframes:
             try:
                 process_symbol_timeframe(symbol, timeframe, fetcher, db, alert_manager)
-                # Delay to stay within API rate limits (8/min). 
-                # 7s ensures 9+ calls are spread across > 1 minute.
-                time.sleep(7)
+                # Delay to stay within API rate limits (8/min on free tier).
+                # 9 symbols × 8s = 72s > 60s rolling window — guaranteed safe.
+                time.sleep(8)
             except Exception as exc:
                 message = f"Failed to fetch {symbol} {timeframe}: {exc}"
                 logging.exception(message)
