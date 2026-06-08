@@ -199,7 +199,7 @@ def process_symbol_timeframe(
 
 # ── LIQ sweep live alerts ──────────────────────────────────────────────────────
 
-_LIQ_LIVE_PAIRS = {"EURUSD", "USDCAD"}
+_LIQ_LIVE_PAIRS = {"EURUSD"}  # USDCAD muted until stats improve
 
 # Optimal params: PDH/PDL + NY open + HTF aligned + sweep≥0.2 ATR + entry_0.7atr SL + RR 3.0
 _LIQ_LIVE_DETECT_PARAMS = {

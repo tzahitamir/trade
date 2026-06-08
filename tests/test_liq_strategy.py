@@ -419,10 +419,10 @@ class TestProcessSymbolLiq:
             second_count = am.send_alert.call_count
         assert second_count == first_count  # no new alert on second call
 
-    def test_usdcad_also_live(self, db):
-        assert "USDCAD" in _LIQ_LIVE_PAIRS
+    def test_usdcad_not_live(self, db):
+        assert "USDCAD" not in _LIQ_LIVE_PAIRS  # muted until stats improve
 
-    def test_eurusd_also_live(self, db):
+    def test_eurusd_is_live(self, db):
         assert "EURUSD" in _LIQ_LIVE_PAIRS
 
 
