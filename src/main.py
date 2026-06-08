@@ -152,8 +152,12 @@ def process_symbol_timeframe(
         logging.debug("Alerts suppressed for %s (not in alert_pairs)", symbol)
         return
 
+    if timeframe == "30m":
+        process_symbol_liq(symbol, db, alert_manager)
+        return
+
     if timeframe != "15m":
-        return  # only 15m signals for now
+        return  # only 15m BOS signals
 
     # Load gold params for this symbol/strategy to filter signals
     gold_map = db.get_gold_params("BOS15m", symbol)
@@ -191,6 +195,117 @@ def process_symbol_timeframe(
             )
         except Exception:
             logging.exception("Failed to insert trade monitor for %s", alert.get("alert_id"))
+
+
+# ── LIQ sweep live alerts ──────────────────────────────────────────────────────
+
+_LIQ_LIVE_PAIRS = {"EURUSD", "USDCAD"}
+
+# Optimal params: PDH/PDL + NY open + HTF aligned + sweep≥0.2 ATR + entry_0.7atr SL + RR 3.0
+_LIQ_LIVE_DETECT_PARAMS = {
+    "use_pdh_pdl":   True,
+    "use_eq_pools":  False,
+    "kill_zones_utc": [(13, 16)],  # NY open 13-15 UTC
+    "min_sweep_atr": 0.0,          # filter applied manually after detection
+}
+_LIQ_LIVE_MIN_SWEEP_ATR = 0.2
+_LIQ_LIVE_SL_ATR        = 0.7
+_LIQ_LIVE_RR            = 3.0
+
+
+def _format_liq_alert(symbol: str, ev: dict, entry: float, sl: float, tp: float,
+                      htf_bias: str, atr: float) -> str:
+    direction  = ev["direction"].upper()
+    pool_type  = ev["pool_type"]
+    pool_level = ev["pool_level"]
+    sweep_atr  = ev.get("sweep_size_atr", 0.0)
+    wick_pct   = ev.get("rejection_wick_pct", 0.0)
+    risk       = abs(entry - sl)
+    ts_str     = datetime.fromtimestamp(ev["breakout_ts"], tz=timezone.utc).strftime("%H:%M %d-%b")
+    return (
+        f"LIQ SWEEP {direction} {symbol} @ {entry:.5f}"
+        f" | {pool_type}={pool_level:.5f}"
+        f" | SL:{sl:.5f} (entry±0.7ATR)"
+        f" | TP:{tp:.5f} (3R={risk * _LIQ_LIVE_RR:.5f})"
+        f" | sweep={sweep_atr:.2f}ATR  wick={wick_pct:.0%}"
+        f" | 4H:{(htf_bias or '?').upper()}"
+        f" | {ts_str} UTC"
+    )
+
+
+def process_symbol_liq(
+    symbol: str,
+    db: "LocalDB",
+    alert_manager: "AlertManager",
+) -> None:
+    """Check for live LIQ sweep alerts on 30m after a new candle is inserted."""
+    if symbol not in _LIQ_LIVE_PAIRS:
+        return
+    if not alert_manager.settings.should_alert(symbol):
+        return
+
+    now_hour = datetime.now(timezone.utc).hour
+    if now_hour not in (13, 14, 15):
+        return
+
+    recent = db.query_recent(symbol, "30m", limit=100)
+    if not recent or len(recent) < 30:
+        return
+
+    candles_4h = db.query_recent(symbol, "4h", limit=500)
+    htf_bias = None
+    if candles_4h:
+        htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, recent[0]["timestamp"])
+
+    det_slice = recent[:50]
+    liq_events = alert_manager.analyzer.detect_liquidity_sweep(
+        det_slice, params={**_LIQ_LIVE_DETECT_PARAMS, "symbol": symbol, "timeframe": "30m"}
+    )
+    if not liq_events:
+        return
+
+    atr = alert_manager.analyzer.calculate_atr(det_slice) or 1e-6
+
+    for ev in liq_events:
+        if ev["pool_type"] not in ("PDH", "PDL"):
+            continue
+        if ev.get("sweep_size_atr", 0.0) < _LIQ_LIVE_MIN_SWEEP_ATR:
+            continue
+        if htf_bias != ev["direction"]:
+            continue  # require HTF alignment
+
+        bullish = ev["direction"] == "bullish"
+        entry   = det_slice[0]["close"]
+        sl      = (entry - _LIQ_LIVE_SL_ATR * atr) if bullish else (entry + _LIQ_LIVE_SL_ATR * atr)
+        risk    = abs(entry - sl) or atr * 0.5
+        tp      = (entry + _LIQ_LIVE_RR * risk) if bullish else (entry - _LIQ_LIVE_RR * risk)
+
+        alert_id = _liq_alert_id(symbol, ev["breakout_ts"], ev["pool_type"])
+        message  = _format_liq_alert(symbol, ev, entry, sl, tp, htf_bias, atr)
+
+        # Dedup: insert_alert raises on duplicate alert_id (UNIQUE constraint)
+        try:
+            db.insert_alert(symbol, "30m", ev["breakout_ts"], "LIQ", message,
+                            None, "{}", alert_id=alert_id)
+        except Exception:
+            logging.debug("LIQ duplicate suppressed: %s", alert_id)
+            continue
+
+        logging.info("LIQ ALERT: %s", message)
+        alert_manager.send_alert(message)
+
+        try:
+            db.insert_monitor(
+                alert_id=alert_id,
+                symbol=symbol,
+                direction=ev["direction"],
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                breakout_ts=ev["breakout_ts"],
+            )
+        except Exception:
+            logging.exception("Failed to insert LIQ monitor for %s", alert_id)
 
 
 def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
@@ -1429,38 +1544,46 @@ def run_weekly_report(settings: "Settings", db: LocalDB,
 # ──────────────────────────── FVG DOJI STRATEGY ────────────────────────────
 
 _FVG_SWEEP_BASE = {
-    "fvg_lookback": 20,
-    "max_doji_body_pct": 0.35,
-    "min_fvg_size_atr": 0.3,
-    "min_retrace_pct": 0.5,
-    "scan_days": 365,
+    "fvg_lookback":           20,
+    "max_bars_after_fvg":     8,
+    "max_doji_body_pct":      0.20,
+    "min_rejection_wick_pct": 0.75,
+    "min_momentum_body_pct":  0.60,
+    "min_fvg_size_atr":       0.3,
+    "min_retrace_pct":        0.50,
+    "scan_days":              365,
 }
 
 FVG_PARAM_SWEEP_SETS = [
-    # vary FVG size threshold
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.3,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.7,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 1.0,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35},
-    # vary retrace depth
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.35},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.80, "max_doji_body_pct": 0.35},
-    # vary doji body strictness
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.20},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.25},
-    # combined strict setups
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.7,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.25},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 1.0,  "min_retrace_pct": 0.80, "max_doji_body_pct": 0.20},
-    # HTF-aligned only variants (4h bias must match FVG direction)
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.3,  "min_retrace_pct": 0.50, "max_doji_body_pct": 0.35, "htf_aligned_only": True},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.35, "htf_aligned_only": True},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.7,  "min_retrace_pct": 0.65, "max_doji_body_pct": 0.25, "htf_aligned_only": True},
-    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 1.0,  "min_retrace_pct": 0.80, "max_doji_body_pct": 0.20, "htf_aligned_only": True},
+    # ── wick ≥ 75% baseline ──
+    {**_FVG_SWEEP_BASE},
+    {**_FVG_SWEEP_BASE, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_retrace_pct": 0.70},
+    {**_FVG_SWEEP_BASE, "min_retrace_pct": 0.70, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5, "min_retrace_pct": 0.70},
+    {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.5, "min_retrace_pct": 0.70, "htf_aligned_only": True},
+    # ── wick ≥ 80% ──
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.80},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.80, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.80, "min_fvg_size_atr": 0.5},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.80, "min_fvg_size_atr": 0.5, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.80, "min_retrace_pct": 0.70},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.80, "min_retrace_pct": 0.70, "htf_aligned_only": True},
+    # ── wick ≥ 85% ──
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.85},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.85, "htf_aligned_only": True},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.85, "min_fvg_size_atr": 0.5},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.85, "min_retrace_pct": 0.70},
+    # ── wick ≥ 90% (very rare / very high bar) ──
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.90},
+    {**_FVG_SWEEP_BASE, "min_rejection_wick_pct": 0.90, "htf_aligned_only": True},
 ]
 
 
 def _fvg_pset_label(pset: dict) -> str:
-    lbl = f"fvg{pset['min_fvg_size_atr']}+r{pset['min_retrace_pct']}+b{pset['max_doji_body_pct']}"
+    lbl = f"fvg{pset['min_fvg_size_atr']}+r{pset['min_retrace_pct']}+b{pset['max_doji_body_pct']}+w{pset['min_rejection_wick_pct']}"
     if pset.get("htf_aligned_only"):
         lbl += "+htf"
     return lbl
@@ -1470,6 +1593,7 @@ def _apply_fvg_param_filter(raw_signals: list, params: dict) -> list:
     min_size    = params.get("min_fvg_size_atr", 0.3)
     min_retrace = params.get("min_retrace_pct", 0.5)
     max_body    = params.get("max_doji_body_pct", 0.35)
+    min_wick    = params.get("min_rejection_wick_pct", 0.0)
     htf_only    = params.get("htf_aligned_only", False)
     result = []
     for r in raw_signals:
@@ -1478,6 +1602,8 @@ def _apply_fvg_param_filter(raw_signals: list, params: dict) -> list:
         if (r.get("retrace_depth") or 0) < min_retrace:
             continue
         if (r.get("doji_body_pct") or 1) > max_body:
+            continue
+        if min_wick > 0 and (r.get("rejection_wick_pct") or 0) < min_wick:
             continue
         if htf_only:
             htf = (r.get("htf_bias") or "").lower()
@@ -1523,15 +1649,15 @@ def _run_fvg_param_sweep(raw_signals: list, db: LocalDB,
                      pset_id, lbl, pair_cols, ov["win_rate"] * 100, ev_12)
 
     logging.info("")
-    logging.info("Best FVG param set per pair (min 20 resolved trades):")
+    logging.info("Best FVG param set per pair (min 8 resolved trades):")
     gold_map = db.get_gold_params(strategy)
     for sym in all_symbols:
         candidates = [
             (pid, pset) for pid, pset in zip(pset_ids, FVG_PARAM_SWEEP_SETS)
-            if all_pair_stats.get((pid, sym), {}).get("resolved", 0) >= 20
+            if all_pair_stats.get((pid, sym), {}).get("resolved", 0) >= 8
         ]
         if not candidates:
-            logging.info("  %-10s  (no param set with ≥20 trades)", sym)
+            logging.info("  %-10s  (no param set with ≥8 trades)", sym)
             continue
         best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)]["win_rate"])
         s = all_pair_stats[(best_pid, sym)]
@@ -1593,10 +1719,39 @@ def _format_dax_alert(sig: dict) -> str:
     )
 
 
+def dax_data_job(db: "LocalDB") -> None:
+    """Fetch and store DAX 15m + 5m candles from Yahoo Finance.
+
+    Runs every 5 min during full Frankfurt hours (09:00-17:30 IDT / 07:00-15:30 UTC)
+    so post-session data is available for any future invalidation logic.
+    """
+    from datetime import time as _time
+    from data.yahoo_fetcher import fetch_yahoo
+
+    now_il = datetime.now(_ISRAEL_TZ)
+    if now_il.weekday() >= 5:
+        return
+    t = now_il.time()
+    if not (_time(9, 0) <= t <= _time(17, 30)):
+        return
+
+    try:
+        candles_15m = fetch_yahoo("DAX", "15m", days=7)
+        candles_5m  = fetch_yahoo("DAX", "5m",  days=5)
+    except Exception as exc:
+        logging.error("DAX data job: Yahoo fetch failed: %s", exc)
+        return
+
+    if candles_15m:
+        db.insert_candles("DAX", "15m", candles_15m)
+    if candles_5m:
+        db.insert_candles("DAX", "5m", candles_5m)
+    logging.debug("DAX data job: stored %d 15m + %d 5m candles", len(candles_15m or []), len(candles_5m or []))
+
+
 def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertManager") -> None:
     """Check for DAX counter-trend setup; runs every 5 min during Frankfurt session."""
     from datetime import date as _date
-    from data.yahoo_fetcher import fetch_yahoo
     from analysis.smc_analyzer import SMCAnalyzer
 
     now_il  = datetime.now(_ISRAEL_TZ)
@@ -1624,18 +1779,14 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
         return
     gold_params = db.get_param_set_by_id(gold["param_set_id"])
 
-    # Fetch fresh data from Yahoo Finance
-    try:
-        candles_15m = fetch_yahoo("DAX", "15m", days=7)
-        candles_5m  = fetch_yahoo("DAX", "5m",  days=5)
-    except Exception as exc:
-        logging.error("DAX session job: Yahoo fetch failed: %s", exc)
-        return
+    # Read candles from DB (kept fresh by dax_data_job every 5 min)
+    start_ts, end_ts = _dax_session_window(today)
+    candles_15m = db.query_recent("DAX", "15m", limit=200)
+    candles_5m  = db.query_recent("DAX", "5m",  limit=500)
 
     if not candles_15m or not candles_5m:
         return
 
-    start_ts, end_ts = _dax_session_window(today)
     sess_15m = [c for c in candles_15m if start_ts <= c["timestamp"] <= end_ts]
     if len(sess_15m) < 3:
         return
@@ -2041,9 +2192,169 @@ def _fvg_alert_id(symbol: str, timestamp: int) -> str:
     return f"fvg_{dt.minute:02d}-{dt.hour:02d}-{dt.day:02d}-{dt.month:02d}-{dt.year}-{pair}"
 
 
-def _scan_one_symbol_fvg(args: tuple) -> tuple:
-    """Worker: scan 30m candles for FVG doji setups. Returns raw signal records."""
-    symbol, settings, param_set_id, cutoff_ts, scan_run_id = args
+# ── Liquidity Sweep strategy ──────────────────────────────────────────────────
+
+_LIQ_SWEEP_BASE = {
+    "eq_tolerance_atr":       0.20,
+    "swing_lookback":         30,
+    "min_swing_strength":     2,
+    "min_sweep_atr":          0.0,
+    "min_rejection_wick_pct": 0.0,
+    "use_pdh_pdl":            True,
+    "use_eq_pools":           True,
+    "sl_buffer_atr":          0.1,
+    "rr":                     2.0,
+    "scan_days":              365,
+}
+
+_LIQ_LDN  = [7, 8, 9]       # London open kill zone hours (UTC)
+_LIQ_NY   = [13, 14, 15]    # NY open kill zone hours (UTC)
+_LIQ_BOTH = _LIQ_LDN + _LIQ_NY
+
+LIQ_PARAM_SWEEP_SETS = [
+    # ── Tier 0: baseline ──────────────────────────────────────────────────
+    {**_LIQ_SWEEP_BASE},
+    {**_LIQ_SWEEP_BASE, "htf_aligned_only": True},
+    # ── Tier 1: kill zone gate ────────────────────────────────────────────
+    {**_LIQ_SWEEP_BASE, "kill_zone_hours": _LIQ_LDN},
+    {**_LIQ_SWEEP_BASE, "kill_zone_hours": _LIQ_NY},
+    {**_LIQ_SWEEP_BASE, "kill_zone_hours": _LIQ_BOTH},
+    {**_LIQ_SWEEP_BASE, "kill_zone_hours": _LIQ_LDN,  "htf_aligned_only": True},
+    {**_LIQ_SWEEP_BASE, "kill_zone_hours": _LIQ_NY,   "htf_aligned_only": True},
+    {**_LIQ_SWEEP_BASE, "kill_zone_hours": _LIQ_BOTH, "htf_aligned_only": True},
+    # ── Tier 2: touch count (pool quality) ────────────────────────────────
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3},
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3, "htf_aligned_only": True},
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3, "kill_zone_hours": _LIQ_BOTH},
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3, "kill_zone_hours": _LIQ_BOTH, "htf_aligned_only": True},
+    # ── Tier 3: pool freshness ────────────────────────────────────────────
+    {**_LIQ_SWEEP_BASE, "max_pool_age_bars": 20},
+    {**_LIQ_SWEEP_BASE, "max_pool_age_bars": 10},
+    {**_LIQ_SWEEP_BASE, "max_pool_age_bars": 20, "htf_aligned_only": True},
+    {**_LIQ_SWEEP_BASE, "max_pool_age_bars": 20, "kill_zone_hours": _LIQ_BOTH},
+    # ── Tier 4: combined best candidates ─────────────────────────────────
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3, "max_pool_age_bars": 20, "kill_zone_hours": _LIQ_BOTH},
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3, "max_pool_age_bars": 20, "kill_zone_hours": _LIQ_BOTH, "htf_aligned_only": True},
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3, "max_pool_age_bars": 20, "kill_zone_hours": _LIQ_LDN,  "htf_aligned_only": True},
+    {**_LIQ_SWEEP_BASE, "min_pool_touches": 3, "max_pool_age_bars": 20, "kill_zone_hours": _LIQ_NY,   "htf_aligned_only": True},
+]
+
+
+def _liq_pset_label(pset: dict) -> str:
+    parts = []
+    sw = pset.get("min_sweep_atr", 0.0)
+    if sw > 0:
+        parts.append(f"sw{sw}")
+    wk = pset.get("min_rejection_wick_pct", 0.0)
+    if wk > 0:
+        parts.append(f"w{wk}")
+    pt = pset.get("pool_types")
+    if pt:
+        parts.append("+".join(pt))
+    mt = pset.get("min_pool_touches", 0)
+    if mt > 2:
+        parts.append(f"t{mt}")
+    age = pset.get("max_pool_age_bars")
+    if age is not None:
+        parts.append(f"age{age}")
+    kz = pset.get("kill_zone_hours")
+    if kz:
+        if set(kz) == set(_LIQ_LDN):
+            parts.append("ldn")
+        elif set(kz) == set(_LIQ_NY):
+            parts.append("ny")
+        else:
+            parts.append("kz")
+    if pset.get("htf_aligned_only"):
+        parts.append("htf")
+    return "+".join(parts) if parts else "all"
+
+
+def _apply_liq_param_filter(raw_signals: list, params: dict) -> list:
+    min_sweep   = params.get("min_sweep_atr", 0.0)
+    min_wick    = params.get("min_rejection_wick_pct", 0.0)
+    pool_types  = params.get("pool_types")
+    htf_only    = params.get("htf_aligned_only", False)
+    min_touches = params.get("min_pool_touches", 0)
+    max_age     = params.get("max_pool_age_bars")
+    kz_hours    = params.get("kill_zone_hours")
+    result = []
+    for r in raw_signals:
+        if (r.get("fvg_size_atr") or 0) < min_sweep:
+            continue
+        if min_wick > 0 and (r.get("rejection_wick_pct") or 0) < min_wick:
+            continue
+        if pool_types and r.get("pool_type") not in pool_types:
+            continue
+        if min_touches > 2 and (r.get("swing_test_count") or 0) < min_touches:
+            continue
+        if max_age is not None and (r.get("swing_age_candles") or 9999) > max_age:
+            continue
+        if kz_hours is not None and r.get("hour") not in kz_hours:
+            continue
+        if htf_only:
+            htf = (r.get("htf_bias") or "").lower()
+            direction = (r.get("direction") or "").lower()
+            if not htf or htf != direction:
+                continue
+        result.append(r)
+    return result
+
+
+def _run_liq_param_sweep(raw_signals: list, db: LocalDB, strategy: str,
+                         update_gold: bool = False) -> None:
+    logging.info("")
+    logging.info("=== LIQ Param Sweep (%d sets) ===", len(LIQ_PARAM_SWEEP_SETS))
+    logging.info("  %-38s  %5s  %5s  %6s", "Params", "n", "WR%", "EV 1:2")
+    logging.info("  " + "-" * 62)
+
+    pset_ids   = []
+    pset_stats = {}
+
+    for pset in LIQ_PARAM_SWEEP_SETS:
+        pset_id = db.get_or_create_param_set(pset)
+        pset_ids.append(pset_id)
+
+        filtered = _apply_liq_param_filter(raw_signals, pset)
+        trades   = [{"alert_id": r["alert_id"], "outcome": r["outcome"],
+                     "confluences": [], "symbol": r["symbol"],
+                     "hour": r["hour"], "month": r["month"],
+                     "break_strength": r.get("fvg_size_atr", 0),
+                     "r_win": 2.0,
+                     "htf_bias": r.get("htf_bias"),
+                     "bos_direction": r["direction"]}
+                    for r in filtered]
+
+        stats       = _compute_stats(trades)
+        ev_12       = stats.get("expected_value", {}).get("1:2", 0)
+        wr          = stats.get("win_rate", 0)
+        n           = stats.get("resolved", 0)
+        pset_stats[pset_id] = stats
+        label = _liq_pset_label(pset)
+        logging.info("  %-38s  %4d  %4.1f%%  %+.3fR", label, n, wr * 100, ev_12)
+
+    if not pset_ids:
+        return
+
+    best_pid = max(pset_ids,
+                   key=lambda pid: pset_stats[pid].get("expected_value", {}).get("1:2", -999))
+    best_s   = pset_stats[best_pid]
+    best_ev  = best_s.get("expected_value", {}).get("1:2", 0)
+    best_label = _liq_pset_label(LIQ_PARAM_SWEEP_SETS[pset_ids.index(best_pid)])
+    logging.info("")
+    logging.info("Best LIQ params: v%-3d %-38s  WR: %.1f%%  n: %d  EV: %+.3fR",
+                 best_pid, best_label, best_s["win_rate"] * 100, best_s["resolved"], best_ev)
+
+
+def _liq_alert_id(symbol: str, timestamp: int, pool_type: str) -> str:
+    dt   = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    pair = symbol.lower().replace("/", "")
+    return f"liq_{pool_type.lower()}_{dt.minute:02d}-{dt.hour:02d}-{dt.day:02d}-{dt.month:02d}-{dt.year}-{pair}"
+
+
+def _scan_one_symbol_liq(args: tuple) -> tuple:
+    """Worker: scan liquidity sweep setups on given timeframe. Returns raw signal records."""
+    symbol, settings, param_set_id, cutoff_ts, scan_run_id, timeframe, htf = args
 
     from db.local_db import LocalDB
     from analysis.smc_analyzer import SMCAnalyzer
@@ -2052,7 +2363,172 @@ def _scan_one_symbol_fvg(args: tuple) -> tuple:
     db       = LocalDB(settings.db_path)
     analyzer = SMCAnalyzer()
     dev_mode = settings.dev_mode
-    timeframe, htf = "30m", "4h"
+
+    candles_desc = db.query_recent(symbol, timeframe, limit=_candle_limit(timeframe))
+    if not candles_desc:
+        db.close()
+        return symbol, 0, [], [], []
+
+    candles_htf = db.query_recent(symbol, htf, limit=_candle_limit(htf))
+    n = len(candles_desc)
+    seen: set = set()
+    trade_results, log_lines, raw_signal_records = [], [], []
+
+    for k in range(50, n):
+        bos_ts = candles_desc[n - 1 - k]["timestamp"]
+        if bos_ts < cutoff_ts:
+            continue
+
+        idx       = n - 1 - k
+        det_slice = candles_desc[idx : idx + 50]
+        lookahead = candles_desc[max(0, idx - 51) : idx] if dev_mode else None
+
+        liq_events = analyzer.detect_liquidity_sweep(
+            det_slice, params={"symbol": symbol, "timeframe": timeframe}
+        )
+        if not liq_events:
+            continue
+
+        htf_bias        = analyzer.get_htf_bias(candles_htf, bos_ts) if candles_htf else None
+        lookahead_chron = list(reversed(lookahead)) if lookahead else []
+        sig_dt          = datetime.fromtimestamp(bos_ts, tz=timezone.utc)
+
+        for ev in liq_events:
+            key = (ev["direction"], ev["pool_type"], round(ev["pool_level"], 5))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            outcome  = AlertManager.evaluate_liq_outcome(
+                det_slice, ev, lookahead_chron, candles_htf
+            )
+            alert_id = _liq_alert_id(symbol, ev["breakout_ts"], ev["pool_type"])
+
+            raw_signal_records.append({
+                "symbol":              symbol,
+                "timeframe":           timeframe,
+                "breakout_ts":         ev["breakout_ts"],
+                "alert_id":            alert_id,
+                "direction":           ev["direction"],
+                "broken_level":        ev["pool_level"],
+                "break_strength":      ev.get("sweep_size_atr", 0.0),
+                "htf_bias":            htf_bias,
+                "confluences":         json.dumps([]),
+                "outcome":             outcome,
+                "hour":                sig_dt.hour,
+                "month":               sig_dt.strftime("%Y-%m"),
+                "has_liquidity_sweep": 1,
+                "swing_age_candles":   None,
+                "session":             _hour_to_session(sig_dt.hour),
+                "dow":                 sig_dt.weekday(),
+                "fvg_size_atr":        ev.get("sweep_size_atr"),
+                "retrace_depth":       None,
+                "doji_body_pct":       None,
+                "rejection_wick_pct":  ev.get("rejection_wick_pct"),
+                "pool_type":           ev["pool_type"],
+                "swing_test_count":    ev.get("pool_touch_count"),
+                "swing_age_candles":   ev.get("pool_age_bars"),
+                "strategy":            f"LIQ{timeframe}",
+                "scan_run_id":         scan_run_id,
+            })
+            trade_results.append({
+                "alert_id":       alert_id,
+                "outcome":        outcome,
+                "confluences":    [],
+                "r_win":          2.0,
+                "symbol":         symbol,
+                "hour":           sig_dt.hour,
+                "month":          sig_dt.strftime("%Y-%m"),
+                "break_strength": ev.get("sweep_size_atr", 0.0),
+                "htf_bias":       htf_bias,
+                "bos_direction":  ev["direction"],
+            })
+            log_lines.append(
+                f"  [{symbol}] LIQ {ev['direction'].upper()}"
+                f"  {ev['pool_type']}@{ev['pool_level']:.5f}"
+                f"  sweep={ev['sweep_size_atr']:.2f}ATR  wick={ev['rejection_wick_pct']:.0%}"
+                f"  4H={( htf_bias or '?').upper():<8}  ts={sig_dt.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+    db.close()
+    return symbol, len(raw_signal_records), trade_results, log_lines, raw_signal_records
+
+
+def run_liq_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager,
+                       update_gold: bool = False, timeframe: str = "30m") -> None:
+    """Scan liquidity sweep setups on given timeframe; run param sweep."""
+    from datetime import timedelta
+    htf       = "4h"
+    strategy  = f"LIQ{timeframe}"
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
+
+    logging.info("Scanning %s Liquidity Sweep (last 365 days) — HTF bias from %s", timeframe, htf)
+    logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
+
+    param_set_id = db.get_or_create_param_set(_LIQ_SWEEP_BASE)
+    scan_run_id  = int(datetime.now(timezone.utc).timestamp())
+    n_workers    = min(len(settings.fx_pairs), max(1, (os.cpu_count() or 4) // 2))
+    worker_args  = [
+        (symbol, settings, param_set_id, cutoff_ts, scan_run_id, timeframe, htf)
+        for symbol in settings.fx_pairs
+    ]
+    logging.info("Launching %d LIQ workers (%s)...", n_workers, timeframe)
+
+    pair_counts: dict = {}
+    all_trade_results: list = []
+    all_raw_signals:   list = []
+
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_scan_one_symbol_liq, args): args[0] for args in worker_args}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                sym, count, trade_results, log_lines, raw_signal_recs = future.result()
+            except Exception as exc:
+                logging.error("LIQ worker for %s failed: %s", symbol, exc)
+                pair_counts[symbol] = 0
+                continue
+            pair_counts[sym] = count
+            all_trade_results.extend(trade_results)
+            all_raw_signals.extend(raw_signal_recs)
+            for line in log_lines:
+                logging.info(line)
+
+    try:
+        db.insert_raw_signals(scan_run_id, all_raw_signals)
+        logging.info("LIQ raw signals stored: %d (scan_run_id=%d)", len(all_raw_signals), scan_run_id)
+    except Exception as exc:
+        logging.warning("Failed to store LIQ raw signals: %s", exc)
+
+    logging.info("")
+    logging.info("=== %s Liquidity Sweep count (last 365 days) ===", timeframe)
+    for sym, cnt in pair_counts.items():
+        logging.info("  %-10s %d", sym, cnt)
+    logging.info("  %-10s %d", "TOTAL", sum(pair_counts.values()))
+
+    overall = _compute_stats(all_trade_results)
+    ev = overall.get("expected_value", {})
+    logging.info("")
+    logging.info("=== %s LIQ Scan Stats ===", timeframe)
+    logging.info("  Resolved: %d  Wins: %d  Losses: %d  Open: %d",
+                 overall["resolved"], overall["wins"], overall["losses"], overall["open"])
+    logging.info("  Win rate: %.1f%%  |  EV 1:2: %+.3fR", overall["win_rate"] * 100, ev.get("1:2", 0))
+
+    if all_raw_signals:
+        _run_liq_param_sweep(all_raw_signals, db, strategy=strategy, update_gold=update_gold)
+
+
+def _scan_one_symbol_fvg(args: tuple) -> tuple:
+    """Worker: scan FVG doji setups on given timeframe. Returns raw signal records."""
+    symbol, settings, param_set_id, cutoff_ts, scan_run_id, timeframe, htf = args
+
+    from db.local_db import LocalDB
+    from analysis.smc_analyzer import SMCAnalyzer
+    from alerts.alert_manager import AlertManager
+
+    db       = LocalDB(settings.db_path)
+    analyzer = SMCAnalyzer()
+    dev_mode = settings.dev_mode
 
     candles_desc = db.query_recent(symbol, timeframe, limit=_candle_limit(timeframe))
     if not candles_desc:
@@ -2113,10 +2589,11 @@ def _scan_one_symbol_fvg(args: tuple) -> tuple:
                 "swing_age_candles": None,
                 "session":          _hour_to_session(sig_dt.hour),
                 "dow":              sig_dt.weekday(),
-                "fvg_size_atr":     ev.get("fvg_size_atr"),
-                "retrace_depth":    ev.get("retrace_depth"),
-                "doji_body_pct":    ev.get("doji_body_pct"),
-                "strategy":         "FVG30m",
+                "fvg_size_atr":        ev.get("fvg_size_atr"),
+                "retrace_depth":       ev.get("retrace_depth"),
+                "doji_body_pct":       ev.get("doji_body_pct"),
+                "rejection_wick_pct":  ev.get("rejection_wick_pct"),
+                "strategy":            f"FVG{timeframe}",
                 "scan_run_id":      scan_run_id,
             })
             trade_results.append({
@@ -2142,16 +2619,19 @@ def _scan_one_symbol_fvg(args: tuple) -> tuple:
 
 
 def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertManager,
-                       update_gold: bool = False) -> None:
-    """Scan 365 days of 30m candles for FVG doji setups; run param sweep."""
+                       update_gold: bool = False, timeframe: str = "30m") -> None:
+    """Scan FVG doji setups on given timeframe; run param sweep."""
     from datetime import timedelta
-    cutoff_ts  = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
-    timeframe, htf = "30m", "4h"
+    htf       = "4h"
+    strategy  = f"FVG{timeframe}"
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
 
-    logging.info("Scanning 30m FVG doji (last 365 days) — HTF bias from 4h")
+    logging.info("Scanning %s FVG doji (last 365 days) — HTF bias from %s", timeframe, htf)
     logging.info("Cutoff: %s UTC", datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M"))
 
-    base_params = {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.0, "min_retrace_pct": 0.0, "max_doji_body_pct": 1.0}
+    # Loose base: catch all signals; param sweep applies filters on stored values
+    base_params = {**_FVG_SWEEP_BASE, "min_fvg_size_atr": 0.0, "min_retrace_pct": 0.0,
+                   "max_doji_body_pct": 1.0, "min_rejection_wick_pct": 0.0}
     param_set_id = db.get_or_create_param_set(base_params)
 
     try:
@@ -2165,10 +2645,10 @@ def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
     scan_run_id = int(datetime.now(timezone.utc).timestamp())
     n_workers   = min(len(settings.fx_pairs), max(1, (os.cpu_count() or 4) // 2))
     worker_args = [
-        (symbol, settings, param_set_id, cutoff_ts, scan_run_id)
+        (symbol, settings, param_set_id, cutoff_ts, scan_run_id, timeframe, htf)
         for symbol in settings.fx_pairs
     ]
-    logging.info("Launching %d FVG workers...", n_workers)
+    logging.info("Launching %d FVG workers (%s)...", n_workers, timeframe)
 
     pair_counts: dict = {}
     all_trade_results: list = []
@@ -2197,7 +2677,7 @@ def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
         logging.warning("Failed to store FVG raw signals: %s", exc)
 
     logging.info("")
-    logging.info("=== 30m FVG doji count (last 365 days) ===")
+    logging.info("=== %s FVG doji count (last 365 days) ===", timeframe)
     for sym, cnt in pair_counts.items():
         logging.info("  %-10s %d", sym, cnt)
     logging.info("  %-10s %d", "TOTAL", sum(pair_counts.values()))
@@ -2205,13 +2685,13 @@ def run_fvg_experiment(settings: Settings, db: LocalDB, alert_manager: AlertMana
     overall = _compute_stats(all_trade_results)
     ev = overall.get("expected_value", {})
     logging.info("")
-    logging.info("=== FVG Scan Stats ===")
+    logging.info("=== %s FVG Scan Stats ===", timeframe)
     logging.info("  Resolved: %d  Wins: %d  Losses: %d  Open: %d",
                  overall["resolved"], overall["wins"], overall["losses"], overall["open"])
     logging.info("  Win rate: %.1f%%  |  EV 1:2: %+.3fR", overall["win_rate"] * 100, ev.get("1:2", 0))
 
     if all_raw_signals:
-        _run_fvg_param_sweep(all_raw_signals, db, strategy="FVG30m", update_gold=update_gold)
+        _run_fvg_param_sweep(all_raw_signals, db, strategy=strategy, update_gold=update_gold)
 
 
 def run_bos_experiment(
@@ -2483,6 +2963,21 @@ def parse_args() -> argparse.Namespace:
         help="Scan 30m data for FVG + deep retrace + doji rejection setups",
     )
     parser.add_argument(
+        "--experiment-fvg15",
+        action="store_true",
+        help="Same as --experiment-fvg but on 15m timeframe",
+    )
+    parser.add_argument(
+        "--experiment-liq30",
+        action="store_true",
+        help="Scan 30m data for liquidity sweep (EQH/EQL/PDH/PDL) + pin-bar rejection setups",
+    )
+    parser.add_argument(
+        "--experiment-liq15",
+        action="store_true",
+        help="Same as --experiment-liq30 but on 15m timeframe",
+    )
+    parser.add_argument(
         "--experiment-dax",
         action="store_true",
         help="Scan DE40 for DAX Frankfurt open session setups (09:00-12:30 Israel time)",
@@ -2563,7 +3058,22 @@ def main() -> None:
         return
 
     if args.experiment_fvg:
-        run_fvg_experiment(settings, db, alert_manager, update_gold=args.update_gold)
+        run_fvg_experiment(settings, db, alert_manager, update_gold=args.update_gold, timeframe="30m")
+        db.close()
+        return
+
+    if args.experiment_fvg15:
+        run_fvg_experiment(settings, db, alert_manager, update_gold=args.update_gold, timeframe="15m")
+        db.close()
+        return
+
+    if args.experiment_liq30:
+        run_liq_experiment(settings, db, alert_manager, update_gold=args.update_gold, timeframe="30m")
+        db.close()
+        return
+
+    if args.experiment_liq15:
+        run_liq_experiment(settings, db, alert_manager, update_gold=args.update_gold, timeframe="15m")
         db.close()
         return
 
@@ -2599,6 +3109,15 @@ def main() -> None:
         args=[log_monitor],
         max_instances=1,
         id="trade_log_monitor_job",
+    )
+    scheduler.add_job(
+        dax_data_job,
+        trigger="cron",
+        minute="*/5",
+        second=0,
+        args=[db],
+        max_instances=1,
+        id="trade_dax_data_job",
     )
     scheduler.add_job(
         dax_session_job,

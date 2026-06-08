@@ -15,14 +15,18 @@ class LogMonitor:
     def scan(self) -> None:
         lines = self._read_recent_lines()
         issues = []
+        latest_seen = self.last_check
         for line in lines:
             timestamp = self._parse_timestamp(line)
             if not timestamp or timestamp <= self.last_check:
                 continue
+            if timestamp > latest_seen:
+                latest_seen = timestamp
             if "ERROR" in line or "CRITICAL" in line or "[trade] fetch error" in line:
                 issues.append(line.strip())
 
-        self.last_check = datetime.now()  # update after scan, not before (avoids gap)
+        # Advance past any seen timestamps to avoid re-alerting the same lines
+        self.last_check = max(datetime.now(), latest_seen)
 
         if issues:
             alert_text = "[trade] log monitor detected issues:\n" + "\n".join(issues[:10])
@@ -47,7 +51,7 @@ class LogMonitor:
     def _parse_timestamp(self, line: str) -> Optional[datetime]:
         try:
             timestamp_str = line.split(" [", 1)[0]
-            return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
         except Exception:
             return None
 

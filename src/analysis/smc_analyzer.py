@@ -278,26 +278,32 @@ class SMCAnalyzer:
 
     def detect_fvg_doji(self, candles: List[Dict], params: Dict = None) -> List[Dict]:
         """
-        Detect FVG + retrace + doji rejection setup.
+        Detect FVG + retrace + pin-bar doji rejection setup.
 
         Sequence:
-          1. A Fair Value Gap (3-candle gap) formed within the last max_bars_after_fvg candles.
+          1. A Fair Value Gap (3-candle gap) formed by a stacked momentum move:
+             the candle immediately before the gap (c1) AND the one before it (c0)
+             must both be full-bodied in the FVG direction (body >= min_momentum_body_pct * range).
           2. Price retraced >= min_retrace_pct into the FVG zone.
-          3. The current (last) candle is a doji: body <= max_doji_body_pct * range.
-          4. Doji INVALIDATES the FVG: close back inside/through the zone (confirms rejection).
+          3. The current (last) candle is a pin-bar doji:
+             - body <= max_doji_body_pct * range
+             - rejection wick (lower for bullish, upper for bearish) >= min_rejection_wick_pct * range
+          4. Doji closes back inside the zone (confirms rejection):
              Bullish: close >= fvg_low  |  Bearish: close <= fvg_high
 
         Returns at most one signal per call (the strongest match by retrace depth).
         """
         params = params or {}
-        fvg_lookback        = params.get("fvg_lookback", 20)
-        max_bars_after_fvg  = params.get("max_bars_after_fvg", 8)
-        min_fvg_size_atr    = params.get("min_fvg_size_atr", 0.3)
-        min_retrace_pct     = params.get("min_retrace_pct", 0.5)
-        max_doji_body_pct   = params.get("max_doji_body_pct", 0.35)
-        min_atr_pct         = params.get("min_atr_pct", 0.0003)
+        fvg_lookback            = params.get("fvg_lookback", 20)
+        max_bars_after_fvg      = params.get("max_bars_after_fvg", 8)
+        min_fvg_size_atr        = params.get("min_fvg_size_atr", 1.5)
+        min_retrace_pct         = params.get("min_retrace_pct", 0.5)
+        max_doji_body_pct       = params.get("max_doji_body_pct", 0.10)
+        min_rejection_wick_pct  = params.get("min_rejection_wick_pct", 0.40)
+        min_momentum_body_pct   = params.get("min_momentum_body_pct", 0.60)
+        min_atr_pct             = params.get("min_atr_pct", 0.0003)
 
-        if not candles or len(candles) < 5:
+        if not candles or len(candles) < 6:
             return []
 
         c   = self._chronological(candles)
@@ -309,89 +315,285 @@ class SMCAnalyzer:
         body = abs(cur["close"] - cur["open"])
         rng  = cur["high"] - cur["low"]
 
-        # ATR gate: skip dead-market candles
+        # ATR gate
         if rng < min_atr_pct * cur["close"]:
             return []
 
-        # Must be a doji (small body relative to full range)
+        # Pin-bar doji: small body
         if rng == 0 or body / rng > max_doji_body_pct:
             return []
 
-        # Search within fvg_lookback candles (exclude current candle)
+        # Pre-compute rejection wicks
+        lower_wick = min(cur["open"], cur["close"]) - cur["low"]
+        upper_wick = cur["high"] - max(cur["open"], cur["close"])
+
+        # Search within fvg_lookback candles (need c0 before c1, so search starts 1 earlier)
         search_start = max(0, len(c) - 2 - fvg_lookback)
         search = c[search_start : len(c) - 2]
 
         candidates = []
-        for i in range(len(search) - 2):
-            # How many bars elapsed between FVG formation (c3 = search[i+2]) and the doji (c[-1])
-            fvg_c3_abs_idx = search_start + i + 2  # absolute index in c[]
+        for i in range(1, len(search) - 2):   # i >= 1 so c0 = search[i-1] exists
+            fvg_c3_abs_idx = search_start + i + 2
             bars_since_fvg = (len(c) - 1) - fvg_c3_abs_idx
             if bars_since_fvg > max_bars_after_fvg:
-                continue  # FVG too old
+                continue
 
-            c1, c2, c3 = search[i], search[i + 1], search[i + 2]
+            c0, c1, c2, c3 = search[i - 1], search[i], search[i + 1], search[i + 2]
 
-            # --- Bullish FVG: gap above c1.high below c3.low ---
+            def _body_pct(candle):
+                r = candle["high"] - candle["low"]
+                return abs(candle["close"] - candle["open"]) / r if r > 0 else 0.0
+
+            # --- Bullish FVG ---
             if c3["low"] > c1["high"]:
                 fvg_lo, fvg_hi = c1["high"], c3["low"]
                 fvg_size = fvg_hi - fvg_lo
                 if fvg_size < min_fvg_size_atr * atr:
                     continue
+                # Stacked momentum: c0 and c1 both bullish full-body candles
+                if not (c0["close"] > c0["open"] and _body_pct(c0) >= min_momentum_body_pct):
+                    continue
+                if not (c1["close"] > c1["open"] and _body_pct(c1) >= min_momentum_body_pct):
+                    continue
                 retrace_level = fvg_hi - min_retrace_pct * fvg_size
                 if cur["low"] > retrace_level:
-                    continue  # not deep enough into the zone
+                    continue
                 if cur["low"] < fvg_lo - atr * 0.3:
-                    continue  # blew completely through — no longer a valid test
-                # Rejection: doji must close back inside/above the FVG (invalidates the retrace)
+                    continue
                 if cur["close"] < fvg_lo:
+                    continue
+                # Rejection wick must poke down into the FVG (lower wick)
+                if rng > 0 and lower_wick / rng < min_rejection_wick_pct:
                     continue
                 depth = (fvg_hi - cur["low"]) / fvg_size
                 candidates.append({
-                    "symbol":           params.get("symbol"),
-                    "timeframe":        params.get("timeframe"),
-                    "direction":        "bullish",
-                    "fvg_low":          fvg_lo,
-                    "fvg_high":         fvg_hi,
-                    "fvg_ts":           c2["timestamp"],
-                    "breakout_ts":      cur["timestamp"],
-                    "fvg_size_atr":     round(fvg_size / atr, 2),
-                    "retrace_depth":    round(depth, 2),
-                    "doji_body_pct":    round(body / rng, 2),
-                    "bars_since_fvg":   bars_since_fvg,
+                    "symbol":                   params.get("symbol"),
+                    "timeframe":                params.get("timeframe"),
+                    "direction":                "bullish",
+                    "fvg_low":                  fvg_lo,
+                    "fvg_high":                 fvg_hi,
+                    "fvg_ts":                   c2["timestamp"],
+                    "breakout_ts":              cur["timestamp"],
+                    "fvg_size_atr":             round(fvg_size / atr, 2),
+                    "retrace_depth":            round(depth, 2),
+                    "doji_body_pct":            round(body / rng, 2),
+                    "rejection_wick_pct":       round(lower_wick / rng, 2),
+                    "bars_since_fvg":           bars_since_fvg,
                 })
 
-            # --- Bearish FVG: gap below c1.low above c3.high ---
+            # --- Bearish FVG ---
             if c1["low"] > c3["high"]:
                 fvg_hi, fvg_lo = c1["low"], c3["high"]
                 fvg_size = fvg_hi - fvg_lo
                 if fvg_size < min_fvg_size_atr * atr:
+                    continue
+                # Stacked momentum: c0 and c1 both bearish full-body candles
+                if not (c0["close"] < c0["open"] and _body_pct(c0) >= min_momentum_body_pct):
+                    continue
+                if not (c1["close"] < c1["open"] and _body_pct(c1) >= min_momentum_body_pct):
                     continue
                 retrace_level = fvg_lo + min_retrace_pct * fvg_size
                 if cur["high"] < retrace_level:
                     continue
                 if cur["high"] > fvg_hi + atr * 0.3:
                     continue
-                # Rejection: doji must close back inside/below the FVG (invalidates the retrace)
                 if cur["close"] > fvg_hi:
+                    continue
+                # Rejection wick must poke up into the FVG (upper wick)
+                if rng > 0 and upper_wick / rng < min_rejection_wick_pct:
                     continue
                 depth = (cur["high"] - fvg_lo) / fvg_size
                 candidates.append({
-                    "symbol":           params.get("symbol"),
-                    "timeframe":        params.get("timeframe"),
-                    "direction":        "bearish",
-                    "fvg_low":          fvg_lo,
-                    "fvg_high":         fvg_hi,
-                    "fvg_ts":           c2["timestamp"],
-                    "breakout_ts":      cur["timestamp"],
-                    "fvg_size_atr":     round(fvg_size / atr, 2),
-                    "retrace_depth":    round(depth, 2),
-                    "doji_body_pct":    round(body / rng, 2),
-                    "bars_since_fvg":   bars_since_fvg,
+                    "symbol":                   params.get("symbol"),
+                    "timeframe":                params.get("timeframe"),
+                    "direction":                "bearish",
+                    "fvg_low":                  fvg_lo,
+                    "fvg_high":                 fvg_hi,
+                    "fvg_ts":                   c2["timestamp"],
+                    "breakout_ts":              cur["timestamp"],
+                    "fvg_size_atr":             round(fvg_size / atr, 2),
+                    "retrace_depth":            round(depth, 2),
+                    "doji_body_pct":            round(body / rng, 2),
+                    "rejection_wick_pct":       round(upper_wick / rng, 2),
+                    "bars_since_fvg":           bars_since_fvg,
                 })
 
         if not candidates:
             return []
         return [max(candidates, key=lambda x: x["retrace_depth"])]
+
+    def detect_liquidity_sweep(self, candles: List[Dict], params: Dict = None) -> List[Dict]:
+        """
+        Detect liquidity sweep + pin-bar rejection setup.
+
+        Pool sources:
+          EQH/EQL — equal highs/lows (2+ swing pivots within eq_tolerance_atr of each other)
+          PDH/PDL — previous-day high/low (UTC boundary)
+
+        A sweep: wick exceeds pool by >= min_sweep_atr * ATR, candle closes back inside.
+        Rejection: sweeping candle opposing wick >= min_rejection_wick_pct * range.
+
+        Stored metadata per signal (for post-scan filtering):
+          pool_touch_count — number of swing points that formed the pool (EQH/EQL only)
+          pool_age_bars    — candles since the most recent pool touch
+        """
+        from datetime import datetime as _dt, timezone as _tz
+
+        params = params or {}
+        eq_tolerance_atr       = params.get("eq_tolerance_atr", 0.20)
+        swing_lookback         = params.get("swing_lookback", 30)
+        min_swing_strength     = params.get("min_swing_strength", 2)
+        min_sweep_atr          = params.get("min_sweep_atr", 0.0)
+        min_rejection_wick_pct = params.get("min_rejection_wick_pct", 0.0)
+        use_pdh_pdl            = params.get("use_pdh_pdl", True)
+        use_eq_pools           = params.get("use_eq_pools", True)
+
+        if len(candles) < 30:
+            return []
+
+        c   = candles   # desc (newest first)
+        cur = c[0]      # the potential sweep candle
+
+        # Kill zone gate — fast exit if sweep candle is outside all kill zones
+        kill_zones = params.get("kill_zones_utc")   # None = all hours; or [(7,10),(13,16)]
+        if kill_zones is not None:
+            cur_hour = _dt.fromtimestamp(cur["timestamp"], tz=_tz.utc).hour
+            if not any(start <= cur_hour < end for start, end in kill_zones):
+                return []
+
+        atr = self.calculate_atr(candles)
+        if not atr:
+            return []
+
+        rng = cur["high"] - cur["low"]
+        if rng == 0:
+            return []
+
+        lower_wick = min(cur["open"], cur["close"]) - cur["low"]
+        upper_wick = cur["high"] - max(cur["open"], cur["close"])
+
+        # chronological lookback (excludes current candle)
+        chron_lb = list(reversed(c[1: swing_lookback + 1]))
+
+        pools = []  # (level, pool_type, touch_count, age_bars)
+
+        # --- EQH / EQL -------------------------------------------------------
+        if use_eq_pools and len(chron_lb) >= 5:
+            tol = eq_tolerance_atr * atr
+            n   = len(chron_lb)
+
+            # collect (level, chron_lb index) for swing pivots
+            sh_with_idx = []
+            for i in range(min_swing_strength, n - min_swing_strength):
+                h = chron_lb[i]["high"]
+                if (all(chron_lb[j]["high"] <= h for j in range(i - min_swing_strength, i)) and
+                        all(chron_lb[j]["high"] <= h for j in range(i + 1, i + min_swing_strength + 1))):
+                    sh_with_idx.append((h, i))
+
+            sl_with_idx = []
+            for i in range(min_swing_strength, n - min_swing_strength):
+                l = chron_lb[i]["low"]
+                if (all(chron_lb[j]["low"] >= l for j in range(i - min_swing_strength, i)) and
+                        all(chron_lb[j]["low"] >= l for j in range(i + 1, i + min_swing_strength + 1))):
+                    sl_with_idx.append((l, i))
+
+            def _cluster(items):
+                # items = [(level, chron_idx), ...]
+                # returns [(avg_level, touch_count, age_bars), ...]
+                # age_bars = bars since most recent touch (0 = just before current candle)
+                used   = [False] * len(items)
+                groups = []
+                for i in range(len(items)):
+                    if used[i]:
+                        continue
+                    lvl_i, idx_i = items[i]
+                    grp = [(lvl_i, idx_i)]
+                    for j in range(i + 1, len(items)):
+                        if not used[j] and abs(items[j][0] - lvl_i) <= tol:
+                            grp.append(items[j])
+                            used[j] = True
+                    if len(grp) >= 2:
+                        avg_lvl        = sum(l for l, _ in grp) / len(grp)
+                        most_recent    = max(idx for _, idx in grp)  # highest idx = most recent
+                        age_bars       = (n - 1) - most_recent       # bars before current candle
+                        groups.append((avg_lvl, len(grp), age_bars))
+                return groups
+
+            for lvl, touches, age in _cluster(sh_with_idx):
+                pools.append((lvl, "EQH", touches, age))
+            for lvl, touches, age in _cluster(sl_with_idx):
+                pools.append((lvl, "EQL", touches, age))
+
+        # --- PDH / PDL -------------------------------------------------------
+        if use_pdh_pdl and chron_lb:
+            cur_date = _dt.fromtimestamp(cur["timestamp"], tz=_tz.utc).date()
+            prev_day = [
+                (i, c2) for i, c2 in enumerate(chron_lb)
+                if _dt.fromtimestamp(c2["timestamp"], tz=_tz.utc).date() < cur_date
+            ]
+            if prev_day:
+                n = len(chron_lb)
+                pdh_idx, pdh_c = max(prev_day, key=lambda x: x[1]["high"])
+                pdl_idx, pdl_c = min(prev_day, key=lambda x: x[1]["low"])
+                pools.append((pdh_c["high"], "PDH", 1, (n - 1) - pdh_idx))
+                pools.append((pdl_c["low"],  "PDL", 1, (n - 1) - pdl_idx))
+
+        if not pools:
+            return []
+
+        # --- Evaluate each pool for a sweep ----------------------------------
+        events     = []
+        seen_types = set()
+
+        for pool_level, pool_type, touch_count, age_bars in pools:
+            if pool_type in seen_types:
+                continue
+
+            bullish = pool_type in ("EQL", "PDL")
+
+            if bullish:
+                sweep_size = (pool_level - cur["low"]) / atr
+                if sweep_size < min_sweep_atr:
+                    continue
+                if cur["close"] <= pool_level:
+                    continue
+                if rng > 0 and lower_wick / rng < min_rejection_wick_pct:
+                    continue
+                events.append({
+                    "direction":          "bullish",
+                    "pool_type":          pool_type,
+                    "pool_level":         pool_level,
+                    "sweep_size_atr":     round(sweep_size, 2),
+                    "rejection_wick_pct": round(lower_wick / rng, 2),
+                    "pool_touch_count":   touch_count,
+                    "pool_age_bars":      age_bars,
+                    "breakout_ts":        cur["timestamp"],
+                    "symbol":             params.get("symbol"),
+                    "timeframe":          params.get("timeframe"),
+                })
+            else:
+                sweep_size = (cur["high"] - pool_level) / atr
+                if sweep_size < min_sweep_atr:
+                    continue
+                if cur["close"] >= pool_level:
+                    continue
+                if rng > 0 and upper_wick / rng < min_rejection_wick_pct:
+                    continue
+                events.append({
+                    "direction":          "bearish",
+                    "pool_type":          pool_type,
+                    "pool_level":         pool_level,
+                    "sweep_size_atr":     round(sweep_size, 2),
+                    "rejection_wick_pct": round(upper_wick / rng, 2),
+                    "pool_touch_count":   touch_count,
+                    "pool_age_bars":      age_bars,
+                    "breakout_ts":        cur["timestamp"],
+                    "symbol":             params.get("symbol"),
+                    "timeframe":          params.get("timeframe"),
+                })
+            seen_types.add(pool_type)
+
+        return events
 
     def detect_dax_session_setup(
         self,

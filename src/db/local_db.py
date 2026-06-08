@@ -164,11 +164,25 @@ class LocalDB:
             "ALTER TABLE raw_signals ADD COLUMN outcome_break_candle TEXT",
             "ALTER TABLE raw_signals ADD COLUMN eff_r_broken_level REAL",
             "ALTER TABLE raw_signals ADD COLUMN eff_r_break_candle REAL",
+            "ALTER TABLE raw_signals ADD COLUMN rejection_wick_pct REAL",
+            "ALTER TABLE raw_signals ADD COLUMN pool_type TEXT",
         ]:
             try:
                 conn.execute(col_sql)
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # Partial unique index on smc_alerts.alert_id (non-NULL values only).
+        # Deduplicate first so the index creation succeeds on existing DBs.
+        conn.execute(
+            "DELETE FROM smc_alerts WHERE id NOT IN ("
+            "  SELECT MIN(id) FROM smc_alerts"
+            "  WHERE alert_id IS NOT NULL GROUP BY alert_id"
+            ") AND alert_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS smc_alerts_alert_id_uniq"
+            " ON smc_alerts (alert_id) WHERE alert_id IS NOT NULL"
+        )
         conn.commit()
         if is_local:
             conn.close()
@@ -344,9 +358,9 @@ class LocalDB:
              fvg_size_atr, retrace_depth, doji_body_pct,
              swing_test_count, break_body_pct,
              outcome_broken_level, outcome_break_candle,
-             eff_r_broken_level, eff_r_break_candle)
+             eff_r_broken_level, eff_r_break_candle, rejection_wick_pct, pool_type)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?)
         """
         rows = [
             (scan_run_id, r["symbol"], r["timeframe"], r["breakout_ts"], r["alert_id"],
@@ -357,7 +371,8 @@ class LocalDB:
              r.get("fvg_size_atr"), r.get("retrace_depth"), r.get("doji_body_pct"),
              r.get("swing_test_count"), r.get("break_body_pct"),
              r.get("outcome_broken_level"), r.get("outcome_break_candle"),
-             r.get("eff_r_broken_level"), r.get("eff_r_break_candle"))
+             r.get("eff_r_broken_level"), r.get("eff_r_break_candle"),
+             r.get("rejection_wick_pct"), r.get("pool_type"))
             for r in signals
         ]
         with self._lock:
@@ -371,9 +386,11 @@ class LocalDB:
                 "direction", "broken_level", "break_strength", "htf_bias", "confluences",
                 "outcome", "hour", "month", "has_liquidity_sweep",
                 "swing_age_candles", "session", "dow", "strategy",
+                "fvg_size_atr", "retrace_depth", "doji_body_pct",
                 "swing_test_count", "break_body_pct",
                 "outcome_broken_level", "outcome_break_candle",
-                "eff_r_broken_level", "eff_r_break_candle"]
+                "eff_r_broken_level", "eff_r_break_candle", "rejection_wick_pct",
+                "pool_type"]
         with self._lock:
             conn = self._get_conn()
             if strategy:

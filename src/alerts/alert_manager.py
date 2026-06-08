@@ -712,6 +712,45 @@ class AlertManager:
                     if bar["low"]  <= tp: outcome = "HTF WIN";  break
         return outcome
 
+    @staticmethod
+    def evaluate_liq_outcome(
+        candles: List[Dict],
+        ev: Dict,
+        lookahead_chron: List[Dict],
+        candles_htf: Optional[List[Dict]] = None,
+        sl_buffer_atr: float = 0.1,
+        rr: float = 2.0,
+    ) -> str:
+        """Compute WIN/LOSS/HTF WIN/HTF LOSS/OPEN for a liquidity sweep signal."""
+        from analysis.smc_analyzer import SMCAnalyzer as _SA
+        direction = ev.get("direction", "bullish")
+        bullish   = direction == "bullish"
+        atr       = _SA.calculate_atr(candles) or 1e-6
+        entry     = candles[0]["close"]
+        sl        = (candles[0]["low"]  - sl_buffer_atr * atr) if bullish \
+                    else (candles[0]["high"] + sl_buffer_atr * atr)
+        risk      = abs(entry - sl) or atr * 0.5
+        tp        = (entry + rr * risk) if bullish else (entry - rr * risk)
+        outcome   = "OPEN"
+        for bar in lookahead_chron:
+            if bullish:
+                if bar["low"]  <= sl: outcome = "LOSS"; break
+                if bar["high"] >= tp: outcome = "WIN";  break
+            else:
+                if bar["high"] >= sl: outcome = "LOSS"; break
+                if bar["low"]  <= tp: outcome = "WIN";  break
+        if outcome == "OPEN" and candles_htf:
+            sig_ts = ev.get("breakout_ts", 0)
+            future = [b for b in reversed(candles_htf) if b["timestamp"] > sig_ts]
+            for bar in future:
+                if bullish:
+                    if bar["low"]  <= sl: outcome = "HTF LOSS"; break
+                    if bar["high"] >= tp: outcome = "HTF WIN";  break
+                else:
+                    if bar["high"] >= sl: outcome = "HTF LOSS"; break
+                    if bar["low"]  <= tp: outcome = "HTF WIN";  break
+        return outcome
+
     def render_fvg_alert(
         self,
         symbol: str,
