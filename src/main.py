@@ -44,14 +44,15 @@ TIMEFRAME_INTERVAL_MINUTES = {
 
 def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
     """
-    Fetch schedule — only 15m and 4h are needed for production BOS alerts.
+    Fetch schedule — 15m, 30m (NY window), and 4h for production alerts.
     Covers all FX trading hours (Mon 00:00 – Fri 22:00 UTC); skips Sat/Sun.
     Budget is enforced separately in fetch_job via the API daily counter.
 
     Daily estimate on a full weekday (7 pairs):
-      15m: 4/hr × 24h × 7 = 672 calls
-      4h:  6/day  × 7  = 42 calls
-      Total ≈ 714/day  (under 800 free-tier limit)
+      15m: 4/hr × 24h × 7          = 672 calls
+      4h:  6/day × 7               =  42 calls
+      30m: 2/hr × 4h (12-16 UTC) × 7 =  56 calls
+      Total ≈ 770/day  (under 800 free-tier limit)
     """
     timeframe = timeframe.lower()
     minute  = now.minute
@@ -64,8 +65,10 @@ def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
         return minute % 15 == 4
     if timeframe in {"4h", "h4"}:  # once per 4-hour bar close
         return minute == 0 and now.hour % 4 == 0
+    if timeframe in {"30m", "30min"}:  # NY session window for LIQ sweep alerts
+        return 12 <= now.hour <= 15 and minute % 30 == 4
 
-    return False  # 5m, 30m, 1h not used in production
+    return False  # 5m, 1h not used in production
 
 
 def get_timeframes_to_fetch(timeframes: List[str], now: datetime) -> List[str]:
@@ -1732,7 +1735,8 @@ def dax_data_job(db: "LocalDB") -> None:
     if now_il.weekday() >= 5:
         return
     t = now_il.time()
-    if not (_time(9, 0) <= t <= _time(17, 30)):
+    # Frankfurt closes 17:30 CEST = 18:30 IDT; fetch until 18:45 to capture the close bar
+    if not (_time(9, 0) <= t <= _time(18, 45)):
         return
 
     try:
