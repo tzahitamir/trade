@@ -665,9 +665,10 @@ class AlertManager:
         # Trade info panel — top-left, multi-line; includes HTF bias (removes top-right badge)
         r_ratio = round(abs(tp - entry) / risk, 1) if risk else 2.0
         bias_str = htf_bias.upper() if htf_bias and htf_bias != "neutral" else "—"
+        action = "BUY" if bullish else "SELL"
         info_lines = [
             f"{'Alert:':<7} {bos_dt_str}",
-            f"{'Dir:':<7} {direction.upper()}  │  4H: {bias_str}",
+            f"{'Dir:':<7} {direction.upper()} ({action})  │  4H: {bias_str}",
             f"{'Entry:':<7} {entry:.5f}",
             f"{'SL:':<7} {sl:.5f}",
             f"{'TP:':<7} {tp:.5f}",
@@ -690,7 +691,7 @@ class AlertManager:
         sym  = ev.get("symbol", "?")
         tf   = ev.get("timeframe", "15m")
         ax.set_title(
-            f"{sym} {tf} │ BOS {direction.upper()}{mode_tag} │ {bos_dt_str}",
+            f"{sym} {tf} │ BOS {direction.upper()} ({action}){mode_tag} │ {bos_dt_str}",
             fontsize=11, fontweight="bold", pad=8,
         )
         ax.tick_params(labelsize=8)

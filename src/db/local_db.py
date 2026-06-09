@@ -134,7 +134,8 @@ class LocalDB:
                 status TEXT NOT NULL DEFAULT 'open',
                 created_at INTEGER NOT NULL,
                 notified_stall INTEGER NOT NULL DEFAULT 0,
-                notified_close INTEGER NOT NULL DEFAULT 0
+                notified_close INTEGER NOT NULL DEFAULT 0,
+                notified_reversal INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -166,6 +167,7 @@ class LocalDB:
             "ALTER TABLE raw_signals ADD COLUMN eff_r_break_candle REAL",
             "ALTER TABLE raw_signals ADD COLUMN rejection_wick_pct REAL",
             "ALTER TABLE raw_signals ADD COLUMN pool_type TEXT",
+            "ALTER TABLE trade_monitors ADD COLUMN notified_reversal INTEGER NOT NULL DEFAULT 0",
         ]:
             try:
                 conn.execute(col_sql)
@@ -475,10 +477,10 @@ class LocalDB:
             conn = self._get_conn()
             rows = conn.execute(
                 "SELECT id, alert_id, symbol, direction, entry, sl, tp, breakout_ts, "
-                "notified_stall, notified_close FROM trade_monitors WHERE status='open'"
+                "notified_stall, notified_close, notified_reversal FROM trade_monitors WHERE status='open'"
             ).fetchall()
         keys = ["id", "alert_id", "symbol", "direction", "entry", "sl", "tp",
-                "breakout_ts", "notified_stall", "notified_close"]
+                "breakout_ts", "notified_stall", "notified_close", "notified_reversal"]
         return [dict(zip(keys, r)) for r in rows]
 
     def update_monitor(self, alert_id: str, **kwargs) -> None:

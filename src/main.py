@@ -507,6 +507,20 @@ def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
                 )
                 db.update_monitor(m["alert_id"], notified_stall=1)
 
+        # reversal check: price has closed back past entry — trade invalidated
+        if not m.get("notified_reversal"):
+            last_close = candles[-1]["close"]
+            reversed_past_entry = (last_close < entry) if bullish else (last_close > entry)
+            if reversed_past_entry:
+                action = "BUY" if bullish else "SELL"
+                _dlog.info("[MONITOR] REVERSAL | %s %s | entry=%.5f last_close=%.5f | id=%s",
+                           symbol, direction, entry, last_close, m["alert_id"])
+                alert_manager.send_alert(
+                    f"🚨 Early failure: {symbol} {action} reversed past entry "
+                    f"({last_close:.5f} vs entry {entry:.5f}) — consider closing | {m['alert_id']}"
+                )
+                db.update_monitor(m["alert_id"], notified_reversal=1)
+
     _dlog.info("[MONITOR] END | closed=%d remaining=%d", closed, len(monitors) - closed)
 
 
