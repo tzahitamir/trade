@@ -132,17 +132,21 @@ for symbol in PAIRS:
                   f"entry={entry:.5f} sl={sl:.5f} tp={tp:.5f} | "
                   f"outcome={outcome:10s} eff_r={eff_r}")
 
-            # Rename the chart file evaluate_production already created, embedding outcome
+            # Remove the "open" placeholder chart from evaluate_production,
+            # then re-render with the actual outcome baked in.
             existing_chart = alert.get("image_path")
             if existing_chart and Path(existing_chart).exists():
-                outcome_tag = outcome.replace(" ", "_").upper()
-                stem = Path(existing_chart).stem
-                new_name = f"{stem}-{outcome_tag}.png"
-                new_path = prod_dir / new_name
-                Path(existing_chart).rename(new_path)
-                chart_saved = str(new_path)
-            else:
-                chart_saved = None
+                Path(existing_chart).unlink()
+
+            chart_path, _ = am._render_bos_chart(
+                context, ev, alert_id,
+                lookahead_candles=None,
+                htf_bias=htf_bias,
+                confluences=alert.get("confluences"),
+                output_dir=prod_dir,
+                outcome_override=outcome,
+            )
+            chart_saved = chart_path
 
             results.append({
                 "symbol":    symbol,

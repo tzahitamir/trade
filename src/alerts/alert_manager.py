@@ -430,6 +430,7 @@ class AlertManager:
         candles_4h: Optional[List[Dict]] = None,
         gold_wr: Optional[float] = None,
         output_dir=None,
+        outcome_override: Optional[str] = None,
     ) -> tuple:
         """
         Render BOS candlestick chart and save to data/charts/{alert_id}.png.
@@ -449,14 +450,19 @@ class AlertManager:
         if lookahead_candles and self.dev_mode:
             c_ahead = list(reversed(lookahead_candles))   # oldest → newest
 
-        fig, ax = plt.subplots(figsize=(10, 4))
+        fig, ax = plt.subplots(figsize=(16, 7))
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("#fafafa")
+
         self._draw_candles(ax, c, x_offset=0, alpha=1.0)
         if c_ahead:
             self._draw_candles(ax, c_ahead, x_offset=len(c), alpha=0.45)
 
-        # scale axes manually (add_patch doesn't auto-scale)
+        # Extra x-space on the right so level labels never get clipped
         all_bars = c + c_ahead
-        ax.set_xlim(-1, len(all_bars))
+        LABEL_PAD = 12
+        ax.set_xlim(-1, len(all_bars) + LABEL_PAD)
+
         all_lows  = [b["low"]  for b in all_bars]
         all_highs = [b["high"] for b in all_bars]
         pad = (max(all_highs) - min(all_lows)) * 0.08
@@ -549,28 +555,38 @@ class AlertManager:
         risk = abs(entry - sl) or _atr
         tp = (entry + risk * 2) if bullish else (entry - risk * 2)
 
-        # Extend ylim to include SL and TP
-        new_lo = min(ax.get_ylim()[0], sl - _atr * 0.5)
-        new_hi = max(ax.get_ylim()[1], tp + _atr * 0.5)
+        # Extend ylim to include SL and TP with comfortable padding
+        new_lo = min(ax.get_ylim()[0], sl - _atr * 0.8)
+        new_hi = max(ax.get_ylim()[1], tp + _atr * 0.8)
         ax.set_ylim(new_lo, new_hi)
 
-        # Swing level (structural SL zone)
-        ax.hlines(sl_anchor, trigger_x_chart, len(all_bars) - 1,
+        line_end = len(all_bars) + LABEL_PAD - 1   # lines extend into label area
+        label_x  = len(all_bars) + 0.8             # text starts just after last bar
+
+        def _level_label(y, text, price, color, ls, lw=1.5):
+            ax.hlines(y, trigger_x_chart, line_end,
+                      colors=color, linestyles=ls, linewidth=lw, zorder=3)
+            ax.text(label_x, y, f" {text}\n {price:.5f}",
+                    fontsize=9, color=color, va="center", fontweight="bold",
+                    clip_on=False,
+                    bbox=dict(boxstyle="round,pad=0.35", facecolor="white",
+                              alpha=1.0, edgecolor=color, linewidth=1.4))
+
+        # Swing level (structural SL zone) — subtle dotted purple
+        ax.hlines(sl_anchor, trigger_x_chart, line_end,
                   colors="mediumpurple", linestyles=":", linewidth=1.0, zorder=3)
 
-        # SL and TP lines from trigger point onward
-        ax.hlines(sl, trigger_x_chart, len(all_bars) - 1,
-                  colors="red", linestyles="--", linewidth=1.2, zorder=3)
-        ax.hlines(tp, trigger_x_chart, len(all_bars) - 1,
-                  colors="limegreen", linestyles="--", linewidth=1.2, zorder=3)
-        ax.text(len(all_bars) - 0.3, sl, " SL", fontsize=7, color="red",
-                va="center", fontweight="bold")
-        ax.text(len(all_bars) - 0.3, tp, " TP", fontsize=7, color="limegreen",
-                va="center", fontweight="bold")
+        # Entry line — solid blue
+        _level_label(entry, "ENTRY", entry, "dodgerblue", "-")
+        # SL line — dashed red
+        _level_label(sl, "SL", sl, "#d32f2f", "--")
+        # TP line — dashed green
+        _level_label(tp, "TP", tp, "#1b8a4e", "--")
 
         # Check outcome: did price hit TP or SL first in the 15m lookahead?
-        outcome = "OPEN"
-        if c_ahead:
+        # outcome_override lets callers (e.g. retroactive scans) inject the known result.
+        outcome = outcome_override if outcome_override else "OPEN"
+        if not outcome_override and c_ahead:
             past_trigger = False
             for _b in c_ahead:
                 if not past_trigger:
@@ -589,7 +605,7 @@ class AlertManager:
                         outcome = "WIN"; break
 
         # If still OPEN, check 4h candles beyond the BOS to resolve HTF outcome
-        if outcome == "OPEN" and candles_4h:
+        if not outcome_override and outcome == "OPEN" and candles_4h:
             bos_ts = ev.get("breakout_ts", 0)
             future_4h = [_b for _b in reversed(candles_4h) if _b["timestamp"] > bos_ts]
             for _b in future_4h:
@@ -605,77 +621,86 @@ class AlertManager:
                         outcome = "HTF WIN"; break
 
         if outcome in ("WIN", "HTF WIN"):
-            outcome_color = "#26a69a"
+            outcome_color = "#1b8a4e"
         elif outcome in ("LOSS", "HTF LOSS"):
-            outcome_color = "#ef5350"
+            outcome_color = "#d32f2f"
         else:
-            outcome_color = "gray"
+            outcome_color = "#555555"
+
+        # Outcome badge — bottom-right, large and clear
         ax.text(
-            0.98, 0.03, outcome,
-            transform=ax.transAxes, fontsize=11, fontweight="bold",
-            color=outcome_color, ha="right", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9, edgecolor=outcome_color),
+            0.99, 0.04, outcome,
+            transform=ax.transAxes, fontsize=14, fontweight="bold",
+            color="white", ha="right", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor=outcome_color,
+                      alpha=1.0, edgecolor=outcome_color),
         )
 
-        # legend patches
+        # Legend — lower-left (away from info panel which occupies top-left)
         legend_items = [
-            mpatches.Patch(color="#26a69a", label="bullish candle"),
-            mpatches.Patch(color="#ef5350", label="bearish candle"),
+            mpatches.Patch(color="#26a69a", label="Bullish"),
+            mpatches.Patch(color="#ef5350", label="Bearish"),
         ]
         if c_ahead:
-            legend_items.append(mpatches.Patch(color="gray", alpha=0.45, label="next 50 candles"))
-        ax.legend(handles=legend_items, fontsize=7, loc="upper left")
+            legend_items.append(mpatches.Patch(color="gray", alpha=0.45, label="Future"))
+        ax.legend(handles=legend_items, fontsize=8, loc="lower left",
+                  framealpha=1.0, edgecolor="#aaaaaa")
 
-        # HTF bias label — top-right corner
-        if htf_bias and htf_bias != "neutral":
-            tf = ev.get("timeframe", "15m").upper()
-            bias_color = "#26a69a" if htf_bias == "bullish" else "#ef5350"
-            bias_text = f"{tf} {direction.upper()}  |  4H {htf_bias.upper()}"
-            ax.text(
-                0.98, 0.97, bias_text,
-                transform=ax.transAxes, fontsize=9, fontweight="bold",
-                color=bias_color, ha="right", va="top",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, edgecolor=bias_color),
-            )
-
-        # confluence labels + descriptions — bottom left
+        # Confluence labels — bottom-left, only if present
         if confluences:
             ax.text(
-                0.02, 0.03, confluence_description_text(confluences),
-                transform=ax.transAxes, fontsize=7,
-                color="#26a69a", ha="left", va="bottom",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="#26a69a"),
+                0.01, 0.04, confluence_description_text(confluences),
+                transform=ax.transAxes, fontsize=8,
+                color="#1b6e4e", ha="left", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                          alpha=1.0, edgecolor="#1b8a4e", linewidth=1.2),
             )
 
-        # Trade info box — entry / SL / TP / R / gold WR
+        # Alert time stamp on the BOS candle — vertical line only (time is in info panel)
+        bos_ts = ev.get("breakout_ts", 0)
+        bos_dt_str = (datetime.fromtimestamp(bos_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                      if bos_ts else "?")
+        ax.axvline(x=bos_x, color="darkorange", linestyle=":", linewidth=1.2, alpha=0.7, zorder=2)
+
+        # Trade info panel — top-left, multi-line; includes HTF bias (removes top-right badge)
         r_ratio = round(abs(tp - entry) / risk, 1) if risk else 2.0
-        info_parts = [
-            f"Entry: {entry:.5f}",
-            f"SL: {sl:.5f}",
-            f"TP: {tp:.5f}",
-            f"R: 1:{r_ratio}",
+        bias_str = htf_bias.upper() if htf_bias and htf_bias != "neutral" else "—"
+        info_lines = [
+            f"{'Alert:':<7} {bos_dt_str}",
+            f"{'Dir:':<7} {direction.upper()}  │  4H: {bias_str}",
+            f"{'Entry:':<7} {entry:.5f}",
+            f"{'SL:':<7} {sl:.5f}",
+            f"{'TP:':<7} {tp:.5f}",
+            f"{'R:':<7} 1:{r_ratio}",
         ]
         if gold_wr is not None:
-            info_parts.append(f"Gold WR: {gold_wr*100:.1f}%")
+            info_lines.append(f"{'WR:':<7} {gold_wr*100:.1f}%")
         ax.text(
-            0.02, 0.97, "  ".join(info_parts),
-            transform=ax.transAxes, fontsize=7,
-            color="black", ha="left", va="top",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9, edgecolor="gray"),
+            0.01, 0.97, "\n".join(info_lines),
+            transform=ax.transAxes, fontsize=9.5,
+            color="#111111", ha="left", va="top",
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="white",
+                      alpha=1.0, edgecolor="#555555", linewidth=1.5),
+            zorder=6,
         )
 
+        # Title — symbol, timeframe, direction, alert ID
         mode_tag = " [DEV]" if self.dev_mode and c_ahead else ""
+        sym  = ev.get("symbol", "?")
+        tf   = ev.get("timeframe", "15m")
         ax.set_title(
-            f"{ev.get('symbol')} {ev.get('timeframe')} BOS {direction.upper()}{mode_tag}  |  {alert_id}",
-            fontsize=9,
+            f"{sym} {tf} │ BOS {direction.upper()}{mode_tag} │ {bos_dt_str}",
+            fontsize=11, fontweight="bold", pad=8,
         )
-        ax.tick_params(labelsize=7)
+        ax.tick_params(labelsize=8)
+        ax.grid(axis="y", color="#dddddd", linewidth=0.5, linestyle="-", zorder=0)
 
         outcome_tag = outcome.lower().replace(" ", "_")
         dest_dir = output_dir if output_dir is not None else self.charts_dir
         chart_path = dest_dir / f"{alert_id}-{outcome_tag}.png"
-        fig.tight_layout()
-        fig.savefig(str(chart_path), dpi=100)
+        fig.subplots_adjust(left=0.05, right=0.88, top=0.91, bottom=0.07)
+        fig.savefig(str(chart_path), dpi=150, bbox_inches="tight")
         plt.close(fig)
         return str(chart_path), outcome
 
