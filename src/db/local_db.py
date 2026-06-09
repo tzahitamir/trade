@@ -585,3 +585,43 @@ class LocalDB:
                 "SELECT limit_alerted FROM api_daily_usage WHERE date = ?", (today,)
             ).fetchone()
             return bool(row and row[0])
+
+    def get_data_freshness(self) -> List[Dict]:
+        """Return latest timestamp and candle count per (symbol, timeframe)."""
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT symbol, timeframe, MAX(timestamp) as latest_ts, COUNT(*) as candle_count "
+                "FROM fx_candles GROUP BY symbol, timeframe ORDER BY symbol, timeframe"
+            ).fetchall()
+        return [{"symbol": r[0], "timeframe": r[1], "latest_ts": r[2], "candle_count": r[3]}
+                for r in rows]
+
+    def get_today_alerts(self) -> List[Dict]:
+        """Return alerts created today (UTC date) ordered by timestamp."""
+        from datetime import datetime, timezone
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT symbol, timeframe, ts, type, reason FROM smc_alerts "
+                "WHERE DATE(created_at) = ? ORDER BY ts ASC",
+                (today_str,),
+            ).fetchall()
+        return [{"symbol": r[0], "timeframe": r[1], "ts": r[2], "type": r[3], "reason": r[4]}
+                for r in rows]
+
+    def get_live_monitor_stats(self) -> Dict:
+        """Return TP/SL counts per symbol from all closed trade_monitors."""
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                "SELECT symbol, status, COUNT(*) FROM trade_monitors "
+                "WHERE status IN ('tp_hit','sl_hit') GROUP BY symbol, status"
+            ).fetchall()
+        stats: Dict = {}
+        for symbol, status, count in rows:
+            if symbol not in stats:
+                stats[symbol] = {"tp_hit": 0, "sl_hit": 0}
+            stats[symbol][status] = count
+        return stats

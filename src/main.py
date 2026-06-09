@@ -3,7 +3,7 @@ import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
-from logging.handlers import TimedRotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler, RotatingFileHandler
 from pathlib import Path
 from typing import List, Optional
 import json
@@ -17,6 +17,27 @@ from analysis.confluence_detector import detect_confluences, find_trigger_candle
 from db.local_db import LocalDB
 from alerts.alert_manager import AlertManager
 from alerts.log_monitor import LogMonitor
+
+
+class SizeAndAgeRotatingHandler(RotatingFileHandler):
+    """Rotate the log when it hits maxBytes OR when the file is older than max_age_seconds."""
+    def __init__(self, filename: str, max_age_seconds: int = 48 * 3600, **kwargs):
+        super().__init__(filename, **kwargs)
+        self._max_age = max_age_seconds
+
+    def shouldRollover(self, record) -> bool:
+        if super().shouldRollover(record):
+            return True
+        try:
+            age = time.time() - os.path.getmtime(self.baseFilename)
+            return age > self._max_age
+        except OSError:
+            return False
+
+
+# Module-level debug logger — writes to logs/debug.log, does not propagate to root logger.
+_dlog = logging.getLogger("trade.debug")
+
 
 FETCH_CHECK_SECOND = 10
 INITIAL_LOOKBACK_HOURS = 8760  # 365 days
@@ -133,8 +154,12 @@ def process_symbol_timeframe(
     db: LocalDB,
     alert_manager: AlertManager,
 ) -> None:
-    logging.info("Fetching %s %s", symbol, timeframe)
     latest_timestamp = db.get_latest_timestamp(symbol, timeframe)
+    latest_str = (datetime.fromtimestamp(latest_timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                  if latest_timestamp else "none")
+    _dlog.info("[FETCH] %s %s | latest_in_db=%s UTC | fetching...", symbol, timeframe, latest_str)
+    logging.info("Fetching %s %s", symbol, timeframe)
+
     fetch_limit = get_fetch_limit(timeframe, latest_timestamp)
     candles = fetcher.fetch_historical(symbol, timeframe, limit=fetch_limit)
     validate_candles(symbol, timeframe, candles)
@@ -145,13 +170,18 @@ def process_symbol_timeframe(
         new_candles = filter_last_hours(candles, timeframe)
 
     if not new_candles:
+        _dlog.info("[FETCH] %s %s | NO_NEW_CANDLES | skipping alert checks", symbol, timeframe)
         logging.info("No new candles for %s %s", symbol, timeframe)
         return
 
     db.insert_candles(symbol, timeframe, new_candles)
+    new_latest = datetime.fromtimestamp(new_candles[-1]["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    _dlog.info("[FETCH] %s %s | inserted=%d new candles | new_latest=%s UTC",
+               symbol, timeframe, len(new_candles), new_latest)
     logging.info("Inserted %d new candles for %s %s", len(new_candles), symbol, timeframe)
 
     if not alert_manager.settings.should_alert(symbol):
+        _dlog.info("[FETCH] %s %s | alerts_suppressed (not in alert_pairs)", symbol, timeframe)
         logging.debug("Alerts suppressed for %s (not in alert_pairs)", symbol)
         return
 
@@ -169,19 +199,33 @@ def process_symbol_timeframe(
     if gold:
         gold_params = db.get_param_set_by_id(gold["param_set_id"])
 
+    min_str  = gold_params.get("min_break_strength", "?")
+    htf_req  = gold_params.get("htf_aligned_only", False)
+    sl_mode  = gold_params.get("sl_mode", "swing")
+    _dlog.info("[BOS] %s 15m | checking_signals | gold_params: str>=%s htf_only=%s sl=%s",
+               symbol, min_str, htf_req, sl_mode)
+
     # Fetch 4h candles for HTF bias
     candles_4h = db.query_recent(symbol, "4h", limit=500)
     htf_bias = None
     if candles_4h and new_candles:
         htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, new_candles[-1]["timestamp"])
+    _dlog.info("[BOS] %s 15m | htf_bias=%s | new_candles=%d | 4h_candles=%d",
+               symbol, htf_bias or "none", len(new_candles), len(candles_4h))
 
     # Evaluate with gold params applied
     alerts = alert_manager.evaluate_production(
         symbol, timeframe, new_candles, candles_4h=candles_4h,
         htf_bias=htf_bias, gold_params=gold_params,
     )
+    _dlog.info("[BOS] %s 15m | evaluate_production → %d alert(s)", symbol, len(alerts))
+
     for alert in alerts:
         text = alert_manager.format_production_alert(alert)
+        _dlog.info("[BOS] ALERT | %s 15m | dir=%s entry=%.5f sl=%.5f tp=%.5f | id=%s",
+                   symbol, alert.get("event", {}).get("direction", "?"),
+                   alert.get("entry", 0), alert.get("sl", 0), alert.get("tp", 0),
+                   alert.get("alert_id", "?"))
         logging.info(text)
         alert_manager.send_alert(text)
         # register for post-entry momentum monitoring (Task B)
@@ -243,41 +287,73 @@ def process_symbol_liq(
 ) -> None:
     """Check for live LIQ sweep alerts on 30m after a new candle is inserted."""
     if symbol not in _LIQ_LIVE_PAIRS:
+        _dlog.debug("[LIQ] %s 30m | not in live_pairs (%s) | skip", symbol, _LIQ_LIVE_PAIRS)
         return
     if not alert_manager.settings.should_alert(symbol):
+        _dlog.debug("[LIQ] %s 30m | alerts_suppressed | skip", symbol)
         return
 
     now_hour = datetime.now(timezone.utc).hour
-    if now_hour not in (13, 14, 15):
+    in_ny = now_hour in (13, 14, 15)
+    _dlog.info("[LIQ] %s 30m | hour=%d UTC | in_ny_window=%s", symbol, now_hour, in_ny)
+    if not in_ny:
         return
 
     recent = db.query_recent(symbol, "30m", limit=100)
     if not recent or len(recent) < 30:
+        _dlog.warning("[LIQ] %s 30m | insufficient candles (%d) | skip", symbol, len(recent) if recent else 0)
         return
+
+    latest_str = datetime.fromtimestamp(recent[0]["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    _dlog.info("[LIQ] %s 30m | loaded %d candles | latest=%s UTC", symbol, len(recent), latest_str)
 
     candles_4h = db.query_recent(symbol, "4h", limit=500)
     htf_bias = None
     if candles_4h:
         htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, recent[0]["timestamp"])
+    _dlog.info("[LIQ] %s 30m | htf_bias=%s", symbol, htf_bias or "none")
 
     det_slice = recent[:50]
+    _dlog.info("[LIQ] %s 30m | detect_liquidity_sweep on %d candles | params: PDH/PDL kill_zone=%s min_sweep_atr=%.1f",
+               symbol, len(det_slice), _LIQ_LIVE_DETECT_PARAMS.get("kill_zones_utc"), _LIQ_LIVE_MIN_SWEEP_ATR)
+
     liq_events = alert_manager.analyzer.detect_liquidity_sweep(
         det_slice, params={**_LIQ_LIVE_DETECT_PARAMS, "symbol": symbol, "timeframe": "30m"}
     )
+    _dlog.info("[LIQ] %s 30m | raw_events=%d", symbol, len(liq_events) if liq_events else 0)
+
     if not liq_events:
+        _dlog.info("[LIQ] %s 30m | no_sweep_detected", symbol)
         return
 
     atr = alert_manager.analyzer.calculate_atr(det_slice) or 1e-6
 
     for ev in liq_events:
-        if ev["pool_type"] not in ("PDH", "PDL"):
-            continue
-        if ev.get("sweep_size_atr", 0.0) < _LIQ_LIVE_MIN_SWEEP_ATR:
-            continue
-        if htf_bias != ev["direction"]:
-            continue  # require HTF alignment
+        pool_type   = ev["pool_type"]
+        direction   = ev["direction"]
+        sweep_atr   = ev.get("sweep_size_atr", 0.0)
+        wick_pct    = ev.get("rejection_wick_pct", 0.0)
 
-        bullish = ev["direction"] == "bullish"
+        pool_ok   = pool_type in ("PDH", "PDL")
+        sweep_ok  = sweep_atr >= _LIQ_LIVE_MIN_SWEEP_ATR
+        htf_ok    = htf_bias == direction
+
+        _dlog.info("[LIQ] %s 30m | event pool=%s dir=%s sweep=%.2fATR wick=%.0f%% | "
+                   "pool_ok=%s sweep_ok=%s htf_ok=%s",
+                   symbol, pool_type, direction, sweep_atr, wick_pct * 100,
+                   pool_ok, sweep_ok, htf_ok)
+
+        if not pool_ok:
+            _dlog.info("[LIQ] %s 30m | FILTERED pool_type=%s not PDH/PDL", symbol, pool_type)
+            continue
+        if not sweep_ok:
+            _dlog.info("[LIQ] %s 30m | FILTERED sweep=%.2fATR < %.1f min", symbol, sweep_atr, _LIQ_LIVE_MIN_SWEEP_ATR)
+            continue
+        if not htf_ok:
+            _dlog.info("[LIQ] %s 30m | FILTERED htf_misaligned bias=%s dir=%s", symbol, htf_bias, direction)
+            continue
+
+        bullish = direction == "bullish"
         entry   = det_slice[0]["close"]
         sl      = (entry - _LIQ_LIVE_SL_ATR * atr) if bullish else (entry + _LIQ_LIVE_SL_ATR * atr)
         risk    = abs(entry - sl) or atr * 0.5
@@ -291,9 +367,12 @@ def process_symbol_liq(
             db.insert_alert(symbol, "30m", ev["breakout_ts"], "LIQ", message,
                             None, "{}", alert_id=alert_id)
         except Exception:
+            _dlog.info("[LIQ] DEDUP | %s 30m | id=%s already_sent suppressed", symbol, alert_id)
             logging.debug("LIQ duplicate suppressed: %s", alert_id)
             continue
 
+        _dlog.info("[LIQ] ALERT | %s 30m | %s dir=%s entry=%.5f sl=%.5f tp=%.5f | id=%s",
+                   symbol, pool_type, direction, entry, sl, tp, alert_id)
         logging.info("LIQ ALERT: %s", message)
         alert_manager.send_alert(message)
 
@@ -320,9 +399,11 @@ def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
     - >50 candles old → expire silently
     """
     monitors = db.get_open_monitors()
+    _dlog.info("[MONITOR] START | open_monitors=%d", len(monitors))
     if not monitors:
         return
 
+    closed = 0
     for m in monitors:
         symbol    = m["symbol"]
         direction = m["direction"]
@@ -334,31 +415,53 @@ def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
 
         candles = db.query_candles_after(symbol, "15m", b_ts, limit=60)
         if not candles:
+            _dlog.info("[MONITOR] %s %s | no_candles_after_entry yet | id=%s", symbol, direction, m["alert_id"])
             continue
 
         n = len(candles)
+        _dlog.info("[MONITOR] %s %s | entry=%.5f sl=%.5f tp=%.5f | candles_since=%d | id=%s",
+                   symbol, direction, entry, sl, tp, n, m["alert_id"])
 
         # expire stale monitors
         if n > 50:
+            _dlog.info("[MONITOR] EXPIRE | %s %s | %d candles no_resolution | id=%s",
+                       symbol, direction, n, m["alert_id"])
             db.update_monitor(m["alert_id"], status="expired")
+            closed += 1
             continue
 
         # check SL/TP
         sl_hit = any(c["low"] <= sl for c in candles) if bullish else any(c["high"] >= sl for c in candles)
         tp_hit = any(c["high"] >= tp for c in candles) if bullish else any(c["low"] <= tp for c in candles)
 
+        # compute current progress for log
+        if bullish:
+            best_price = max(c["high"] for c in candles)
+            progress = (best_price - entry) / (tp - entry) if (tp - entry) > 0 else 1.0
+        else:
+            best_price = min(c["low"] for c in candles)
+            progress = (entry - best_price) / (entry - tp) if (entry - tp) > 0 else 1.0
+        _dlog.info("[MONITOR] %s %s | best_price=%.5f progress=%.0f%% toward_tp",
+                   symbol, direction, best_price, progress * 100)
+
         if tp_hit and not m["notified_close"]:
+            _dlog.info("[MONITOR] TP_HIT | %s %s | entry=%.5f tp=%.5f | id=%s",
+                       symbol, direction, entry, tp, m["alert_id"])
             alert_manager.send_alert(
                 f"✅ TP HIT: {symbol} {direction.upper()} | entry {entry:.5f} → TP {tp:.5f} | {m['alert_id']}"
             )
             db.update_monitor(m["alert_id"], status="tp_hit", notified_close=1)
+            closed += 1
             continue
 
         if sl_hit and not m["notified_close"]:
+            _dlog.info("[MONITOR] SL_HIT | %s %s | entry=%.5f sl=%.5f | id=%s",
+                       symbol, direction, entry, sl, m["alert_id"])
             alert_manager.send_alert(
                 f"🔴 SL HIT: {symbol} {direction.upper()} | entry {entry:.5f} → SL {sl:.5f} | {m['alert_id']}"
             )
             db.update_monitor(m["alert_id"], status="sl_hit", notified_close=1)
+            closed += 1
             continue
 
         # stall check: after 4 candles, progress < 50% of TP distance
@@ -372,23 +475,29 @@ def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
                 progress  = (entry - best) / (entry - tp) if (entry - tp) > 0 else 1.0
 
             if progress < 0.5:
+                _dlog.info("[MONITOR] STALL | %s %s | progress=%.0f%% after_4_candles | id=%s",
+                           symbol, direction, progress * 100, m["alert_id"])
                 alert_manager.send_alert(
                     f"⚠️ Momentum stalling: {symbol} {direction.upper()} — "
                     f"{progress:.0%} toward TP after 4 candles | {m['alert_id']}"
                 )
                 db.update_monitor(m["alert_id"], notified_stall=1)
 
+    _dlog.info("[MONITOR] END | closed=%d remaining=%d", closed, len(monitors) - closed)
+
 
 def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager: AlertManager) -> None:
     now = datetime.now(timezone.utc)
     timeframes = get_timeframes_to_fetch(settings.timeframes, now)
     if not timeframes:
-        logging.debug("No scheduled timeframes at %s", now)
+        _dlog.debug("[FETCH] SKIP | %s | no timeframes scheduled this minute",
+                    now.strftime("%H:%M:%S"))
         return
 
     calls_today = db.get_api_calls_today()
     if calls_today >= API_DAILY_LIMIT:
-        logging.debug("API daily limit reached (%d/%d) — skipping fetch", calls_today, API_DAILY_LIMIT)
+        _dlog.warning("[FETCH] BUDGET_EXHAUSTED | api_used=%d/%d | skipping all pairs",
+                      calls_today, API_DAILY_LIMIT)
         return
 
     # Order pairs by priority (best EV first); any pair not in FETCH_PRIORITY goes last
@@ -396,6 +505,8 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
     ordered = [p for p in FETCH_PRIORITY if p in configured]
     ordered += [p for p in settings.fx_pairs if p not in set(FETCH_PRIORITY)]
 
+    _dlog.info("[FETCH] START | timeframes=%s | api_used=%d/%d | pairs=%s",
+               ",".join(timeframes), calls_today, API_DAILY_LIMIT, ",".join(ordered))
     logging.info("Fetch: %s | used %d/%d API calls today",
                  ", ".join(timeframes), calls_today, API_DAILY_LIMIT)
 
@@ -411,6 +522,8 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
                     f"Unfetched pairs this cycle: {', '.join(ordered[ordered.index(symbol):])}."
                 )
                 db.mark_api_limit_alerted()
+            _dlog.warning("[FETCH] BUDGET_HIT | api_used=%d/%d | skipping %s and remaining",
+                          db.get_api_calls_today(), API_DAILY_LIMIT, symbol)
             logging.warning("API daily limit hit — skipping %s and remaining pairs", symbol)
             break
 
@@ -422,8 +535,11 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
                 time.sleep(8)
             except Exception as exc:
                 message = f"Failed to fetch {symbol} {timeframe}: {exc}"
+                _dlog.error("[FETCH] ERROR | %s %s | %s", symbol, timeframe, exc)
                 logging.exception(message)
                 alert_manager.send_fetch_error(symbol, timeframe, str(exc))
+
+    _dlog.info("[FETCH] END | api_used_now=%d/%d", db.get_api_calls_today(), API_DAILY_LIMIT)
 
 
 def _ensure_pair_data(symbol: str, timeframe: str, fetcher: "FXFetcher", db: LocalDB, target_days: int = 365) -> None:
@@ -1739,10 +1855,12 @@ def dax_data_job(db: "LocalDB") -> None:
     if not (_time(9, 0) <= t <= _time(18, 45)):
         return
 
+    _dlog.info("[DAX_DATA] START | time_il=%s | fetching 15m+5m from Yahoo", now_il.strftime("%H:%M IDT"))
     try:
         candles_15m = fetch_yahoo("DAX", "15m", days=7)
         candles_5m  = fetch_yahoo("DAX", "5m",  days=5)
     except Exception as exc:
+        _dlog.error("[DAX_DATA] ERROR | Yahoo fetch failed: %s", exc)
         logging.error("DAX data job: Yahoo fetch failed: %s", exc)
         return
 
@@ -1750,6 +1868,8 @@ def dax_data_job(db: "LocalDB") -> None:
         db.insert_candles("DAX", "15m", candles_15m)
     if candles_5m:
         db.insert_candles("DAX", "5m", candles_5m)
+    _dlog.info("[DAX_DATA] stored %d 15m + %d 5m candles",
+               len(candles_15m or []), len(candles_5m or []))
     logging.debug("DAX data job: stored %d 15m + %d 5m candles", len(candles_15m or []), len(candles_5m or []))
 
 
@@ -1771,14 +1891,18 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
     if not (_time(9, 0) <= t <= _time(12, 30)):
         return
 
+    _dlog.info("[DAX_SESSION] %s | within_session | checking for setup", now_il.strftime("%H:%M IDT"))
+
     # One alert per session day
     if today in _dax_alerted_dates:
+        _dlog.info("[DAX_SESSION] already_alerted today | skip")
         return
 
     # Load gold params
     gold_map = db.get_gold_params("DAX")
     gold = gold_map.get("DAX") or gold_map.get("dax")
     if not gold:
+        _dlog.warning("[DAX_SESSION] no gold params | run --experiment-dax --update-gold")
         logging.warning("DAX session job: no gold params — run --experiment-dax --update-gold first")
         return
     gold_params = db.get_param_set_by_id(gold["param_set_id"])
@@ -1789,10 +1913,13 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
     candles_5m  = db.query_recent("DAX", "5m",  limit=500)
 
     if not candles_15m or not candles_5m:
+        _dlog.warning("[DAX_SESSION] no candles in DB | 15m=%d 5m=%d",
+                      len(candles_15m or []), len(candles_5m or []))
         return
 
     sess_15m = [c for c in candles_15m if start_ts <= c["timestamp"] <= end_ts]
     if len(sess_15m) < 3:
+        _dlog.info("[DAX_SESSION] insufficient session candles (%d<3) | waiting", len(sess_15m))
         return
 
     # Last 16 pre-session 15m candles for context
@@ -1807,6 +1934,9 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
         key=lambda c: c["timestamp"],
     )
 
+    _dlog.info("[DAX_SESSION] detect_setup | sess_15m=%d day_5m=%d pre_15m=%d | param_set_id=%s",
+               len(sess_15m), len(day_5m), len(pre_15m), gold.get("param_set_id", "?"))
+
     analyzer = SMCAnalyzer()
     try:
         sigs = analyzer.detect_dax_session_setup(
@@ -1815,14 +1945,20 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
             candles_15m_presession=pre_15m,
         )
     except Exception as exc:
+        _dlog.error("[DAX_SESSION] detection_failed | %s", exc)
         logging.error("DAX session job: detection failed: %s", exc)
         return
 
     if not sigs:
+        _dlog.info("[DAX_SESSION] no_setup_found")
         return
 
     sig = sigs[0]
     _dax_alerted_dates.add(today)
+
+    _dlog.info("[DAX_SESSION] SIGNAL | dir=%s entry=%.0f sl=%.0f tp=%.0f | alerts_enabled=%s",
+               sig.get("direction", "?"), sig.get("entry", 0), sig.get("sl", 0), sig.get("tp", 0),
+               getattr(settings, "dax_alerts_enabled", False))
 
     msg = _format_dax_alert(sig)
     logging.info("DAX SIGNAL: %s", msg)
@@ -1834,6 +1970,7 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
     if getattr(settings, "dax_alerts_enabled", False):
         alert_manager.send_alert({"message": msg, "image_path": chart_path, "alert_id": sig.get("signal_id", "dax")})
     else:
+        _dlog.info("[DAX_SESSION] alert_suppressed (dax_alerts_enabled=false) | chart=%s", chart_path)
         logging.info("DAX alert suppressed (dax_alerts_enabled=false) — chart saved to %s", chart_path)
 
 
@@ -2836,6 +2973,97 @@ def run_bos_experiment(
                         param_sets=sweep_sets)
 
 
+def scheduler_heartbeat_job() -> None:
+    """Log a heartbeat every 30 minutes so the debug log confirms the scheduler is alive."""
+    _dlog.info("[SCHEDULER] heartbeat | alive | %s UTC",
+               datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def daily_report_job(settings: Settings, db: LocalDB, alert_manager: AlertManager) -> None:
+    """Send daily Telegram summary at 21:00 IDT (18:00 UTC)."""
+    _dlog.info("[DAILY_REPORT] generating")
+    try:
+        now = datetime.now(timezone.utc)
+        is_weekend = now.weekday() >= 5
+
+        freshness = db.get_data_freshness()
+        freshness_map = {(r["symbol"], r["timeframe"]): r for r in freshness}
+
+        all_pairs = list(settings.fx_pairs)
+        if "DAX" not in all_pairs:
+            all_pairs.append("DAX")
+        report_tfs = ["15m", "4h", "30m"]
+
+        lines = [f"📊 Daily Report — {now.strftime('%a %d %b %Y')} (UTC)"]
+        lines.append("")
+        lines.append("─── Data Freshness ───")
+
+        stale_pairs: list = []
+        for symbol in all_pairs:
+            parts = []
+            for tf in report_tfs:
+                row = freshness_map.get((symbol, tf))
+                if row is None:
+                    parts.append(f"{tf}:–")
+                    continue
+                ts = row["latest_ts"]
+                age_h = (now.timestamp() - ts) / 3600
+                dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M")
+                stale = not is_weekend and age_h > 2.0
+                flag = " ⚠" if stale else " ✓"
+                if stale:
+                    stale_pairs.append(f"{symbol}/{tf}")
+                parts.append(f"{tf}:{dt_str}{flag}")
+            lines.append(f"{symbol:<8} {' │ '.join(parts)}")
+
+        calls = db.get_api_calls_today()
+        pct = calls / API_DAILY_LIMIT * 100
+        lines += ["", "─── API Budget ───",
+                  f"Calls today: {calls}/{API_DAILY_LIMIT} ({pct:.0f}%)"]
+
+        monitors = db.get_open_monitors()
+        lines += ["", f"─── Open Monitors ({len(monitors)}) ───"]
+        if monitors:
+            for m in monitors:
+                n = len(db.query_candles_after(m["symbol"], "15m", m["breakout_ts"], limit=60))
+                lines.append(
+                    f"  {m['symbol']} {m['direction'].upper():<5} "
+                    f"entry={m['entry']:.5f} TP={m['tp']:.5f} ({n} bars)"
+                )
+        else:
+            lines.append("  (none)")
+
+        today_alerts = db.get_today_alerts()
+        lines += ["", f"─── Today's Alerts ({len(today_alerts)}) ───"]
+        if today_alerts:
+            for a in today_alerts[:10]:
+                ts_str = datetime.fromtimestamp(a["ts"], tz=timezone.utc).strftime("%H:%M")
+                lines.append(f"  {ts_str} {a['symbol']} {a['timeframe']} [{a['type']}]")
+        else:
+            lines.append("  (none)")
+
+        live_stats = db.get_live_monitor_stats()
+        if live_stats:
+            lines += ["", "─── Live Monitor WR (all time) ───"]
+            for symbol, s in sorted(live_stats.items()):
+                wins  = s["tp_hit"]
+                total = wins + s["sl_hit"]
+                wr    = wins / total * 100 if total else 0
+                lines.append(f"  {symbol}: {wins}W/{s['sl_hit']}L — WR {wr:.1f}% (n={total})")
+
+        if stale_pairs:
+            lines += ["", f"⚠ Stale data: {', '.join(stale_pairs)}"]
+
+        message = "\n".join(lines)
+        alert_manager.notifier.send_message(message)
+        logging.info("Daily report sent")
+        _dlog.info("[DAILY_REPORT] sent | pairs=%d monitors=%d today_alerts=%d stale=%d",
+                   len(all_pairs), len(monitors), len(today_alerts), len(stale_pairs))
+    except Exception:
+        logging.exception("Daily report job failed")
+        _dlog.error("[DAILY_REPORT] FAILED")
+
+
 def setup_logging(log_dir: Path) -> Path:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "trade.log"
@@ -2858,6 +3086,30 @@ def setup_logging(log_dir: Path) -> Path:
     root_logger.handlers = []
     root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
+
+    # ── Debug log: verbose checkpoint file, rotates at 10 MB or 48 h ──
+    debug_file = log_dir / "debug.log"
+    debug_handler = SizeAndAgeRotatingHandler(
+        str(debug_file),
+        max_age_seconds=48 * 3600,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=2,
+    )
+    _UtcFmt = type(
+        "_UtcFmt", (logging.Formatter,),
+        {"converter": staticmethod(__import__("time").gmtime)},
+    )
+    debug_handler.setFormatter(
+        _UtcFmt(
+            "%(asctime)s.%(msecs)03d UTC | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    debug_logger = logging.getLogger("trade.debug")
+    debug_logger.setLevel(logging.DEBUG)
+    debug_logger.handlers = []
+    debug_logger.addHandler(debug_handler)
+    debug_logger.propagate = False  # don't bleed into root logger / trade.log
 
     return log_file
 
@@ -2902,17 +3154,21 @@ def run_gap_check(
     total_inserted = 0
     api_calls_made = 0
 
+    _dlog.info("[GAP_CHECK] START | %d pairs × %d timeframes | budget=%d/%d used",
+               len(pairs), len(timeframes), calls_today, API_DAILY_LIMIT)
     logging.info("=== Gap check: %d pairs × %d timeframes (budget: %d/%d used) ===",
                  len(pairs), len(timeframes), calls_today, API_DAILY_LIMIT)
     for symbol in pairs:
         for tf in timeframes:
             if not dry_run and (API_DAILY_LIMIT - db.get_api_calls_today()) <= 0:
+                _dlog.warning("[GAP_CHECK] BUDGET_EXHAUSTED mid-run | stopping at %s %s", symbol, tf)
                 logging.warning("Gap check: budget exhausted mid-run — stopping at %s %s", symbol, tf)
                 break
             try:
                 gaps, inserted = check_and_backfill(
                     db, fetcher, symbol, tf, dry_run=dry_run
                 )
+                _dlog.info("[GAP_CHECK] %s %s | gaps=%d inserted=%d", symbol, tf, gaps, inserted)
                 total_gaps     += gaps
                 total_inserted += inserted
                 if not dry_run and gaps > 0:
@@ -2920,11 +3176,15 @@ def run_gap_check(
                     db.increment_api_calls(gaps)
                     api_calls_made += gaps
             except Exception as exc:
+                _dlog.error("[GAP_CHECK] ERROR | %s %s | %s", symbol, tf, exc)
                 logging.warning("Gap check failed for %s %s: %s", symbol, tf, exc)
 
     if dry_run:
+        _dlog.info("[GAP_CHECK] END (dry-run) | total_gaps=%d", total_gaps)
         logging.info("Gap check (dry-run) complete — %d gap(s) found", total_gaps)
     else:
+        _dlog.info("[GAP_CHECK] END | total_gaps=%d total_inserted=%d api_calls=%d",
+                   total_gaps, total_inserted, api_calls_made)
         logging.info(
             "Gap check complete — %d gap(s) found, %d candles inserted, %d API calls used",
             total_gaps, total_inserted, api_calls_made,
@@ -3149,18 +3409,46 @@ def main() -> None:
         max_instances=1,
         id="trade_momentum_monitor_job",
     )
+    scheduler.add_job(
+        daily_report_job,
+        trigger="cron",
+        hour=18,
+        minute=0,
+        args=[settings, db, alert_manager],
+        max_instances=1,
+        id="trade_daily_report_job",
+    )
+    scheduler.add_job(
+        scheduler_heartbeat_job,
+        trigger="interval",
+        minutes=30,
+        max_instances=1,
+        id="trade_heartbeat_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
     logging.info("Gap check job runs daily at 06:00 UTC")
+    logging.info("Daily report job runs at 21:00 IDT (18:00 UTC)")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
+    logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
+
+    _dlog.info("[STARTUP] trade service starting | pairs=%d alert_pairs=%s dev_mode=%s",
+               len(settings.fx_pairs),
+               getattr(settings, "alert_pairs", settings.fx_pairs),
+               getattr(settings, "dev_mode", False))
+    _dlog.info("[STARTUP] liq_live_pairs=%s | bos_timeframes=%s", _LIQ_LIVE_PAIRS, settings.timeframes)
+    _dlog.info("[STARTUP] scheduler jobs: fetch(1min) monitor(15min) dax_data(5min) "
+               "dax_session(5min) gap_check(06:00UTC) daily_report(18:00UTC) heartbeat(30min)")
 
     # Run gap check once at startup so any downtime gaps are recovered immediately
     logging.info("Running startup gap check...")
+    _dlog.info("[STARTUP] running startup gap check...")
     try:
         run_gap_check(settings, fetcher, db)
     except Exception:
         logging.exception("Startup gap check failed (non-fatal)")
+        _dlog.error("[STARTUP] gap check failed (non-fatal)")
 
     try:
         scheduler.start()
