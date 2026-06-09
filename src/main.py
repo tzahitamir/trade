@@ -192,6 +192,13 @@ def process_symbol_timeframe(
     if timeframe != "15m":
         return  # only 15m BOS signals
 
+    # Session gate: BOS alerts are only reliable during London + NY (07:00–21:00 UTC).
+    # Asian-session breakouts have lower liquidity and high false-break rates.
+    _bar_hour = datetime.fromtimestamp(new_candles[-1]["timestamp"], tz=timezone.utc).hour
+    if not (7 <= _bar_hour < 21):
+        _dlog.info("[BOS] %s 15m | OUTSIDE_SESSION (hour=%d UTC) | skip", symbol, _bar_hour)
+        return
+
     # Load gold params for this symbol/strategy to filter signals
     gold_map = db.get_gold_params("BOS15m", symbol)
     gold = gold_map.get(symbol)
