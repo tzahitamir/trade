@@ -94,6 +94,7 @@ class AlertManager:
         candles_4h: Optional[List[Dict]] = None,
         htf_bias: Optional[str] = None,
         gold_params: Optional[Dict] = None,
+        min_breakout_ts: Optional[int] = None,
     ) -> List[Dict]:
         """Like evaluate() but applies gold param filters and computes TP/SL/R for each signal."""
         from analysis.confluence_detector import detect_confluences, find_trigger_candle
@@ -115,6 +116,10 @@ class AlertManager:
 
         seen: set = set()
         for ev in bos_events:
+            # Skip events older than the live tick window (avoids chart-render spam)
+            if min_breakout_ts and ev.get("breakout_ts", 0) < min_breakout_ts:
+                continue
+
             key = (ev["direction"], round(ev.get("broken_level", 0), 5))
             if key in seen:
                 continue

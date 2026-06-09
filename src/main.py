@@ -207,18 +207,35 @@ def process_symbol_timeframe(
 
     # Fetch 4h candles for HTF bias
     candles_4h = db.query_recent(symbol, "4h", limit=500)
+
+    # Use the most-recently inserted candle's timestamp as the BOS window boundary.
+    # new_candles is oldest-first (from the API); new_candles[-1] is the newest.
+    newest_new_ts = new_candles[-1]["timestamp"]
+    oldest_new_ts = new_candles[0]["timestamp"]
+
     htf_bias = None
-    if candles_4h and new_candles:
-        htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, new_candles[-1]["timestamp"])
+    if candles_4h:
+        htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, newest_new_ts)
     _dlog.info("[BOS] %s 15m | htf_bias=%s | new_candles=%d | 4h_candles=%d",
                symbol, htf_bias or "none", len(new_candles), len(candles_4h))
 
-    # Evaluate with gold params applied
+    # Pass full recent context (200 candles, newest-first) so BOS detector has
+    # enough prior candles for swing detection. Filter results to events whose
+    # breakout_ts falls within the newly-inserted candle range only, so we don't
+    # re-fire on historical setups from prior ticks.
+    context_candles = db.query_recent(symbol, timeframe, limit=200)
+    _dlog.info("[BOS] %s 15m | context_candles=%d | new_window=[%s … %s]",
+               symbol, len(context_candles),
+               datetime.fromtimestamp(oldest_new_ts, tz=timezone.utc).strftime("%H:%M"),
+               datetime.fromtimestamp(newest_new_ts, tz=timezone.utc).strftime("%H:%M"))
+
     alerts = alert_manager.evaluate_production(
-        symbol, timeframe, new_candles, candles_4h=candles_4h,
+        symbol, timeframe, context_candles, candles_4h=candles_4h,
         htf_bias=htf_bias, gold_params=gold_params,
+        min_breakout_ts=oldest_new_ts,
     )
-    _dlog.info("[BOS] %s 15m | evaluate_production → %d alert(s)", symbol, len(alerts))
+    _dlog.info("[BOS] %s 15m | evaluate_production → %d alert(s) in new window",
+               symbol, len(alerts))
 
     for alert in alerts:
         text = alert_manager.format_production_alert(alert)
@@ -3012,7 +3029,11 @@ def daily_report_job(settings: Settings, db: LocalDB, alert_manager: AlertManage
                 # threshold = 1.5× the bar interval so normal gaps don't false-flag
                 _stale_thresh = {"15m": 0.5, "30m": 1.0, "4h": 6.0,
                                  "5m": 0.25, "1d": 30.0}.get(tf, 2.0)
-                stale = not is_weekend and age_h > _stale_thresh
+                # 30m only fetches during the NY window (12-16 UTC); outside that range
+                # the data will always look "stale" — suppress the flag.
+                _in_30m_window = 12 <= now.hour < 16
+                _skip_stale = tf == "30m" and not _in_30m_window
+                stale = not is_weekend and not _skip_stale and age_h > _stale_thresh
                 flag = " ⚠" if stale else " ✓"
                 if stale:
                     stale_pairs.append(f"{symbol}/{tf}")
@@ -3157,6 +3178,11 @@ def run_gap_check(
     total_inserted = 0
     api_calls_made = 0
 
+    # Only inspect the last 14 days — ancient gaps are either known market
+    # closures or permanently unfillable (API has no data). Retrying them
+    # wastes API credits on every startup without ever inserting anything.
+    since_ts = int(datetime.now(timezone.utc).timestamp()) - 14 * 24 * 3600
+
     _dlog.info("[GAP_CHECK] START | %d pairs × %d timeframes | budget=%d/%d used",
                len(pairs), len(timeframes), calls_today, API_DAILY_LIMIT)
     logging.info("=== Gap check: %d pairs × %d timeframes (budget: %d/%d used) ===",
@@ -3169,7 +3195,7 @@ def run_gap_check(
                 break
             try:
                 gaps, inserted = check_and_backfill(
-                    db, fetcher, symbol, tf, dry_run=dry_run
+                    db, fetcher, symbol, tf, since_ts=since_ts, dry_run=dry_run
                 )
                 _dlog.info("[GAP_CHECK] %s %s | gaps=%d inserted=%d", symbol, tf, gaps, inserted)
                 total_gaps     += gaps
