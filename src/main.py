@@ -3009,7 +3009,10 @@ def daily_report_job(settings: Settings, db: LocalDB, alert_manager: AlertManage
                 ts = row["latest_ts"]
                 age_h = (now.timestamp() - ts) / 3600
                 dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M")
-                stale = not is_weekend and age_h > 2.0
+                # threshold = 1.5× the bar interval so normal gaps don't false-flag
+                _stale_thresh = {"15m": 0.5, "30m": 1.0, "4h": 6.0,
+                                 "5m": 0.25, "1d": 30.0}.get(tf, 2.0)
+                stale = not is_weekend and age_h > _stale_thresh
                 flag = " ⚠" if stale else " ✓"
                 if stale:
                     stale_pairs.append(f"{symbol}/{tf}")
