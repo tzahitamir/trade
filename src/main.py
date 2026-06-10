@@ -46,6 +46,12 @@ API_DAILY_LIMIT = 800
 
 # Fetch order: highest EV alert pairs first; USDJPY last (no live alerts, drop first under pressure)
 FETCH_PRIORITY = ["NZDUSD", "EURJPY", "EURUSD", "USDCHF", "USDCAD", "XAUUSD", "USDJPY"]
+
+# Tracks pairs whose last fetch returned stale data (0 new candles when one was expected).
+# fetch_job retries only these pairs each minute until the fresh candle arrives.
+# Key: (symbol, timeframe), Value: retry attempt number (1, 2, 3 …)
+_stale_retry: dict = {}
+_STALE_MAX_RETRIES = 4  # give up after 4 extra attempts (~4 min total from candle close)
 TIMEFRAME_INTERVAL_MINUTES = {
     "5m": 5,
     "5min": 5,
@@ -83,7 +89,7 @@ def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
         return False
 
     if timeframe in {"15m", "15min"}:
-        return minute % 15 == 4
+        return minute % 15 == 1  # 1 min after candle close; stale pairs auto-retry
     if timeframe in {"4h", "h4"}:  # once per 4-hour bar close
         return minute == 0 and now.hour % 4 == 0
     if timeframe in {"30m", "30min"}:  # NY session window for LIQ sweep alerts
@@ -153,7 +159,9 @@ def process_symbol_timeframe(
     fetcher: FXFetcher,
     db: LocalDB,
     alert_manager: AlertManager,
-) -> None:
+) -> int:
+    """Fetch latest candles for symbol/timeframe, store, run BOS detection.
+    Returns number of new candles inserted (0 = API returned stale data)."""
     latest_timestamp = db.get_latest_timestamp(symbol, timeframe)
     latest_str = (datetime.fromtimestamp(latest_timestamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
                   if latest_timestamp else "none")
@@ -170,9 +178,10 @@ def process_symbol_timeframe(
         new_candles = filter_last_hours(candles, timeframe)
 
     if not new_candles:
-        _dlog.info("[FETCH] %s %s | NO_NEW_CANDLES | skipping alert checks", symbol, timeframe)
-        logging.info("No new candles for %s %s", symbol, timeframe)
-        return
+        _dlog.info("[FETCH] %s %s | NO_NEW_CANDLES (stale) | latest_in_db=%s UTC",
+                   symbol, timeframe, latest_str)
+        logging.info("No new candles for %s %s (stale)", symbol, timeframe)
+        return 0
 
     db.insert_candles(symbol, timeframe, new_candles)
     new_latest = datetime.fromtimestamp(new_candles[-1]["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -272,6 +281,8 @@ def process_symbol_timeframe(
             )
         except Exception:
             logging.exception("Failed to insert trade monitor for %s", alert.get("alert_id"))
+
+    return len(new_candles)
 
 
 # ── LIQ sweep live alerts ──────────────────────────────────────────────────────
@@ -531,59 +542,84 @@ def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
 
 
 def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager: AlertManager) -> None:
+    global _stale_retry
     now = datetime.now(timezone.utc)
     timeframes = get_timeframes_to_fetch(settings.timeframes, now)
-    if not timeframes:
-        _dlog.debug("[FETCH] SKIP | %s | no timeframes scheduled this minute",
+
+    # Ordered pair list (priority order)
+    configured = set(settings.fx_pairs)
+    ordered = [p for p in FETCH_PRIORITY if p in configured]
+    ordered += [p for p in settings.fx_pairs if p not in set(FETCH_PRIORITY)]
+
+    # Decide what to fetch this minute
+    if timeframes:
+        # Scheduled tick: fetch all pairs + reset stale tracking for these timeframes
+        pairs_to_fetch = [(sym, tf) for sym in ordered for tf in timeframes]
+        for sym in ordered:
+            for tf in timeframes:
+                _stale_retry.pop((sym, tf), None)
+        mode = "SCHEDULED"
+    elif _stale_retry:
+        # Non-scheduled tick: retry only stale pairs (zero extra API cost for fresh pairs)
+        pairs_to_fetch = list(_stale_retry.keys())
+        mode = "STALE_RETRY"
+    else:
+        _dlog.debug("[FETCH] SKIP | %s | no timeframes scheduled and no stale pairs",
                     now.strftime("%H:%M:%S"))
         return
 
     calls_today = db.get_api_calls_today()
     if calls_today >= API_DAILY_LIMIT:
-        _dlog.warning("[FETCH] BUDGET_EXHAUSTED | api_used=%d/%d | skipping all pairs",
+        _dlog.warning("[FETCH] BUDGET_EXHAUSTED | api_used=%d/%d | skipping",
                       calls_today, API_DAILY_LIMIT)
         return
 
-    # Order pairs by priority (best EV first); any pair not in FETCH_PRIORITY goes last
-    configured = set(settings.fx_pairs)
-    ordered = [p for p in FETCH_PRIORITY if p in configured]
-    ordered += [p for p in settings.fx_pairs if p not in set(FETCH_PRIORITY)]
+    if mode == "STALE_RETRY":
+        _dlog.info("[FETCH] STALE_RETRY | %s | retrying %d stale pair(s): %s",
+                   now.strftime("%H:%M:%S"), len(pairs_to_fetch),
+                   ", ".join(f"{s} {tf}" for s, tf in pairs_to_fetch))
+    else:
+        _dlog.info("[FETCH] START | timeframes=%s | api_used=%d/%d | pairs=%s",
+                   ",".join(timeframes), calls_today, API_DAILY_LIMIT, ",".join(ordered))
+        logging.info("Fetch: %s | used %d/%d API calls today",
+                     ", ".join(timeframes), calls_today, API_DAILY_LIMIT)
 
-    _dlog.info("[FETCH] START | timeframes=%s | api_used=%d/%d | pairs=%s",
-               ",".join(timeframes), calls_today, API_DAILY_LIMIT, ",".join(ordered))
-    logging.info("Fetch: %s | used %d/%d API calls today",
-                 ", ".join(timeframes), calls_today, API_DAILY_LIMIT)
-
-    for symbol in ordered:
+    for symbol, timeframe in pairs_to_fetch:
         remaining = API_DAILY_LIMIT - db.get_api_calls_today()
         if remaining <= 0:
             if not db.api_limit_already_alerted():
-                skipped = [p for p in ordered if p != symbol and p not in
-                           ordered[:ordered.index(symbol)]]
                 alert_manager.send_alert(
                     f"⚠️ [trade] Daily API limit reached ({API_DAILY_LIMIT} calls). "
-                    f"Data fetch paused until UTC midnight. "
-                    f"Unfetched pairs this cycle: {', '.join(ordered[ordered.index(symbol):])}."
+                    f"Data fetch paused until UTC midnight."
                 )
                 db.mark_api_limit_alerted()
-            _dlog.warning("[FETCH] BUDGET_HIT | api_used=%d/%d | skipping %s and remaining",
-                          db.get_api_calls_today(), API_DAILY_LIMIT, symbol)
-            logging.warning("API daily limit hit — skipping %s and remaining pairs", symbol)
+            _dlog.warning("[FETCH] BUDGET_HIT | api_used=%d/%d | stopping", db.get_api_calls_today(), API_DAILY_LIMIT)
             break
 
-        for timeframe in timeframes:
-            try:
-                process_symbol_timeframe(symbol, timeframe, fetcher, db, alert_manager)
-                db.increment_api_calls(1)
-                # 8s between calls keeps 7 symbols × 8s = 56s within the 60s rolling window
-                time.sleep(8)
-            except Exception as exc:
-                message = f"Failed to fetch {symbol} {timeframe}: {exc}"
-                _dlog.error("[FETCH] ERROR | %s %s | %s", symbol, timeframe, exc)
-                logging.exception(message)
-                alert_manager.send_fetch_error(symbol, timeframe, str(exc))
+        try:
+            n_new = process_symbol_timeframe(symbol, timeframe, fetcher, db, alert_manager)
+            db.increment_api_calls(1)
+            if n_new == 0:
+                attempt = _stale_retry.get((symbol, timeframe), 0) + 1
+                if attempt <= _STALE_MAX_RETRIES:
+                    _stale_retry[(symbol, timeframe)] = attempt
+                    _dlog.info("[FETCH] STALE | %s %s | will retry (attempt %d/%d)",
+                               symbol, timeframe, attempt, _STALE_MAX_RETRIES)
+                else:
+                    _stale_retry.pop((symbol, timeframe), None)
+                    _dlog.warning("[FETCH] STALE_GAVE_UP | %s %s | no new candle after %d retries",
+                                  symbol, timeframe, _STALE_MAX_RETRIES)
+            else:
+                _stale_retry.pop((symbol, timeframe), None)
+            time.sleep(8)
+        except Exception as exc:
+            _dlog.error("[FETCH] ERROR | %s %s | %s", symbol, timeframe, exc)
+            logging.exception("Failed to fetch %s %s: %s", symbol, timeframe, exc)
+            alert_manager.send_fetch_error(symbol, timeframe, str(exc))
+            _stale_retry.pop((symbol, timeframe), None)
 
-    _dlog.info("[FETCH] END | api_used_now=%d/%d", db.get_api_calls_today(), API_DAILY_LIMIT)
+    _dlog.info("[FETCH] END | mode=%s | api_used_now=%d/%d | stale_pending=%d",
+               mode, db.get_api_calls_today(), API_DAILY_LIMIT, len(_stale_retry))
 
 
 def _ensure_pair_data(symbol: str, timeframe: str, fetcher: "FXFetcher", db: LocalDB, target_days: int = 365) -> None:
