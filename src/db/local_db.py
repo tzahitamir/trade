@@ -461,16 +461,18 @@ class LocalDB:
     # ── trade monitor helpers ──────────────────────────────────────────────────
 
     def insert_monitor(self, alert_id: str, symbol: str, direction: str,
-                       entry: float, sl: float, tp: float, breakout_ts: int) -> None:
+                       entry: float, sl: float, tp: float, breakout_ts: int) -> bool:
+        """Insert a new trade monitor. Returns True if inserted, False if already existed."""
         with self._lock:
             conn = self._get_conn()
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT OR IGNORE INTO trade_monitors
                    (alert_id, symbol, direction, entry, sl, tp, breakout_ts, status, created_at)
                    VALUES (?,?,?,?,?,?,?,'open',?)""",
                 (alert_id, symbol, direction, entry, sl, tp, breakout_ts, int(_time_mod.time())),
             )
             conn.commit()
+            return cursor.rowcount > 0
 
     def get_open_monitors(self) -> List[Dict]:
         with self._lock:

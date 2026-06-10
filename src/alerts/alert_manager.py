@@ -95,6 +95,7 @@ class AlertManager:
         htf_bias: Optional[str] = None,
         gold_params: Optional[Dict] = None,
         min_breakout_ts: Optional[int] = None,
+        id_prefix: str = "bos",
     ) -> List[Dict]:
         """Like evaluate() but applies gold param filters and computes TP/SL/R for each signal."""
         from analysis.confluence_detector import detect_confluences, find_trigger_candle
@@ -152,7 +153,7 @@ class AlertManager:
             sl, tp, entry, swing_risk = self._compute_trade_levels(ev, window_chron, candles, sl_mode, atr)
             r_ratio = round(abs(tp - entry) / abs(entry - sl), 2) if abs(entry - sl) > 0 else None
 
-            alert_id = self._generate_alert_id(symbol, ev.get("breakout_ts", 0))
+            alert_id = self._generate_alert_id(symbol, ev.get("breakout_ts", 0), prefix=id_prefix)
             try:
                 fig_path, _ = self._render_bos_chart(
                     candles, ev, alert_id, None, htf_bias,

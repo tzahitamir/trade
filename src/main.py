@@ -71,15 +71,16 @@ TIMEFRAME_INTERVAL_MINUTES = {
 
 def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
     """
-    Fetch schedule — 15m, 30m (NY window), and 4h for production alerts.
-    Covers all FX trading hours (Mon 00:00 – Fri 22:00 UTC); skips Sat/Sun.
+    Fetch schedule — 15m, 30m (NY window), 4h, and 5m (XAUUSD only, filtered in fetch_job).
+    Covers active FX trading hours; skips Sat/Sun.
     Budget is enforced separately in fetch_job via the API daily counter.
 
     Daily estimate on a full weekday (7 pairs):
-      15m: 4/hr × 24h × 7          = 672 calls
-      4h:  6/day × 7               =  42 calls
-      30m: 2/hr × 4h (12-16 UTC) × 7 =  56 calls
-      Total ≈ 770/day  (under 800 free-tier limit)
+      15m: 4/hr × 17h (05-22 UTC) × 7 = 476 calls
+      4h:  6/day × 7                   =  42 calls
+      30m: 2/hr × 4h (12-16 UTC) × 7  =  56 calls
+      5m:  12/hr × 14h (07-21) × 1    = 168 calls  (XAUUSD only)
+      Total ≈ 742/day  (under 800 free-tier limit)
     """
     timeframe = timeframe.lower()
     minute  = now.minute
@@ -89,13 +90,17 @@ def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
         return False
 
     if timeframe in {"15m", "15min"}:
-        return minute % 15 == 1  # 1 min after candle close; stale pairs auto-retry
+        # Session-gated: 05:00–22:00 UTC (saves ~196 calls vs 24h, frees budget for 5m)
+        return 5 <= now.hour < 22 and minute % 15 == 1
+    if timeframe in {"5m", "5min"}:
+        # Only XAUUSD — filtered in fetch_job to avoid fetching all pairs
+        return 7 <= now.hour < 21 and minute % 5 == 1
     if timeframe in {"4h", "h4"}:  # once per 4-hour bar close
         return minute == 0 and now.hour % 4 == 0
     if timeframe in {"30m", "30min"}:  # NY session window for LIQ sweep alerts
         return 12 <= now.hour <= 15 and minute % 30 == 4
 
-    return False  # 5m, 1h not used in production
+    return False  # 1h, 1d not used in production
 
 
 def get_timeframes_to_fetch(timeframes: List[str], now: datetime) -> List[str]:
@@ -153,6 +158,94 @@ def validate_candles(symbol: str, timeframe: str, candles: List[dict]) -> None:
         )
 
 
+def _process_xauusd_5m(
+    symbol: str,
+    new_candles: list,
+    db: LocalDB,
+    alert_manager: AlertManager,
+) -> None:
+    """Detect BOS on XAUUSD 5m using 15m as HTF bias for earlier entry signals.
+
+    Fires before the 15m candle closes — alerts arrive ~5-14 minutes earlier than
+    the standard 15m BOS for fast-moving XAUUSD. Uses the same BOS15m gold params
+    since we don't yet have 5m-specific param history.
+    """
+    if not new_candles:
+        return
+
+    _bar_hour = datetime.fromtimestamp(new_candles[-1]["timestamp"], tz=timezone.utc).hour
+    if not (7 <= _bar_hour < 21):
+        return
+
+    # 15m acts as HTF for 5m signals
+    candles_15m = db.query_recent(symbol, "15m", limit=200)
+    newest_new_ts = new_candles[-1]["timestamp"]
+    oldest_new_ts = new_candles[0]["timestamp"]
+
+    htf_bias = None
+    if candles_15m:
+        htf_bias = alert_manager.analyzer.get_htf_bias(candles_15m, newest_new_ts)
+    _dlog.info("[BOS5m] %s | htf_bias=%s | new_candles=%d | 15m_candles=%d",
+               symbol, htf_bias or "none", len(new_candles), len(candles_15m))
+
+    # Reuse BOS15m gold params — tightest available filter until 5m sweep accumulates
+    gold_map = db.get_gold_params("BOS15m", symbol)
+    gold = gold_map.get(symbol)
+    gold_params: dict = {}
+    if gold:
+        gold_params = db.get_param_set_by_id(gold["param_set_id"])
+
+    context_candles = db.query_recent(symbol, "5m", limit=200)
+    if len(context_candles) < 40:
+        _dlog.info("[BOS5m] %s | insufficient_context (%d candles) — skip", symbol, len(context_candles))
+        return
+
+    alerts = alert_manager.evaluate_production(
+        symbol, "5m", context_candles,
+        candles_4h=candles_15m,   # pass 15m as "HTF" context
+        htf_bias=htf_bias,
+        gold_params=gold_params,
+        min_breakout_ts=oldest_new_ts,
+        id_prefix="bos5m",
+    )
+    _dlog.info("[BOS5m] %s | evaluate_production → %d alert(s)", symbol, len(alerts))
+
+    current_price = new_candles[-1]["close"] if new_candles else None
+    for alert in alerts:
+        alert["current_price"] = current_price
+        try:
+            ev = alert["event"]
+            inserted = db.insert_monitor(
+                alert_id=alert["alert_id"],
+                symbol=symbol,
+                direction=ev.get("direction", "bullish"),
+                entry=alert["entry"],
+                sl=alert["sl"],
+                tp=alert["tp"],
+                breakout_ts=ev.get("breakout_ts", 0),
+            )
+        except Exception:
+            logging.exception("Failed to insert 5m trade monitor for %s", alert.get("alert_id"))
+            inserted = False
+
+        if not inserted:
+            _dlog.info("[BOS5m] DEDUP | %s | id=%s already fired — skipped",
+                       symbol, alert.get("alert_id", "?"))
+            continue
+
+        text = alert_manager.format_production_alert(alert)
+        _dlog.info("[BOS5m] ALERT | %s 5m | dir=%s entry=%.2f sl=%.2f tp=%.2f | id=%s",
+                   symbol, ev.get("direction", "?"),
+                   alert.get("entry", 0), alert.get("sl", 0), alert.get("tp", 0),
+                   alert.get("alert_id", "?"))
+        logging.info(text)
+        alert_manager.send_alert({
+            "message":    text,
+            "image_path": alert.get("image_path"),
+            "alert_id":   alert.get("alert_id", ""),
+        })
+
+
 def process_symbol_timeframe(
     symbol: str,
     timeframe: str,
@@ -192,21 +285,26 @@ def process_symbol_timeframe(
     if not alert_manager.settings.should_alert(symbol):
         _dlog.info("[FETCH] %s %s | alerts_suppressed (not in alert_pairs)", symbol, timeframe)
         logging.debug("Alerts suppressed for %s (not in alert_pairs)", symbol)
-        return
+        return len(new_candles)
 
     if timeframe == "30m":
         process_symbol_liq(symbol, db, alert_manager)
-        return
+        return len(new_candles)
+
+    if timeframe in ("5m", "5min"):
+        if symbol == "XAUUSD":
+            _process_xauusd_5m(symbol, new_candles, db, alert_manager)
+        return len(new_candles)
 
     if timeframe != "15m":
-        return  # only 15m BOS signals
+        return len(new_candles)
 
     # Session gate: BOS alerts are only reliable during London + NY (07:00–21:00 UTC).
     # Asian-session breakouts have lower liquidity and high false-break rates.
     _bar_hour = datetime.fromtimestamp(new_candles[-1]["timestamp"], tz=timezone.utc).hour
     if not (7 <= _bar_hour < 21):
         _dlog.info("[BOS] %s 15m | OUTSIDE_SESSION (hour=%d UTC) | skip", symbol, _bar_hour)
-        return
+        return len(new_candles)
 
     # Load gold params for this symbol/strategy to filter signals
     gold_map = db.get_gold_params("BOS15m", symbol)
@@ -256,6 +354,28 @@ def process_symbol_timeframe(
     current_price = new_candles[-1]["close"] if new_candles else None
     for alert in alerts:
         alert["current_price"] = current_price
+        # Insert monitor first — INSERT OR IGNORE returns False if already registered.
+        # This is the dedup gate: if the same BOS breakout already fired, skip re-sending.
+        try:
+            ev = alert["event"]
+            inserted = db.insert_monitor(
+                alert_id=alert["alert_id"],
+                symbol=symbol,
+                direction=ev.get("direction", "bullish"),
+                entry=alert["entry"],
+                sl=alert["sl"],
+                tp=alert["tp"],
+                breakout_ts=ev.get("breakout_ts", 0),
+            )
+        except Exception:
+            logging.exception("Failed to insert trade monitor for %s", alert.get("alert_id"))
+            inserted = False
+
+        if not inserted:
+            _dlog.info("[BOS] DEDUP | %s 15m | id=%s already fired — skipped",
+                       symbol, alert.get("alert_id", "?"))
+            continue
+
         text = alert_manager.format_production_alert(alert)
         _dlog.info("[BOS] ALERT | %s 15m | dir=%s entry=%.5f sl=%.5f tp=%.5f curr=%.5f | id=%s",
                    symbol, alert.get("event", {}).get("direction", "?"),
@@ -267,20 +387,6 @@ def process_symbol_timeframe(
             "image_path": alert.get("image_path"),
             "alert_id":   alert.get("alert_id", ""),
         })
-        # register for post-entry momentum monitoring (Task B)
-        try:
-            ev = alert["event"]
-            db.insert_monitor(
-                alert_id=alert["alert_id"],
-                symbol=symbol,
-                direction=ev.get("direction", "bullish"),
-                entry=alert["entry"],
-                sl=alert["sl"],
-                tp=alert["tp"],
-                breakout_ts=ev.get("breakout_ts", 0),
-            )
-        except Exception:
-            logging.exception("Failed to insert trade monitor for %s", alert.get("alert_id"))
 
     return len(new_candles)
 
@@ -498,9 +604,6 @@ def momentum_monitor_job(db: LocalDB, alert_manager: AlertManager) -> None:
         if sl_hit and not m["notified_close"]:
             _dlog.info("[MONITOR] SL_HIT | %s %s | entry=%.5f sl=%.5f | id=%s",
                        symbol, direction, entry, sl, m["alert_id"])
-            alert_manager.send_alert(
-                f"🔴 SL HIT: {symbol} {direction.upper()} | entry {entry:.5f} → SL {sl:.5f} | {m['alert_id']}"
-            )
             db.update_monitor(m["alert_id"], status="sl_hit", notified_close=1)
             closed += 1
             continue
@@ -553,11 +656,14 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
 
     # Decide what to fetch this minute
     if timeframes:
-        # Scheduled tick: fetch all pairs + reset stale tracking for these timeframes
-        pairs_to_fetch = [(sym, tf) for sym in ordered for tf in timeframes]
-        for sym in ordered:
-            for tf in timeframes:
-                _stale_retry.pop((sym, tf), None)
+        # Scheduled tick: fetch all pairs + reset stale tracking for these timeframes.
+        # 5m is fetched only for XAUUSD (budget constraint — 168 calls/day vs 1176 for all pairs).
+        pairs_to_fetch = [
+            (sym, tf) for sym in ordered for tf in timeframes
+            if not (tf in ("5m", "5min") and sym != "XAUUSD")
+        ]
+        for sym, tf in pairs_to_fetch:
+            _stale_retry.pop((sym, tf), None)
         mode = "SCHEDULED"
     elif _stale_retry:
         # Non-scheduled tick: retry only stale pairs (zero extra API cost for fresh pairs)
