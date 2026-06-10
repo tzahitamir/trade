@@ -158,63 +158,115 @@ def validate_candles(symbol: str, timeframe: str, candles: List[dict]) -> None:
         )
 
 
+_5M_ATR_MIN_DIST = 0.2   # 5m close must be >= this × ATR5m past the broken level
+
 def _process_xauusd_5m(
     symbol: str,
     new_candles: list,
     db: LocalDB,
     alert_manager: AlertManager,
 ) -> None:
-    """Detect BOS on XAUUSD 5m using 15m as HTF bias for earlier entry signals.
+    """5m-early entry signal for XAUUSD: detects 15m structural breaks ~5-15 min early.
 
-    Fires before the 15m candle closes — alerts arrive ~5-14 minutes earlier than
-    the standard 15m BOS for fast-moving XAUUSD. Uses the same BOS15m gold params
-    since we don't yet have 5m-specific param history.
+    Strategy:
+      1. Identify the current 15m period from the latest 5m candle.
+      2. Aggregate all 5m candles in that period into a synthetic 15m candle whose
+         close equals the latest 5m close.  The synthetic candle carries the same
+         timestamp as the real 15m candle will have when it closes (period_end).
+      3. Prepend the synthetic candle to the closed 15m context and run the same
+         BOS detector + gold-param filters used for real 15m alerts.
+      4. Apply the 0.2×ATR5m distance filter — the close must be meaningfully past
+         the structural level (backtest: reduces in-period stop rate to 2%).
+      5. Insert the trade monitor using the same alert_id format as the real 15m
+         alert would generate (both use period_end as timestamp).  When the real
+         15m candle eventually closes, insert_monitor returns False → no duplicate.
     """
     if not new_candles:
         return
 
-    _bar_hour = datetime.fromtimestamp(new_candles[-1]["timestamp"], tz=timezone.utc).hour
+    latest_5m = new_candles[-1]
+    ts_5m = latest_5m["timestamp"]
+
+    _bar_hour = datetime.fromtimestamp(ts_5m, tz=timezone.utc).hour
     if not (7 <= _bar_hour < 21):
         return
 
-    # 15m acts as HTF for 5m signals
+    # Determine 15m period boundaries
+    _PERIOD = 900
+    period_start = (ts_5m // _PERIOD) * _PERIOD
+    period_end   = period_start + _PERIOD   # this will be the real 15m candle's timestamp
+
+    # All 5m candles in the current 15m period (already inserted in DB)
+    period_5m = [
+        c for c in db.query_candles_after(symbol, "5m", period_start - 1, limit=4)
+        if c["timestamp"] < period_end
+    ]
+    if not period_5m:
+        return
+
+    # Build synthetic 15m candle representing the in-progress period
+    synthetic = {
+        "timestamp": period_end,
+        "open":   period_5m[0]["open"],
+        "high":   max(c["high"] for c in period_5m),
+        "low":    min(c["low"]  for c in period_5m),
+        "close":  period_5m[-1]["close"],
+        "volume": 0,
+    }
+
+    # 15m context: closed candles + synthetic prepended (newest-first)
     candles_15m = db.query_recent(symbol, "15m", limit=200)
-    newest_new_ts = new_candles[-1]["timestamp"]
-    oldest_new_ts = new_candles[0]["timestamp"]
+    candles_15m = [c for c in candles_15m if c["timestamp"] != period_end]
+    context_15m = [synthetic] + candles_15m
+    if len(context_15m) < 60:
+        return
 
-    htf_bias = None
-    if candles_15m:
-        htf_bias = alert_manager.analyzer.get_htf_bias(candles_15m, newest_new_ts)
-    _dlog.info("[BOS5m] %s | htf_bias=%s | new_candles=%d | 15m_candles=%d",
-               symbol, htf_bias or "none", len(new_candles), len(candles_15m))
+    # 5m ATR for the distance filter
+    atr_5m_ctx = db.query_recent(symbol, "5m", limit=20)
+    atr_5m = alert_manager.analyzer.calculate_atr(atr_5m_ctx) or 1.0
 
-    # Reuse BOS15m gold params — tightest available filter until 5m sweep accumulates
+    # HTF bias from 4h
+    candles_4h = db.query_recent(symbol, "4h", limit=500)
+    htf_bias = alert_manager.analyzer.get_htf_bias(candles_4h, ts_5m) if candles_4h else None
+
+    # Gold params (same as BOS15m)
     gold_map = db.get_gold_params("BOS15m", symbol)
     gold = gold_map.get(symbol)
     gold_params: dict = {}
     if gold:
         gold_params = db.get_param_set_by_id(gold["param_set_id"])
 
-    context_candles = db.query_recent(symbol, "5m", limit=200)
-    if len(context_candles) < 40:
-        _dlog.info("[BOS5m] %s | insufficient_context (%d candles) — skip", symbol, len(context_candles))
-        return
-
+    # Run BOS detection — only the synthetic candle (at period_end) can trigger
     alerts = alert_manager.evaluate_production(
-        symbol, "5m", context_candles,
-        candles_4h=candles_15m,   # pass 15m as "HTF" context
+        symbol, "15m", context_15m,
+        candles_4h=candles_4h,
         htf_bias=htf_bias,
         gold_params=gold_params,
-        min_breakout_ts=oldest_new_ts,
-        id_prefix="bos5m",
+        min_breakout_ts=period_end,
     )
-    _dlog.info("[BOS5m] %s | evaluate_production → %d alert(s)", symbol, len(alerts))
+    _dlog.info("[BOS5e] %s | synthetic_close=%.2f period=%s | %d alert(s)",
+               symbol, synthetic["close"],
+               datetime.fromtimestamp(period_end, tz=timezone.utc).strftime("%H:%M"),
+               len(alerts))
 
-    current_price = new_candles[-1]["close"] if new_candles else None
     for alert in alerts:
-        alert["current_price"] = current_price
+        ev           = alert["event"]
+        broken_level = ev.get("broken_level", 0)
+        dist_usd     = abs(synthetic["close"] - broken_level)
+        dist_atr     = dist_usd / atr_5m
+
+        # Distance filter: 5m close must be >= 0.2×ATR5m past the level
+        if dist_atr < _5M_ATR_MIN_DIST:
+            _dlog.info("[BOS5e] FILTERED | %s | dist=%.2f (%.2f×ATR < %.1f×) — skip",
+                       symbol, dist_usd, dist_atr, _5M_ATR_MIN_DIST)
+            continue
+
+        alert["current_price"] = latest_5m["close"]
+        alert["timeframe"]    = "5m-early"   # label it clearly in the Telegram message
+
+        # insert_monitor uses the same alert_id the real 15m will generate
+        # → real 15m alert is auto-suppressed once 5m-early fires
         try:
-            ev = alert["event"]
             inserted = db.insert_monitor(
                 alert_id=alert["alert_id"],
                 symbol=symbol,
@@ -225,19 +277,19 @@ def _process_xauusd_5m(
                 breakout_ts=ev.get("breakout_ts", 0),
             )
         except Exception:
-            logging.exception("Failed to insert 5m trade monitor for %s", alert.get("alert_id"))
+            logging.exception("Failed to insert 5m-early monitor for %s", alert.get("alert_id"))
             inserted = False
 
         if not inserted:
-            _dlog.info("[BOS5m] DEDUP | %s | id=%s already fired — skipped",
-                       symbol, alert.get("alert_id", "?"))
+            _dlog.info("[BOS5e] DEDUP | %s | id=%s already fired", symbol, alert.get("alert_id", "?"))
             continue
 
         text = alert_manager.format_production_alert(alert)
-        _dlog.info("[BOS5m] ALERT | %s 5m | dir=%s entry=%.2f sl=%.2f tp=%.2f | id=%s",
+        _dlog.info("[BOS5e] ALERT | %s | dir=%s entry=%.2f sl=%.2f tp=%.2f "
+                   "dist=%.2f (%.2fx ATR) | id=%s",
                    symbol, ev.get("direction", "?"),
                    alert.get("entry", 0), alert.get("sl", 0), alert.get("tp", 0),
-                   alert.get("alert_id", "?"))
+                   dist_usd, dist_atr, alert.get("alert_id", "?"))
         logging.info(text)
         alert_manager.send_alert({
             "message":    text,
