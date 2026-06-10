@@ -1291,13 +1291,19 @@ def _run_param_sweep(raw_signals: list, db: LocalDB,
         if gold:
             delta_wr = s["win_rate"] - gold["win_rate"]
             delta_ev = ev_var - gold["ev_1_2"]
-            gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV]"
             if update_gold:
                 db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_var, s["resolved"])
-                gold_note += " ← GOLD UPDATED"
+                gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV] ← GOLD UPDATED"
+            elif best_pid != gold["param_set_id"]:
+                gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV] ⚡ SUGGESTED"
+            else:
+                gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV] ✓ unchanged"
         else:
-            db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_var, s["resolved"])
-            gold_note = " ← GOLD SET"
+            if update_gold:
+                db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_var, s["resolved"])
+                gold_note = " ← GOLD SET"
+            else:
+                gold_note = " ⚡ SUGGESTED (no gold yet — run --update-gold to apply)"
         logging.info("  %-10s  v%-3d %-25s  WR: %5.1f%%  avgR: %.2f  Trades: %d  EV: %+.3fR%s",
                      sym, best_pid, _pset_label(best_pset), s["win_rate"] * 100, avg_r,
                      s["resolved"], ev_var, gold_note)
@@ -1312,11 +1318,14 @@ def _send_sweep_summary(
     all_symbols: list,
     pset_ids: list,
     param_sets: list = None,
+    strategy: str = "BOS15m",
 ) -> None:
     """Send a concise Telegram summary of the sweep results."""
     if param_sets is None:
         param_sets = PARAM_SWEEP_SETS
     try:
+        gold_map = alert_manager.db.get_gold_params(strategy) if hasattr(alert_manager, "db") else {}
+
         pset_ev = []
         for pid, pset in zip(pset_ids, param_sets):
             ov = all_pair_stats.get((pid, "ALL"), {})
@@ -1328,7 +1337,7 @@ def _send_sweep_summary(
         pset_ev.sort(key=lambda x: x[2], reverse=True)
 
         lines = [
-            f"BOS Param Sweep — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+            f"📊 BOS Param Sweep — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
             f"Signals: {len(raw_signals):,}  Sets: {len(param_sets)}",
             "",
             "Top 5 by EV:",
@@ -1337,6 +1346,7 @@ def _send_sweep_summary(
             lines.append(f"  {i}. v{pid} {_pset_label(pset)}: WR={wr*100:.1f}% EV={ev:+.3f}R (n={n})")
 
         lines += ["", "Best per pair (>=20 trades):"]
+        suggestions = []
         for sym in all_symbols:
             candidates = [
                 (pid, pset) for pid, pset in zip(pset_ids, param_sets)
@@ -1347,7 +1357,29 @@ def _send_sweep_summary(
                 continue
             best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)].get("ev_variable_r", 0))
             s = all_pair_stats[(best_pid, sym)]
-            lines.append(f"  {sym}: {_pset_label(best_pset)} WR={s['win_rate']*100:.1f}% (n={s['resolved']})")
+            gold = gold_map.get(sym)
+            if gold and best_pid != gold["param_set_id"]:
+                delta_wr = (s["win_rate"] - gold["win_rate"]) * 100
+                delta_ev = s.get("ev_variable_r", 0) - gold["ev_1_2"]
+                change_tag = " ⚡"
+                suggestions.append(
+                    f"  {sym}: v{best_pid} {_pset_label(best_pset)} "
+                    f"({delta_wr:+.1f}pp WR  {delta_ev:+.3f}R EV)"
+                )
+            else:
+                change_tag = ""
+            lines.append(f"  {sym}: {_pset_label(best_pset)} WR={s['win_rate']*100:.1f}% (n={s['resolved']}){change_tag}")
+
+        if suggestions:
+            lines += [
+                "",
+                "⚡ Suggested gold param changes:",
+            ] + suggestions + [
+                "",
+                "To apply: cd src && python -m main --experiment-bos --update-gold",
+            ]
+        else:
+            lines.append("\n✅ All gold params unchanged — no action needed.")
 
         alert_manager.notifier.send_message("\n".join(lines))
         logging.info("Sweep summary sent to Telegram")
@@ -1852,13 +1884,19 @@ def _run_fvg_param_sweep(raw_signals: list, db: LocalDB,
         if gold:
             delta_wr = s["win_rate"] - gold["win_rate"]
             delta_ev = ev_12 - gold["ev_1_2"]
-            gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV]"
             if update_gold:
                 db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_12, s["resolved"])
-                gold_note += " ← GOLD UPDATED"
+                gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV] ← GOLD UPDATED"
+            elif best_pid != gold["param_set_id"]:
+                gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV] ⚡ SUGGESTED"
+            else:
+                gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV] ✓ unchanged"
         else:
-            db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_12, s["resolved"])
-            gold_note = " ← GOLD SET"
+            if update_gold:
+                db.upsert_gold_params(strategy, sym, best_pid, s["win_rate"], ev_12, s["resolved"])
+                gold_note = " ← GOLD SET"
+            else:
+                gold_note = " ⚡ SUGGESTED (no gold yet — run --update-gold to apply)"
         logging.info("  %-10s  v%-3d %-31s  WR: %5.1f%%  Trades: %d  EV 1:2: %+.3fR%s",
                      sym, best_pid, _fvg_pset_label(best_pset), s["win_rate"] * 100, s["resolved"],
                      ev_12, gold_note)
@@ -3328,7 +3366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--update-gold",
         action="store_true",
-        help="Force-update gold params with results from this scan (default: auto-set only if none exist)",
+        help="Apply the best param set found in this scan as the new gold params (manual approval step — never runs automatically)",
     )
     parser.add_argument(
         "--scan-days",
