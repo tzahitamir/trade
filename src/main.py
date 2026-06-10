@@ -840,6 +840,8 @@ _SWEEP_BASE = {
     "exclude_weekend": False,  # True = skip Sat/Sun signals
     "dead_hours_utc": [],      # e.g. [18,19,20,21] to skip late-NY wind-down
     "max_break_strength": None, # None = no cap; 2.0 to exclude exhaustion candles
+    "exclude_london_open": False, # True = skip 08:00-08:15 UTC (London open first 2 bars)
+    "exclude_ny_open": False,     # True = skip 13:30-13:45 UTC (NY open first 2 bars)
 }
 
 PARAM_SWEEP_SETS = [
@@ -919,6 +921,19 @@ PARAM_SWEEP_SETS = [
     # ── Tier 16: all loss-reduction filters combined + sweep-required (XAUUSD) ─
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True,  "htf_aligned_only": True, "max_confluences": 3, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level"},
     {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True,  "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level"},
+    # ── Tier 17: open-window exclusion (London 08:00-08:15 / NY 13:30-13:45) ──
+    # Standalone open filters
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "exclude_london_open": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "exclude_ny_open": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "exclude_london_open": True, "exclude_ny_open": True},
+    # Combined with full gold stack (htf+mx2+nowe+nodh+mxs2+bl)
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level", "exclude_london_open": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level", "exclude_ny_open": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": False, "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level", "exclude_london_open": True, "exclude_ny_open": True},
+    # With sweep required (XAUUSD)
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True,  "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level", "exclude_london_open": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True,  "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level", "exclude_ny_open": True},
+    {**_SWEEP_BASE, "min_break_strength": 0.7,  "require_brt_confluence": False, "require_liquidity_sweep": True,  "htf_aligned_only": True, "max_confluences": 2, "exclude_weekend": True, "dead_hours_utc": [18, 19, 20, 21], "max_break_strength": 2.0, "sl_mode": "broken_level", "exclude_london_open": True, "exclude_ny_open": True},
 ]
 
 # Symbols for which gold params must come from sweep-required param sets only.
@@ -998,6 +1013,8 @@ def _apply_param_filter(raw_signals: list, params: dict) -> list:
     excl_weekend       = params.get("exclude_weekend", False)
     dead_hours         = set(params.get("dead_hours_utc", []))
     max_str_cap        = params.get("max_break_strength")  # None = no cap
+    excl_london_open   = params.get("exclude_london_open", False)
+    excl_ny_open       = params.get("exclude_ny_open", False)
 
     result = []
     for r in raw_signals:
@@ -1037,6 +1054,14 @@ def _apply_param_filter(raw_signals: list, params: dict) -> list:
             continue
         if dead_hours and r.get("hour") in dead_hours:
             continue
+        if excl_london_open:
+            _ts = r.get("breakout_ts", 0)
+            if r.get("hour") == 8 and (_ts % 3600) < 1800:  # 08:00 or 08:15 UTC
+                continue
+        if excl_ny_open:
+            _ts = r.get("breakout_ts", 0)
+            if r.get("hour") == 13 and (_ts % 3600) >= 1800:  # 13:30 or 13:45 UTC
+                continue
         result.append({**r, "confluences": confs})
     return result
 
@@ -1078,6 +1103,10 @@ def _pset_label(pset: dict) -> str:
     ms = pset.get("max_break_strength")
     if ms is not None:
         parts.append(f"mxs{ms:.0f}")
+    if pset.get("exclude_london_open"):
+        parts.append("nolo")
+    if pset.get("exclude_ny_open"):
+        parts.append("nony")
     slm = pset.get("sl_mode", "swing")
     if slm != "swing":
         parts.append("bl" if slm == "broken_level" else "bc")

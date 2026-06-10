@@ -100,11 +100,13 @@ class AlertManager:
         from analysis.confluence_detector import detect_confluences, find_trigger_candle
 
         gp = gold_params or {}
-        min_str      = gp.get("min_break_strength", 0.7)
-        req_brt      = gp.get("require_brt_confluence", False)
-        htf_only     = gp.get("htf_aligned_only", False)
-        sl_mode      = gp.get("sl_mode", "swing")
-        req_liq      = gp.get("require_liquidity_sweep", False)
+        min_str          = gp.get("min_break_strength", 0.7)
+        req_brt          = gp.get("require_brt_confluence", False)
+        htf_only         = gp.get("htf_aligned_only", False)
+        sl_mode          = gp.get("sl_mode", "swing")
+        req_liq          = gp.get("require_liquidity_sweep", False)
+        excl_london_open = gp.get("exclude_london_open", False)
+        excl_ny_open     = gp.get("exclude_ny_open", False)
 
         alerts: List[Dict] = []
         detect_params = {"symbol": symbol, "timeframe": timeframe, "min_break_strength": 0.0,
@@ -131,6 +133,12 @@ class AlertManager:
                 continue
             if htf_only and htf_bias not in ("bullish" if ev["direction"] == "bullish" else ("bearish",)):
                 if htf_bias != ("bullish" if ev["direction"] == "bullish" else "bearish"):
+                    continue
+            if excl_london_open or excl_ny_open:
+                _ev_dt = datetime.fromtimestamp(ev.get("breakout_ts", 0), tz=timezone.utc)
+                if excl_london_open and _ev_dt.hour == 8 and _ev_dt.minute < 30:
+                    continue
+                if excl_ny_open and _ev_dt.hour == 13 and _ev_dt.minute >= 30:
                     continue
 
             confluences = detect_confluences(ev, [], pre_bos_chron, candles_4h, atr)
