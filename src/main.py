@@ -1748,15 +1748,187 @@ def run_decay_check(db: LocalDB, alert_manager: AlertManager,
     logging.info("Decay check:\n%s", msg)
     if alert_manager.notifier:
         alert_manager.notifier.send_message(msg)
+    return live
+
+
+def _build_weekly_markdown(
+    report_dt: "datetime",
+    raw_signals: list,
+    all_pair_stats: dict,
+    all_symbols: list,
+    pset_ids: list,
+    param_sets: list,
+    gold_map: dict,
+    live_stats: dict,
+    decay_threshold: float = 0.15,
+) -> str:
+    week_str   = report_dt.strftime("%Y-%m-%d")
+    next_week  = (report_dt + __import__("datetime").timedelta(days=7)).strftime("%Y-%m-%d")
+
+    lines = [
+        f"# Weekly Report — {week_str}",
+        "",
+        f"> Generated automatically on {report_dt.strftime('%Y-%m-%d %H:%M UTC')}  ",
+        f"> Signals scanned: {len(raw_signals):,}  |  Param sets: {len(param_sets)}",
+        "",
+        "---",
+        "",
+        "## Current Gold Params",
+        "",
+        "| Pair | Param Set | WR | EV (var-R) | Trades |",
+        "|------|-----------|----|------------|--------|",
+    ]
+    for sym in sorted(gold_map):
+        g = gold_map[sym]
+        pset = db_pset = None
+        try:
+            from db.local_db import LocalDB as _LDB  # already imported at module level
+        except Exception:
+            pass
+        lbl = f"v{g['param_set_id']}"
+        lines.append(f"| {sym} | {lbl} | {g['win_rate']*100:.1f}% | {g['ev_1_2']:+.3f}R | {g.get('resolved','?')} |")
+
+    # Sweep suggestions
+    suggestions = []
+    for sym in all_symbols:
+        candidates = [
+            (pid, pset) for pid, pset in zip(pset_ids, param_sets)
+            if all_pair_stats.get((pid, sym), {}).get("resolved", 0) >= 20
+        ]
+        if not candidates:
+            continue
+        best_pid, best_pset = max(candidates, key=lambda x: all_pair_stats[(x[0], sym)].get("ev_variable_r", 0))
+        s = all_pair_stats[(best_pid, sym)]
+        gold = gold_map.get(sym)
+        if gold and best_pid != gold["param_set_id"]:
+            delta_wr = (s["win_rate"] - gold["win_rate"]) * 100
+            delta_ev = s.get("ev_variable_r", 0) - gold["ev_1_2"]
+            suggestions.append((sym, best_pid, best_pset, s, delta_wr, delta_ev))
+
+    lines += [
+        "",
+        "## Param Sweep — Suggested Changes",
+        "",
+    ]
+    if suggestions:
+        lines += [
+            "| Pair | Suggested Set | Δ WR | Δ EV | New WR | Trades |",
+            "|------|---------------|------|------|--------|--------|",
+        ]
+        for sym, best_pid, best_pset, s, delta_wr, delta_ev in suggestions:
+            lbl = _pset_label(best_pset)
+            lines.append(
+                f"| {sym} | v{best_pid} `{lbl}` | {delta_wr:+.1f}pp | {delta_ev:+.3f}R"
+                f" | {s['win_rate']*100:.1f}% | {s['resolved']} |"
+            )
+        lines += [
+            "",
+            "**To apply:**",
+            "```",
+            "cd /home/tzahi/repo/trade/src && python -m main --experiment-bos --update-gold",
+            "```",
+        ]
+    else:
+        lines.append("_No changes suggested — all gold params are optimal._")
+
+    # Decay check
+    lines += [
+        "",
+        "## Live Decay Check",
+        "",
+        "| Pair | Live WR | Gold WR | Δ | Status |",
+        "|------|---------|---------|---|--------|",
+    ]
+    if live_stats:
+        for sym in sorted(live_stats):
+            w = live_stats[sym].get("tp_hit", 0)
+            l = live_stats[sym].get("sl_hit", 0)
+            n = w + l
+            if n < 5:
+                lines.append(f"| {sym} | — | — | — | n={n} (too few) |")
+                continue
+            live_wr = w / n
+            gold = gold_map.get(sym)
+            gold_wr = gold["win_rate"] if gold else None
+            if gold_wr is None:
+                lines.append(f"| {sym} | {live_wr*100:.1f}% | — | — | no baseline |")
+                continue
+            delta = live_wr - gold_wr
+            flag = "🔴 DEGRADED" if delta <= -decay_threshold else ("🟡 watch" if delta <= -decay_threshold/2 else "🟢 ok")
+            lines.append(f"| {sym} | {live_wr*100:.1f}% | {gold_wr*100:.1f}% | {delta*100:+.1f}pp | {flag} |")
+    else:
+        lines.append("| — | — | — | — | No closed live trades yet |")
+
+    # Outcome section for manual fill-in
+    lines += [
+        "",
+        "---",
+        "",
+        f"## Outcome — Week of {next_week}",
+        "",
+        "_Fill in after the week plays out. Compare against suggestions above._",
+        "",
+        "| Pair | Direction | Entry | Result | Notes |",
+        "|------|-----------|-------|--------|-------|",
+    ]
+    for sym in all_symbols:
+        lines.append(f"| {sym} | | | | |")
+
+    lines += [
+        "",
+        "**Were the suggestions correct?** _(delete as applicable)_",
+        "",
+        "- [ ] Applied suggested gold param changes",
+        "- [ ] Rejected suggestions — reason: _____",
+        "- [ ] No changes needed",
+    ]
+
+    return "\n".join(lines) + "\n"
 
 
 def run_weekly_report(settings: "Settings", db: LocalDB,
                       alert_manager: AlertManager) -> None:
-    """Full weekly job: rescan BOS experiment (no gold update) + decay check."""
+    """Full weekly job: rescan BOS experiment (no gold update) + decay check + save markdown report."""
+    import subprocess
+    from pathlib import Path as _Path
+
     logging.info("=== Weekly report: running full BOS experiment (no gold update) ===")
-    run_bos_experiment(settings, db, alert_manager, update_gold=False)
+    result = run_bos_experiment(settings, db, alert_manager, update_gold=False)
     logging.info("=== Weekly report: running decay check ===")
-    run_decay_check(db, alert_manager)
+    live_stats = run_decay_check(db, alert_manager) or {}
+
+    if result is None:
+        logging.warning("Weekly report: no sweep data returned — skipping markdown save")
+        return
+
+    all_pair_stats, all_symbols, pset_ids, raw_signals, param_sets = result
+    gold_map = db.get_gold_params("BOS15m")
+    report_dt = datetime.now(timezone.utc)
+
+    md = _build_weekly_markdown(
+        report_dt, raw_signals, all_pair_stats, all_symbols,
+        pset_ids, param_sets, gold_map, live_stats,
+    )
+
+    repo_root = _Path(__file__).parents[1]
+    reports_dir = repo_root / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    report_path = reports_dir / f"weekly_{report_dt.strftime('%Y-%m-%d')}.md"
+    report_path.write_text(md, encoding="utf-8")
+    logging.info("Weekly report saved: %s", report_path)
+
+    # Auto-commit the report file into the repo
+    try:
+        subprocess.run(["git", "-C", str(repo_root), "add", str(report_path)], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-m",
+             f"Weekly report {report_dt.strftime('%Y-%m-%d')}: sweep findings + suggestions"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", str(repo_root), "push"], check=True)
+        logging.info("Weekly report committed and pushed.")
+    except subprocess.CalledProcessError as exc:
+        logging.warning("Weekly report git commit failed: %s", exc)
 
 
 # ──────────────────────────── FVG DOJI STRATEGY ────────────────────────────
@@ -3075,7 +3247,8 @@ def run_bos_experiment(
         all_raw_signals, db, strategy=strategy, update_gold=update_gold,
         param_sets=sweep_sets)
     _send_sweep_summary(alert_manager, all_raw_signals, all_pair_stats, all_symbols, pset_ids,
-                        param_sets=sweep_sets)
+                        param_sets=sweep_sets, strategy=strategy)
+    return all_pair_stats, all_symbols, pset_ids, all_raw_signals, sweep_sets
 
 
 def scheduler_heartbeat_job() -> None:
