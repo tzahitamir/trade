@@ -251,7 +251,11 @@ def process_symbol_timeframe(
                    alert.get("entry", 0), alert.get("sl", 0), alert.get("tp", 0),
                    alert.get("alert_id", "?"))
         logging.info(text)
-        alert_manager.send_alert(text)
+        alert_manager.send_alert({
+            "message":    text,
+            "image_path": alert.get("image_path"),
+            "alert_id":   alert.get("alert_id", ""),
+        })
         # register for post-entry momentum monitoring (Task B)
         try:
             ev = alert["event"]

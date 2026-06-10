@@ -216,10 +216,17 @@ class AlertManager:
         tp = entry + swing_risk * 2 if bullish else entry - swing_risk * 2
         return sl, tp, entry, swing_risk
 
+    @staticmethod
+    def _fmt_symbol(symbol: str) -> str:
+        """EURUSD → EUR/USD, XAUUSD → XAU/USD"""
+        return f"{symbol[:3]}/{symbol[3:]}" if len(symbol) == 6 else symbol
+
     def _format_production_message(self, alert: Dict) -> str:
         ev        = alert["event"]
-        direction = ev.get("direction", "").upper()
+        direction = ev.get("direction", "bullish")
+        bullish   = direction == "bullish"
         symbol    = alert["symbol"]
+        timeframe = alert.get("timeframe", "15m")
         htf       = alert.get("htf_bias", "")
         confs     = alert.get("confluences") or []
         sl_mode   = alert.get("sl_mode", "swing")
@@ -228,18 +235,24 @@ class AlertManager:
         tp        = alert.get("tp")
         r         = alert.get("r_ratio")
 
-        bias_str  = f" | 4H {htf.upper()}" if htf and htf != "neutral" else ""
+        action    = "BUY" if bullish else "SELL"
+        emoji     = "🟢" if bullish else "🔴"
+        sym_fmt   = self._fmt_symbol(symbol)
+
+        bias_str  = f" | 4H: {htf.upper()}" if htf and htf != "neutral" else ""
         conf_str  = f" | {','.join(confs)}" if confs else ""
-        sl_str    = f" | SL:{sl:.5f} ({sl_mode})" if sl else ""
-        tp_str    = f" | TP:{tp:.5f}" if tp else ""
-        r_str     = f" | R:{r}" if r else ""
+        sl_str    = f" | SL: {sl:.5f}" if sl else ""
+        tp_str    = f" | TP: {tp:.5f}" if tp else ""
+        r_str     = f" | R: 1:{r}" if r else ""
         wr_str    = ""
         gold = self.db.get_gold_params("BOS15m", symbol).get(symbol)
         if gold:
-            wr_str = f" | WR:{gold['win_rate']*100:.0f}%"
-        ts_str = datetime.fromtimestamp(ev.get("breakout_ts", 0), tz=timezone.utc).strftime("%H:%M %d-%b")
-        return (f"BOS {direction} {symbol} @ {entry:.5f}{sl_str}{tp_str}{r_str}"
-                f"{bias_str}{conf_str}{wr_str} [{ts_str}]")
+            wr_str = f" | WR: {gold['win_rate']*100:.0f}%"
+        ts_str = datetime.fromtimestamp(ev.get("breakout_ts", 0), tz=timezone.utc).strftime("%H:%M %d-%b UTC")
+        return (
+            f"{emoji} {action} alert on {sym_fmt} {timeframe}\n"
+            f"@ {entry:.5f}{sl_str}{tp_str}{r_str}{bias_str}{conf_str}{wr_str} [{ts_str}]"
+        )
 
     def format_production_alert(self, alert: Dict) -> str:
         return self._format_production_message(alert)
