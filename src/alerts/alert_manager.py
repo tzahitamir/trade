@@ -157,6 +157,7 @@ class AlertManager:
                 fig_path, _ = self._render_bos_chart(
                     candles, ev, alert_id, None, htf_bias,
                     confluences=confluences, output_dir=self.prod_charts_dir,
+                    entry_price=entry, sl_price=sl, tp_price=tp,
                 )
             except Exception:
                 fig_path = None
@@ -249,9 +250,21 @@ class AlertManager:
         if gold:
             wr_str = f" | WR: {gold['win_rate']*100:.0f}%"
         ts_str = datetime.fromtimestamp(ev.get("breakout_ts", 0), tz=timezone.utc).strftime("%H:%M %d-%b UTC")
+
+        # Staleness indicator: show how far current price is from entry
+        stale_str = ""
+        current_price = alert.get("current_price")
+        if current_price is not None and entry:
+            dist = current_price - entry
+            dist_str = f"{dist:+.2f}" if symbol == "XAUUSD" else f"{dist:+.5f}"
+            if abs(dist) > abs(entry - sl) * 0.5:
+                stale_str = f"\n⚠️ Price now {current_price:.5f} ({dist_str} from entry)"
+            else:
+                stale_str = f"\nCurrent: {current_price:.5f} ({dist_str})"
+
         return (
             f"{emoji} {action} alert on {sym_fmt} {timeframe}\n"
-            f"@ {entry:.5f}{sl_str}{tp_str}{r_str}{bias_str}{conf_str}{wr_str} [{ts_str}]"
+            f"@ {entry:.5f}{sl_str}{tp_str}{r_str}{bias_str}{conf_str}{wr_str} [{ts_str}]{stale_str}"
         )
 
     def format_production_alert(self, alert: Dict) -> str:
@@ -452,6 +465,9 @@ class AlertManager:
         gold_wr: Optional[float] = None,
         output_dir=None,
         outcome_override: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
     ) -> tuple:
         """
         Render BOS candlestick chart and save to data/charts/{alert_id}.png.
@@ -550,31 +566,34 @@ class AlertManager:
                     arrowprops={**arrow_props, "color": "green"},
                 )
 
-        # SL / TP / outcome
+        # SL / TP / Entry — use caller-supplied values when available (keeps chart
+        # consistent with the Telegram message which uses gold sl_mode).
         from analysis.smc_analyzer import SMCAnalyzer as _SA
         _atr = _SA.calculate_atr(candles) or (price_range * 0.05)
         _swings = _SA._find_last_swing(candles, lookback=3, search_back=20)
         sweep = ev.get("liquidity_sweep") or {}
 
-        if bullish:
-            sl_anchor = sweep.get("wick_low") or _swings.get("swing_low") or min(b["low"] for b in c[-10:])
-            sl = sl_anchor - _atr * 0.3
-        else:
-            sl_anchor = sweep.get("wick_high") or _swings.get("swing_high") or max(b["high"] for b in c[-10:])
-            sl = sl_anchor + _atr * 0.3
-
-        # Entry from trigger candle; fall back to BOS close
-        entry = c[-1]["close"]
         trigger_x_chart = len(c) - 1
-        if trigger_ts and c_ahead:
-            for _i, _b in enumerate(c_ahead):
-                if _b["timestamp"] == trigger_ts:
-                    entry = _b["close"]
-                    trigger_x_chart = len(c) + _i
-                    break
-
-        risk = abs(entry - sl) or _atr
-        tp = (entry + risk * 2) if bullish else (entry - risk * 2)
+        if entry_price is not None and sl_price is not None and tp_price is not None:
+            entry, sl, tp = entry_price, sl_price, tp_price
+            sl_anchor = sl  # for the subtle purple dotted line
+        else:
+            if bullish:
+                sl_anchor = sweep.get("wick_low") or _swings.get("swing_low") or min(b["low"] for b in c[-10:])
+                sl = sl_anchor - _atr * 0.3
+            else:
+                sl_anchor = sweep.get("wick_high") or _swings.get("swing_high") or max(b["high"] for b in c[-10:])
+                sl = sl_anchor + _atr * 0.3
+            # Entry from trigger candle; fall back to BOS close
+            entry = c[-1]["close"]
+            if trigger_ts and c_ahead:
+                for _i, _b in enumerate(c_ahead):
+                    if _b["timestamp"] == trigger_ts:
+                        entry = _b["close"]
+                        trigger_x_chart = len(c) + _i
+                        break
+            risk = abs(entry - sl) or _atr
+            tp = (entry + risk * 2) if bullish else (entry - risk * 2)
 
         # Extend ylim to include SL and TP with comfortable padding
         new_lo = min(ax.get_ylim()[0], sl - _atr * 0.8)

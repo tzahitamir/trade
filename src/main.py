@@ -244,12 +244,14 @@ def process_symbol_timeframe(
     _dlog.info("[BOS] %s 15m | evaluate_production → %d alert(s) in new window",
                symbol, len(alerts))
 
+    current_price = new_candles[-1]["close"] if new_candles else None
     for alert in alerts:
+        alert["current_price"] = current_price
         text = alert_manager.format_production_alert(alert)
-        _dlog.info("[BOS] ALERT | %s 15m | dir=%s entry=%.5f sl=%.5f tp=%.5f | id=%s",
+        _dlog.info("[BOS] ALERT | %s 15m | dir=%s entry=%.5f sl=%.5f tp=%.5f curr=%.5f | id=%s",
                    symbol, alert.get("event", {}).get("direction", "?"),
                    alert.get("entry", 0), alert.get("sl", 0), alert.get("tp", 0),
-                   alert.get("alert_id", "?"))
+                   current_price or 0, alert.get("alert_id", "?"))
         logging.info(text)
         alert_manager.send_alert({
             "message":    text,
