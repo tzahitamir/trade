@@ -52,6 +52,14 @@ FETCH_PRIORITY = ["NZDUSD", "EURJPY", "EURUSD", "USDCHF", "USDCAD", "XAUUSD", "U
 # Key: (symbol, timeframe), Value: retry attempt number (1, 2, 3 …)
 _stale_retry: dict = {}
 _STALE_MAX_RETRIES = 4  # give up after 4 extra attempts (~4 min total from candle close)
+
+# Pairs with 5m-early BOS detection and their active UTC session windows.
+# XAUUSD runs full session; FX pairs restricted to London+early-NY to stay within budget.
+_5M_PAIRS_SESSION: dict = {
+    "XAUUSD": (7, 21),   # 07:00–21:00 UTC  (14h × 12 = 168 calls/day)
+    "NZDUSD": (8, 15),   # 08:00–15:00 UTC  ( 7h × 12 =  84 calls/day)
+    "EURUSD": (8, 15),   # 08:00–15:00 UTC  ( 7h × 12 =  84 calls/day)
+}
 TIMEFRAME_INTERVAL_MINUTES = {
     "5m": 5,
     "5min": 5,
@@ -71,16 +79,17 @@ TIMEFRAME_INTERVAL_MINUTES = {
 
 def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
     """
-    Fetch schedule — 15m, 30m (NY window), 4h, and 5m (XAUUSD only, filtered in fetch_job).
+    Fetch schedule — 15m, 30m (NY window), 4h, and 5m (_5M_PAIRS_SESSION, filtered in fetch_job).
     Covers active FX trading hours; skips Sat/Sun.
     Budget is enforced separately in fetch_job via the API daily counter.
 
     Daily estimate on a full weekday (7 pairs):
-      15m: 4/hr × 17h (05-22 UTC) × 7 = 476 calls
+      15m: 4/hr × 14h (07-21 UTC) × 7 = 392 calls
       4h:  6/day × 7                   =  42 calls
-      30m: 2/hr × 4h (12-16 UTC) × 7  =  56 calls
-      5m:  12/hr × 14h (07-21) × 1    = 168 calls  (XAUUSD only)
-      Total ≈ 742/day  (under 800 free-tier limit)
+      30m: 2/hr × 4h (12-16 UTC) × 1  =   8 calls  (EURUSD LIQ only — fetch_job filter)
+      5m:  12/hr × 14h (07-21) × 1    = 168 calls  (XAUUSD)
+           12/hr × 7h  (08-15) × 2    = 168 calls  (NZDUSD + EURUSD)
+      Total ≈ 778/day  (under 800 free-tier limit)
     """
     timeframe = timeframe.lower()
     minute  = now.minute
@@ -90,10 +99,10 @@ def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
         return False
 
     if timeframe in {"15m", "15min"}:
-        # Session-gated: 05:00–22:00 UTC (saves ~196 calls vs 24h, frees budget for 5m)
-        return 5 <= now.hour < 22 and minute % 15 == 1
+        # Session-gated: 07:00–21:00 UTC (14h covers London + NY; trims thin Asian hours)
+        return 7 <= now.hour < 21 and minute % 15 == 1
     if timeframe in {"5m", "5min"}:
-        # Only XAUUSD — filtered in fetch_job to avoid fetching all pairs
+        # Broadest window — per-pair session gates enforced in fetch_job via _5M_PAIRS_SESSION
         return 7 <= now.hour < 21 and minute % 5 == 1
     if timeframe in {"4h", "h4"}:  # once per 4-hour bar close
         return minute == 0 and now.hour % 4 == 0
@@ -160,15 +169,15 @@ def validate_candles(symbol: str, timeframe: str, candles: List[dict]) -> None:
 
 _5M_ATR_MIN_DIST = 0.2   # 5m close must be >= this × ATR5m past the broken level
 
-def _process_xauusd_5m(
+def _process_symbol_5m(
     symbol: str,
     new_candles: list,
     db: LocalDB,
     alert_manager: AlertManager,
 ) -> None:
-    """5m-early entry signal for XAUUSD: detects 15m structural breaks ~5-15 min early.
+    """5m-early entry signal: detects 15m structural breaks ~5-15 min early.
 
-    Strategy:
+    Works for any pair in _5M_PAIRS_SESSION. Strategy:
       1. Identify the current 15m period from the latest 5m candle.
       2. Aggregate all 5m candles in that period into a synthetic 15m candle whose
          close equals the latest 5m close.  The synthetic candle carries the same
@@ -176,7 +185,7 @@ def _process_xauusd_5m(
       3. Prepend the synthetic candle to the closed 15m context and run the same
          BOS detector + gold-param filters used for real 15m alerts.
       4. Apply the 0.2×ATR5m distance filter — the close must be meaningfully past
-         the structural level (backtest: reduces in-period stop rate to 2%).
+         the structural level (backtest: NZDUSD 0%, EURUSD 1%, XAUUSD 2% stop rate).
       5. Insert the trade monitor using the same alert_id format as the real 15m
          alert would generate (both use period_end as timestamp).  When the real
          15m candle eventually closes, insert_monitor returns False → no duplicate.
@@ -188,7 +197,8 @@ def _process_xauusd_5m(
     ts_5m = latest_5m["timestamp"]
 
     _bar_hour = datetime.fromtimestamp(ts_5m, tz=timezone.utc).hour
-    if not (7 <= _bar_hour < 21):
+    start_h, end_h = _5M_PAIRS_SESSION.get(symbol, (7, 21))
+    if not (start_h <= _bar_hour < end_h):
         return
 
     # Determine 15m period boundaries
@@ -344,8 +354,8 @@ def process_symbol_timeframe(
         return len(new_candles)
 
     if timeframe in ("5m", "5min"):
-        if symbol == "XAUUSD":
-            _process_xauusd_5m(symbol, new_candles, db, alert_manager)
+        if symbol in _5M_PAIRS_SESSION:
+            _process_symbol_5m(symbol, new_candles, db, alert_manager)
         return len(new_candles)
 
     if timeframe != "15m":
@@ -709,10 +719,15 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
     # Decide what to fetch this minute
     if timeframes:
         # Scheduled tick: fetch all pairs + reset stale tracking for these timeframes.
-        # 5m is fetched only for XAUUSD (budget constraint — 168 calls/day vs 1176 for all pairs).
+        # 5m: only pairs in _5M_PAIRS_SESSION within their session window (budget control).
+        # 30m: only _LIQ_LIVE_PAIRS — others have no LIQ sweep alert consumer (saves 48 calls/day).
         pairs_to_fetch = [
             (sym, tf) for sym in ordered for tf in timeframes
-            if not (tf in ("5m", "5min") and sym != "XAUUSD")
+            if not (tf in ("5m", "5min") and (
+                sym not in _5M_PAIRS_SESSION or
+                not (_5M_PAIRS_SESSION[sym][0] <= now.hour < _5M_PAIRS_SESSION[sym][1])
+            ))
+            and not (tf in ("30m", "30min") and sym not in _LIQ_LIVE_PAIRS)
         ]
         for sym, tf in pairs_to_fetch:
             _stale_retry.pop((sym, tf), None)
