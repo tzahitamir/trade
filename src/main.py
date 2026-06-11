@@ -54,11 +54,14 @@ _stale_retry: dict = {}
 _STALE_MAX_RETRIES = 4  # give up after 4 extra attempts (~4 min total from candle close)
 
 # Pairs with 5m-early BOS detection and their active UTC session windows.
-# XAUUSD runs full session; FX pairs restricted to London+early-NY to stay within budget.
+# XAUUSD runs full session; FX pairs run London+NY-open only (08:00-14:00 UTC) for budget.
+# Budget: 5 pairs × 15m(7-21) + XAUUSD 5m(7-21) + 4 FX 5m(8-14) ≈ 774/day < 800 limit.
 _5M_PAIRS_SESSION: dict = {
     "XAUUSD": (7, 21),   # 07:00–21:00 UTC  (14h × 12 = 168 calls/day)
-    "NZDUSD": (8, 15),   # 08:00–15:00 UTC  ( 7h × 12 =  84 calls/day)
-    "EURUSD": (8, 15),   # 08:00–15:00 UTC  ( 7h × 12 =  84 calls/day)
+    "NZDUSD": (8, 14),   # 08:00–14:00 UTC  ( 6h × 12 =  72 calls/day)
+    "EURUSD": (8, 14),   # 08:00–14:00 UTC  ( 6h × 12 =  72 calls/day)
+    "USDCHF": (8, 14),   # 08:00–14:00 UTC  ( 6h × 12 =  72 calls/day)
+    "EURJPY": (8, 14),   # 08:00–14:00 UTC  ( 6h × 12 =  72 calls/day)
 }
 TIMEFRAME_INTERVAL_MINUTES = {
     "5m": 5,

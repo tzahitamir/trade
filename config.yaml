@@ -1,21 +1,18 @@
 fx_pairs:
-  - NZDUSD   # WR 68.8%  EV +3.447R  n=48
-  - EURJPY   # WR 59.0%  EV +2.678R  n=78
-  - EURUSD   # WR 62.7%  EV +2.487R  n=75
-  - USDCHF   # WR 58.8%  EV +2.374R  n=80
-  - USDCAD   # WR 61.1%  EV +2.148R  n=54
-  - XAUUSD   # WR 58.6%  EV +1.854R  n=58  — liquidity sweep mandatory
-  - USDJPY   # WR 64.7%  EV +2.429R  n=51  — data fetched; excluded from alerts
+  - NZDUSD   # WR 68.8%  EV +3.447R  n=49  — 5m-early: 0% in-period stop
+  - EURJPY   # WR 59.0%  EV +2.678R  n=87  — 5m-early: 3% in-period stop, 11.9p avg impr
+  - EURUSD   # WR 62.7%  EV +2.487R  n=85  — 5m-early: 1% in-period stop, 7.3p avg impr
+  - USDCHF   # WR 58.8%  EV +2.374R  n=59  — 5m-early: 2% in-period stop
+  - XAUUSD   # WR 58.6%  EV +1.854R  n=58  — 5m-early: 2% in-period stop; liq sweep req
+  # USDCAD removed: lowest EV (2.148), limited 5m data (18 days)
+  # USDJPY removed: 14% in-period stop rate on 5m — not viable for early entry
 
-# Pairs that generate live Telegram alerts. Subset of fx_pairs.
-# GBPJPY (WR 52.4%) and EURGBP (WR 48.4%) removed to stay within 800 API calls/day.
-# USDJPY excluded from alerts (no live gold params active).
+# All fx_pairs receive live Telegram alerts (all are now on 5m-early).
 alert_pairs:
   - NZDUSD
   - EURJPY
   - EURUSD
   - USDCHF
-  - USDCAD
   - XAUUSD
 
 timeframes:
