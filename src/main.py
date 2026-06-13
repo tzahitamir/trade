@@ -172,6 +172,52 @@ def validate_candles(symbol: str, timeframe: str, candles: List[dict]) -> None:
 
 _5M_ATR_MIN_DIST = 0.2   # 5m close must be >= this × ATR5m past the broken level
 
+
+def _5m_candle_quality_pass(
+    symbol: str,
+    b1: float,   # C1 body size in ATR units
+    b2: float,   # C2 body size in ATR units
+    a1: bool,    # C1 body aligned with BOS direction
+    a2: bool,    # C2 body aligned with BOS direction
+) -> tuple[bool, str]:
+    """Per-symbol 5m candle quality filter derived from 13-month backtest.
+
+    Returns (pass, reason).  False = block the signal.
+
+    Filters (all at ≥95% statistical confidence, n ≥ 400 per pair):
+      XAUUSD : require C2 body in [0.3, 1.5) × ATR.
+               Blocks spike-then-stall (C2 < 0.3) and C2 exhaustion (C2 ≥ 1.5).
+               WR 36.3 → 41.5 % keeping 53 % of signals.
+
+      EURUSD / EURJPY : block medium-momentum C1 or C2 body (0.7–1.5 × ATR)
+                        and the counter→aligned pattern (C1 counter, C2 aligned).
+                        WR 34.1 → 41.1 % (EURUSD, 46 % kept)
+                            34.1 → 38.6 % (EURJPY, 53 % kept).
+
+      USDCHF : keep only aligned→aligned (both C1 and C2 body in BOS direction).
+               WR 34.7 → 39.2 % keeping 30 % of signals.
+
+      NZDUSD : no filter — no statistically significant improvement found.
+    """
+    if symbol == "XAUUSD":
+        if not (0.3 <= b2 < 1.5):
+            return False, f"C2 body {b2:.2f}×ATR outside [0.3, 1.5)"
+
+    elif symbol in ("EURUSD", "EURJPY"):
+        if 0.7 <= b1 < 1.5:
+            return False, f"C1 body {b1:.2f}×ATR in medium zone [0.7, 1.5)"
+        if 0.7 <= b2 < 1.5:
+            return False, f"C2 body {b2:.2f}×ATR in medium zone [0.7, 1.5)"
+        if not a1 and a2:  # counter→aligned
+            return False, "counter→aligned pattern (C1 counter, C2 aligned)"
+
+    elif symbol == "USDCHF":
+        if not (a1 and a2):
+            return False, f"not aligned→aligned (C1={'aligned' if a1 else 'counter'}, C2={'aligned' if a2 else 'counter'})"
+
+    return True, ""
+
+
 def _process_symbol_5m(
     symbol: str,
     new_candles: list,
@@ -189,6 +235,8 @@ def _process_symbol_5m(
          BOS detector + gold-param filters used for real 15m alerts.
       4. Apply the 0.2×ATR5m distance filter — the close must be meaningfully past
          the structural level (backtest: NZDUSD 0%, EURUSD 1%, XAUUSD 2% stop rate).
+      5. Only fire on the 3rd (last) 5m candle of the period — requires all 3
+         candles present, ensuring ≤5 min lead time (not 13 min from candle #1).
       5. Insert the trade monitor using the same alert_id format as the real 15m
          alert would generate (both use period_end as timestamp).  When the real
          15m candle eventually closes, insert_monitor returns False → no duplicate.
@@ -215,6 +263,13 @@ def _process_symbol_5m(
         if c["timestamp"] < period_end
     ]
     if not period_5m:
+        return
+
+    # Option A: only fire on the last 5m candle of the period.
+    # Twelve Data returns in-progress bars, so candle #1 can arrive with 13+ min
+    # left in the 15m window.  Requiring all 3 candles ensures we're ≤5 min early.
+    if len(period_5m) < 3:
+        _dlog.info("[BOS5e] SKIP %s — %d/3 5m candles in period (too early)", symbol, len(period_5m))
         return
 
     # Build synthetic 15m candle representing the in-progress period
@@ -272,6 +327,18 @@ def _process_symbol_5m(
         if dist_atr < _5M_ATR_MIN_DIST:
             _dlog.info("[BOS5e] FILTERED | %s | dist=%.2f (%.2f×ATR < %.1f×) — skip",
                        symbol, dist_usd, dist_atr, _5M_ATR_MIN_DIST)
+            continue
+
+        # Per-pair candle quality filter (backtest-derived, ≥95% confidence)
+        sig_dir = ev.get("direction", "bullish")
+        c1, c2  = period_5m[0], period_5m[1]
+        b1 = abs(c1["close"] - c1["open"]) / atr_5m
+        b2 = abs(c2["close"] - c2["open"]) / atr_5m
+        a1 = (c1["close"] > c1["open"]) if sig_dir == "bullish" else (c1["close"] < c1["open"])
+        a2 = (c2["close"] > c2["open"]) if sig_dir == "bullish" else (c2["close"] < c2["open"])
+        ok, reason = _5m_candle_quality_pass(symbol, b1, b2, a1, a2)
+        if not ok:
+            _dlog.info("[BOS5e] FILTERED | %s | quality: %s", symbol, reason)
             continue
 
         alert["current_price"] = latest_5m["close"]
@@ -2304,10 +2371,18 @@ except Exception:
 
 
 def _dax_session_window(trade_date) -> tuple:
-    """Return (start_ts_utc, end_ts_utc) for 09:00-12:30 Israel time on trade_date."""
+    """Return (start_ts_utc, end_ts_utc) for DAX Frankfurt open: 09:00-12:30 Israel time."""
     from datetime import datetime as _dt
     start = _dt(trade_date.year, trade_date.month, trade_date.day, 9,  0,  tzinfo=_ISRAEL_TZ)
     end   = _dt(trade_date.year, trade_date.month, trade_date.day, 12, 30, tzinfo=_ISRAEL_TZ)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _us100_session_window(trade_date) -> tuple:
+    """Return (start_ts_utc, end_ts_utc) for US100 NY open: 14:30-17:30 Israel time (09:30-12:30 ET)."""
+    from datetime import datetime as _dt
+    start = _dt(trade_date.year, trade_date.month, trade_date.day, 14, 30, tzinfo=_ISRAEL_TZ)
+    end   = _dt(trade_date.year, trade_date.month, trade_date.day, 17, 30, tzinfo=_ISRAEL_TZ)
     return int(start.timestamp()), int(end.timestamp())
 
 
@@ -2315,7 +2390,7 @@ _dax_alerted_dates: set = set()
 
 
 def _format_dax_alert(sig: dict) -> str:
-    """Format a DAX counter-trend signal for Telegram."""
+    """Format a DAX session_start_expansion_retrace_pull_back_to_equilibrium signal for Telegram."""
     ct_dir   = sig["direction"].upper()        # direction of our trade
     exp_dir  = sig.get("expansion_dir", "").upper()  # direction of the expansion we fade
     entry    = sig["entry"]
@@ -2327,7 +2402,7 @@ def _format_dax_alert(sig: dict) -> str:
     ep_pct   = sig.get("entry_pct_from_origin", 0) * 100
     eq_str   = f"\nEQ: {eq:.0f}" if eq else ""
     return (
-        f"[DAX] COUNTER-TREND {ct_dir} (fades {exp_dir} expansion)\n"
+        f"[DAX] SERPE {ct_dir} (fades {exp_dir} expansion)\n"
         f"Entry: {entry:.0f}  SL: {sl:.0f}  TP: {tp:.0f}\n"
         f"R: 1:{r}  Entry zone: {ep_pct:.0f}% from origin{eq_str}"
     )
@@ -2369,7 +2444,7 @@ def dax_data_job(db: "LocalDB") -> None:
 
 
 def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertManager") -> None:
-    """Check for DAX counter-trend setup; runs every 5 min during Frankfurt session."""
+    """Check for DAX session_start_expansion_retrace_pull_back_to_equilibrium setup; runs every 5 min during Frankfurt session."""
     from datetime import date as _date
     from analysis.smc_analyzer import SMCAnalyzer
 
@@ -2536,6 +2611,13 @@ DAX_PARAM_SWEEP_SETS = [
     {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "entry_zone_min_pct": 0.7},
     {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "entry_zone_min_pct": 0.8},
     {**_DAX_SWEEP_BASE, "tp_pct": 0.6, "sl_atr_mult": 0.7, "entry_zone_min_pct": 0.7},
+    # ── Tier: tp0.55 — 45% retrace from peak (between EQ and tp0.6) ──────
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.55},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.55, "bearish_only": True},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.55, "exclude_dow": [0, 4]},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.55, "exclude_dow": [0, 4], "bearish_only": True},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.55, "exclude_dow": [0, 4], "bearish_only": True, "entry_zone_min_pct": 0.7},
+    {**_DAX_SWEEP_BASE, "tp_pct": 0.55, "exclude_dow": [0, 4], "bearish_only": True, "sl_atr_mult": 0.7},
     # ── Tier: day-of-week filter (Mon=0, Fri=4 excluded) ─────────────────
     {**_DAX_SWEEP_BASE, "exclude_dow": [0, 4]},
     {**_DAX_SWEEP_BASE, "exclude_dow": [0]},
@@ -2574,55 +2656,59 @@ def _dax_pset_label(pset: dict) -> str:
     return "+".join(parts)
 
 
-def run_dax_experiment(
+def run_serpe_experiment(
     settings: Settings,
     db: LocalDB,
     alert_manager: AlertManager,
+    symbol: str,
+    session_fn,
+    session_label: str,
     scan_days: int = 365,
     update_gold: bool = False,
 ) -> None:
-    """Scan DE40 for DAX Frankfurt open session setups; run param sweep."""
-    from datetime import timedelta, date as _date
+    """Generic SERPE (session_start_expansion_retrace_pull_back_to_equilibrium) experiment.
+
+    Works for any instrument + session window. symbol must exist in yahoo_fetcher SYMBOL_MAP.
+    session_fn(trade_date) -> (start_ts_utc, end_ts_utc)
+    session_label: human-readable window string for log output.
+    """
+    from datetime import timedelta
     from analysis.smc_analyzer import SMCAnalyzer
 
-    symbol = "DAX"
-    strategy = "DAX"
+    strategy  = symbol
     cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=scan_days)).timestamp())
 
-    logging.info("Scanning DAX session setups via Yahoo Finance (last %d days)", scan_days)
-    logging.info("Session window: 09:00-12:30 Israel time  |  Cutoff: %s UTC",
-                 datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"))
+    logging.info("Scanning %s SERPE setups via Yahoo Finance (last %d days)", symbol, scan_days)
+    logging.info("Session window: %s  |  Cutoff: %s UTC",
+                 session_label, datetime.fromtimestamp(cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d"))
 
-    # Fetch via Yahoo Finance and store in DB
     from data.yahoo_fetcher import fetch_yahoo
     for tf in ("15m", "5m"):
         existing = db.query_recent(symbol, tf, limit=1)
         if existing:
             age_hours = (datetime.now(timezone.utc).timestamp() - existing[0]["timestamp"]) / 3600
             if age_hours < 24:
-                logging.info("DAX %s: using cached data (%.0fh old)", tf, age_hours)
+                logging.info("%s %s: using cached data (%.0fh old)", symbol, tf, age_hours)
                 continue
-        logging.info("Fetching DAX %s from Yahoo Finance...", tf)
+        logging.info("Fetching %s %s from Yahoo Finance...", symbol, tf)
         try:
             candles = fetch_yahoo(symbol, tf, days=scan_days)
             db.insert_candles(symbol, tf, candles)
             logging.info("  → stored %d %s candles", len(candles), tf)
         except Exception as exc:
-            logging.error("Failed to fetch DAX %s from Yahoo: %s", tf, exc)
+            logging.error("Failed to fetch %s %s from Yahoo: %s", symbol, tf, exc)
 
     candles_15m_desc = db.query_recent(symbol, "15m", limit=_candle_limit("15m", days=scan_days))
     candles_5m_desc  = db.query_recent(symbol, "5m",  limit=_candle_limit("5m",  days=scan_days))
 
     if not candles_15m_desc or not candles_5m_desc:
-        logging.error("No DAX data in DB after fetch attempt.")
+        logging.error("No %s data in DB after fetch attempt.", symbol)
         return
 
-    # Convert to chronological (oldest→newest) and filter to scan period
     c15m = [c for c in reversed(candles_15m_desc) if c["timestamp"] >= cutoff_ts]
     c5m  = [c for c in reversed(candles_5m_desc)  if c["timestamp"] >= cutoff_ts]
     logging.info("Loaded %d 15m and %d 5m candles", len(c15m), len(c5m))
 
-    # Get unique trading dates
     trading_dates = sorted(set(
         datetime.fromtimestamp(c["timestamp"], tz=timezone.utc).date()
         for c in c15m
@@ -2633,12 +2719,11 @@ def run_dax_experiment(
     analyzer    = SMCAnalyzer()
     all_raw: list = []
 
-    # Pre-collect per-session data once; reused by base scan and all sweep iterations
     sessions_data: list = []
     for trade_date in trading_dates:
         if trade_date.weekday() >= 5:
             continue
-        start_ts, end_ts = _dax_session_window(trade_date)
+        start_ts, end_ts = session_fn(trade_date)
         lookahead_end    = end_ts + 6 * 3600
         sess_15m = [c for c in c15m if start_ts <= c["timestamp"] <= end_ts]
         day_5m   = [c for c in c5m  if start_ts <= c["timestamp"] <= lookahead_end]
@@ -2646,7 +2731,6 @@ def run_dax_experiment(
         if len(sess_15m) >= 3:
             sessions_data.append((start_ts, end_ts, sess_15m, day_5m, pre_15m))
 
-    # Base scan using _DAX_SWEEP_BASE params
     base_params = {**_DAX_SWEEP_BASE, "symbol": symbol}
     base_wins: list = []
     base_losses: int = 0
@@ -2663,7 +2747,8 @@ def run_dax_experiment(
             outcome, eff_r = _evaluate_dax_outcome(sig, post_entry_5m)
 
             bos_dt   = datetime.fromtimestamp(entry_ts, tz=timezone.utc)
-            alert_id = f"dax-{bos_dt.minute:02d}-{bos_dt.hour:02d}-{bos_dt.day:02d}-{bos_dt.month:02d}-{bos_dt.year}"
+            sym_tag  = symbol.lower()
+            alert_id = f"{sym_tag}-{bos_dt.minute:02d}-{bos_dt.hour:02d}-{bos_dt.day:02d}-{bos_dt.month:02d}-{bos_dt.year}"
 
             if outcome == "WIN":
                 base_wins.append(eff_r or 2.0)
@@ -2687,7 +2772,7 @@ def run_dax_experiment(
                 "month":                 bos_dt.strftime("%Y-%m"),
                 "has_liquidity_sweep":   0,
                 "swing_age_candles":     None,
-                "session":               "frankfurt",
+                "session":               session_label,
                 "dow":                   bos_dt.weekday(),
                 "strategy":              strategy,
                 "scan_run_id":           scan_run_id,
@@ -2700,45 +2785,42 @@ def run_dax_experiment(
                 "eff_r_break_candle":    None,
             })
 
-    logging.info("DAX raw signals: %d", len(all_raw))
+    logging.info("%s raw signals: %d", symbol, len(all_raw))
     if not all_raw:
-        logging.warning("No DAX counter-trend setups found — check session window or expansion params")
+        logging.warning("No %s SERPE setups found — check session window or expansion params", symbol)
         return
 
     try:
         db.insert_raw_signals(scan_run_id, all_raw)
     except Exception as exc:
-        logging.warning("Failed to store DAX raw signals: %s", exc)
+        logging.warning("Failed to store %s raw signals: %s", symbol, exc)
 
-    # Base stats using actual variable-R
-    b_res = len(base_wins) + base_losses
-    b_wr  = len(base_wins) / b_res if b_res else 0
+    b_res   = len(base_wins) + base_losses
+    b_wr    = len(base_wins) / b_res if b_res else 0
     b_avg_r = sum(base_wins) / len(base_wins) if base_wins else 2.0
-    b_ev  = round(b_avg_r * b_wr - 1.0 * (1 - b_wr), 4) if b_res else -1.0
+    b_ev    = round(b_avg_r * b_wr - 1.0 * (1 - b_wr), 4) if b_res else -1.0
     logging.info("")
-    logging.info("=== DAX Raw Scan Stats (base params) ===")
+    logging.info("=== %s Raw Scan Stats (base params) ===", symbol)
     logging.info("  Total: %d  Resolved: %d  WR: %.1f%%  avgR: %.2f  EV: %+.3fR",
                  len(all_raw), b_res, b_wr * 100, b_avg_r, b_ev)
     logging.info("  Wins: %d  Losses: %d  Open: %d", len(base_wins), base_losses, base_opens)
 
-    # Param sweep — re-run detector for each pset to get correct SL/TP/outcome
     logging.info("")
-    logging.info("=== DAX Param Sweep (%d sets) ===", len(DAX_PARAM_SWEEP_SETS))
+    logging.info("=== %s Param Sweep (%d sets) ===", symbol, len(DAX_PARAM_SWEEP_SETS))
     logging.info("  %-35s  %5s  %5s  %5s  %5s", "Params", "WR%", "avgR", "EV", "n")
     logging.info("  " + "-" * 60)
 
     all_pset_stats: dict = {}
-    pset_ids_dax: list = []
+    pset_ids: list = []
     gold_map = db.get_gold_params(strategy)
 
     for pset in DAX_PARAM_SWEEP_SETS:
         pset_id = db.get_or_create_param_set(pset)
-        pset_ids_dax.append(pset_id)
+        pset_ids.append(pset_id)
 
-        pset_params = {**pset, "symbol": symbol}
+        pset_params  = {**pset, "symbol": symbol}
         p_wins: list = []; p_losses = 0; p_opens = 0
-
-        excl_dow    = set(pset.get("exclude_dow", []))
+        excl_dow     = set(pset.get("exclude_dow", []))
         bearish_only = pset.get("bearish_only", False)
 
         for start_ts, end_ts, sess_15m, day_5m, pre_15m in sessions_data:
@@ -2773,21 +2855,18 @@ def run_dax_experiment(
         }
         all_pset_stats[pset_id] = s
         db.insert_scan_stats(pset_id, symbol, s["total"], s["wins"], s["losses"], s["open"], json.dumps(s))
-
         logging.info("  v%-3d %-31s  %4.1f%%  %4.2f  %+.3fR  n=%d",
                      pset_id, _dax_pset_label(pset), p_wr * 100, p_avg_r, p_ev, p_res)
 
-    # Best param set
-    best_pid = max(pset_ids_dax,
-                   key=lambda pid: all_pset_stats[pid].get("ev_variable_r", -999))
-    best_pset = DAX_PARAM_SWEEP_SETS[pset_ids_dax.index(best_pid)]
-    bs = all_pset_stats[best_pid]
-    ev_best = bs.get("ev_variable_r", 0)
-    gold = gold_map.get(symbol)
+    best_pid  = max(pset_ids, key=lambda pid: all_pset_stats[pid].get("ev_variable_r", -999))
+    best_pset = DAX_PARAM_SWEEP_SETS[pset_ids.index(best_pid)]
+    bs        = all_pset_stats[best_pid]
+    ev_best   = bs.get("ev_variable_r", 0)
+    gold      = gold_map.get(symbol)
 
     if gold:
-        delta_wr = bs["win_rate"] - gold["win_rate"]
-        delta_ev = ev_best - gold["ev_1_2"]
+        delta_wr  = bs["win_rate"] - gold["win_rate"]
+        delta_ev  = ev_best - gold["ev_1_2"]
         gold_note = f"  [Δgold: {delta_wr*100:+.1f}pp WR  {delta_ev:+.3f}R EV]"
         if update_gold:
             db.upsert_gold_params(strategy, symbol, best_pid, bs["win_rate"], ev_best, bs["resolved"])
@@ -2797,13 +2876,12 @@ def run_dax_experiment(
         gold_note = " ← GOLD SET"
 
     logging.info("")
-    logging.info("Best DAX params: v%-3d %-31s  WR: %.1f%%  avgR: %.2f  Trades: %d  EV: %+.3fR%s",
-                 best_pid, _dax_pset_label(best_pset),
+    logging.info("Best %s params: v%-3d %-31s  WR: %.1f%%  avgR: %.2f  Trades: %d  EV: %+.3fR%s",
+                 symbol, best_pid, _dax_pset_label(best_pset),
                  bs["win_rate"] * 100, bs.get("avg_r_win", 2.0), bs["resolved"], ev_best, gold_note)
 
-    # Render charts for all signals under gold (best) params
     logging.info("")
-    logging.info("Rendering DAX charts with gold params (v%d)...", best_pid)
+    logging.info("Rendering %s charts with gold params (v%d)...", symbol, best_pid)
     gold_params_chart = {**best_pset, "symbol": symbol}
     chart_count = 0
     for start_ts, end_ts, sess_15m, day_5m, pre_15m in sessions_data:
@@ -2818,8 +2896,416 @@ def run_dax_experiment(
                 alert_manager.render_dax_alert(sig, day_5m, outcome=outcome)
                 chart_count += 1
             except Exception as exc:
-                logging.warning("DAX chart render failed: %s", exc)
-    logging.info("DAX charts saved: %d  →  %s", chart_count, str(alert_manager.charts_dir))
+                logging.warning("%s chart render failed: %s", symbol, exc)
+    logging.info("%s charts saved: %d  →  %s", symbol, chart_count, str(alert_manager.charts_dir))
+
+
+def run_serpe_post_eq_analysis(
+    db: LocalDB,
+    symbol: str,
+    session_fn,
+    scan_days: int = 59,
+) -> None:
+    """Analyse post-EQ price behaviour for SERPE WIN trades.
+
+    For each WIN trade (TP/EQ hit):
+    1. Find the exact 5m candle where EQ was first touched.
+    2. Scan the next 2 h of 5m candles.
+    3. Classify: reversal (price continues past EQ toward origin) /
+                 bounce   (price returns toward expansion peak)   /
+                 range    (neither conclusive).
+    4. Report breakdown + correlation with expansion strength.
+    """
+    from datetime import timedelta
+
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=scan_days)).timestamp())
+
+    # ── Load WIN raw signals for this symbol ──────────────────────────────
+    import sqlite3 as _sqlite3
+    with db._get_conn() as conn:
+        conn.row_factory = _sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT breakout_ts, direction, broken_level AS eq_level,
+                   fvg_size_atr AS expansion_range, hour, dow
+            FROM raw_signals
+            WHERE symbol = ? AND outcome = 'WIN' AND breakout_ts >= ?
+              AND strategy = ?
+            ORDER BY breakout_ts
+            """,
+            (symbol, cutoff_ts, symbol),
+        ).fetchall()
+        conn.row_factory = None
+
+    if not rows:
+        logging.warning("No WIN signals found for %s — run --experiment-%s first",
+                        symbol, symbol.lower())
+        return
+
+    logging.info("Post-EQ analysis for %s: %d WIN trades", symbol, len(rows))
+
+    # ── Load 5m candles once ───────────────────────────────────────────────
+    c5m_all = list(reversed(
+        db.query_recent(symbol, "5m", limit=_candle_limit("5m", days=scan_days))
+    ))  # now oldest→newest
+
+    results = []
+    for row in rows:
+        entry_ts     = row["breakout_ts"]
+        direction    = row["direction"]        # counter-trade direction
+        eq_level     = row["eq_level"]
+        exp_range    = row["expansion_range"]
+        half_range   = exp_range / 2.0
+
+        # Reconstruct origin and peak from eq_level + half_range
+        # direction=="bearish" → SHORT trade → expansion was bullish (origin below eq, peak above)
+        # direction=="bullish" → LONG  trade → expansion was bearish (origin above eq, peak below)
+        if direction == "bearish":
+            origin = eq_level - half_range
+            peak   = eq_level + half_range
+        else:
+            origin = eq_level + half_range
+            peak   = eq_level - half_range
+
+        dist_to_origin = abs(eq_level - origin)   # = half_range
+
+        # Candles after entry
+        post_entry = [c for c in c5m_all if c["timestamp"] > entry_ts]
+        if not post_entry:
+            continue
+
+        # Step 1 — find when EQ was first hit
+        eq_hit_idx = None
+        for i, c in enumerate(post_entry):
+            if direction == "bearish":   # price needs to drop to/below eq
+                if c["low"] <= eq_level:
+                    eq_hit_idx = i
+                    break
+            else:                        # price needs to rise to/above eq
+                if c["high"] >= eq_level:
+                    eq_hit_idx = i
+                    break
+
+        if eq_hit_idx is None:
+            continue  # EQ never actually reached (shouldn't happen for WIN)
+
+        eq_hit_ts = post_entry[eq_hit_idx]["timestamp"]
+
+        # Step 2 — 2h window after EQ hit
+        post_eq = [c for c in post_entry[eq_hit_idx + 1:]
+                   if c["timestamp"] <= eq_hit_ts + 2 * 3600]
+        if not post_eq:
+            results.append({"label": "range", "exp_range": exp_range,
+                            "direction": direction, "hour": row["hour"],
+                            "ext_pct": 0.0, "bounce_pct": 0.0})
+            continue
+
+        # Step 3 — measure max extension past EQ and max bounce back toward peak
+        if direction == "bearish":
+            # We're SHORT: further down = reversal, up = bounce
+            max_ext_price    = min(c["low"]  for c in post_eq)
+            max_bounce_price = max(c["high"] for c in post_eq)
+            ext_pts    = max(0.0, eq_level - max_ext_price)    # how far below EQ
+            bounce_pts = max(0.0, max_bounce_price - eq_level) # how far above EQ
+        else:
+            # We're LONG: further up = reversal, down = bounce
+            max_ext_price    = max(c["high"] for c in post_eq)
+            max_bounce_price = min(c["low"]  for c in post_eq)
+            ext_pts    = max(0.0, max_ext_price - eq_level)    # how far above EQ
+            bounce_pts = max(0.0, eq_level - max_bounce_price) # how far below EQ
+
+        # Express as fraction of half_range (1.0 = reached origin, 2.0 = blew past origin)
+        ext_pct    = ext_pts    / dist_to_origin if dist_to_origin else 0.0
+        bounce_pct = bounce_pts / dist_to_origin if dist_to_origin else 0.0
+
+        # Classify: >50% of remaining range = decisive
+        if ext_pct >= 0.5:
+            label = "reversal"
+        elif bounce_pct >= 0.5:
+            label = "bounce"
+        else:
+            label = "range"
+
+        results.append({
+            "label":      label,
+            "exp_range":  exp_range,
+            "direction":  direction,
+            "hour":       row["hour"],
+            "ext_pct":    round(ext_pct, 2),
+            "bounce_pct": round(bounce_pct, 2),
+        })
+
+    if not results:
+        logging.warning("Could not compute post-EQ data for any WIN trade.")
+        return
+
+    n = len(results)
+    reversals = [r for r in results if r["label"] == "reversal"]
+    bounces   = [r for r in results if r["label"] == "bounce"]
+    ranges    = [r for r in results if r["label"] == "range"]
+
+    logging.info("")
+    logging.info("══════ %s SERPE Post-EQ Outcome (n=%d WIN trades) ══════", symbol, n)
+    logging.info("  reversal  (price continued past EQ toward origin): %d  (%.0f%%)",
+                 len(reversals), 100 * len(reversals) / n)
+    logging.info("  bounce    (price returned toward expansion peak):   %d  (%.0f%%)",
+                 len(bounces),   100 * len(bounces)   / n)
+    logging.info("  range     (neither decisive):                       %d  (%.0f%%)",
+                 len(ranges),    100 * len(ranges)    / n)
+
+    # ── By expansion direction ─────────────────────────────────────────────
+    logging.info("")
+    logging.info("── By counter-trade direction ──")
+    for dir_ in ("bearish", "bullish"):
+        sub = [r for r in results if r["direction"] == dir_]
+        if not sub:
+            continue
+        rev = sum(1 for r in sub if r["label"] == "reversal")
+        bnc = sum(1 for r in sub if r["label"] == "bounce")
+        rng = sum(1 for r in sub if r["label"] == "range")
+        exp_label = "bullish expansion" if dir_ == "bearish" else "bearish expansion"
+        logging.info("  %s (fade %s): n=%d  rev=%d(%.0f%%)  bounce=%d(%.0f%%)  range=%d(%.0f%%)",
+                     dir_, exp_label, len(sub),
+                     rev, 100*rev/len(sub), bnc, 100*bnc/len(sub), rng, 100*rng/len(sub))
+
+    # ── By expansion strength (quartiles) ─────────────────────────────────
+    if len(results) >= 4:
+        exp_vals = sorted(r["exp_range"] for r in results)
+        q1 = exp_vals[len(exp_vals) // 4]
+        q3 = exp_vals[3 * len(exp_vals) // 4]
+        logging.info("")
+        logging.info("── By expansion strength (exp_range quartiles: Q1=%.0f Q3=%.0f) ──", q1, q3)
+        for label_s, sub in [
+            (f"weak  (range < {q1:.0f})",   [r for r in results if r["exp_range"] <  q1]),
+            (f"medium ({q1:.0f}–{q3:.0f})", [r for r in results if q1 <= r["exp_range"] < q3]),
+            (f"strong (range ≥ {q3:.0f})",  [r for r in results if r["exp_range"] >= q3]),
+        ]:
+            if not sub:
+                continue
+            rev = sum(1 for r in sub if r["label"] == "reversal")
+            bnc = sum(1 for r in sub if r["label"] == "bounce")
+            avg_ext = sum(r["ext_pct"] for r in sub) / len(sub)
+            logging.info("  %-30s n=%d  rev=%.0f%%  bounce=%.0f%%  avg_ext=%.2fx half-range",
+                         label_s, len(sub),
+                         100*rev/len(sub), 100*bnc/len(sub), avg_ext)
+
+    # ── Avg extension depth ────────────────────────────────────────────────
+    avg_ext_all    = sum(r["ext_pct"]    for r in results) / n
+    avg_bounce_all = sum(r["bounce_pct"] for r in results) / n
+    logging.info("")
+    logging.info("── Average post-EQ depth (as fraction of half-range) ──")
+    logging.info("  avg extension past EQ toward origin: %.2fx  (%.0f%% of half-range)",
+                 avg_ext_all, avg_ext_all * 100)
+    logging.info("  avg bounce back toward peak:         %.2fx  (%.0f%% of half-range)",
+                 avg_bounce_all, avg_bounce_all * 100)
+    logging.info("")
+    logging.info("  → 1.0x = reached origin/peak; >1.0x = exceeded it")
+
+
+def run_serpe_full_retrace_analysis(
+    db: LocalDB,
+    symbol: str,
+    session_fn,
+    scan_days: int = 59,
+    med_range_lo: float = 201.0,
+    med_range_hi: float = 461.0,
+) -> None:
+    """For medium-strength SERPE expansions, test TP at origin (full retrace) vs EQ.
+
+    Keeps the same entry price and SL as the base detector.
+    Re-evaluates each signal three ways:
+      - TP at EQ       (tp_pct=0.50, current strategy)
+      - TP at 75% ret  (tp_pct=0.25, halfway between EQ and origin)
+      - TP at origin   (tp_pct=0.00, full retrace)
+    Reports WR, avgR, EV for each, plus how many actually reached origin.
+    """
+    from datetime import timedelta
+    from analysis.smc_analyzer import SMCAnalyzer
+
+    cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=scan_days)).timestamp())
+
+    # ── Load candles ───────────────────────────────────────────────────────
+    from data.yahoo_fetcher import fetch_yahoo
+    for tf in ("15m", "5m"):
+        existing = db.query_recent(symbol, tf, limit=1)
+        if existing:
+            age_hours = (datetime.now(timezone.utc).timestamp() - existing[0]["timestamp"]) / 3600
+            if age_hours < 24:
+                continue
+        try:
+            candles = fetch_yahoo(symbol, tf, days=scan_days)
+            db.insert_candles(symbol, tf, candles)
+        except Exception as exc:
+            logging.error("Failed to fetch %s %s: %s", symbol, tf, exc)
+
+    candles_15m_desc = db.query_recent(symbol, "15m", limit=_candle_limit("15m", days=scan_days))
+    candles_5m_desc  = db.query_recent(symbol, "5m",  limit=_candle_limit("5m",  days=scan_days))
+    if not candles_15m_desc or not candles_5m_desc:
+        logging.error("No %s data in DB.", symbol)
+        return
+
+    c15m = [c for c in reversed(candles_15m_desc) if c["timestamp"] >= cutoff_ts]
+    c5m  = [c for c in reversed(candles_5m_desc)  if c["timestamp"] >= cutoff_ts]
+
+    trading_dates = sorted(set(
+        datetime.fromtimestamp(c["timestamp"], tz=timezone.utc).date()
+        for c in c15m
+    ))
+
+    analyzer = SMCAnalyzer()
+    sessions_data: list = []
+    for trade_date in trading_dates:
+        if trade_date.weekday() >= 5:
+            continue
+        start_ts, end_ts = session_fn(trade_date)
+        lookahead_end    = end_ts + 6 * 3600
+        sess_15m = [c for c in c15m if start_ts <= c["timestamp"] <= end_ts]
+        day_5m   = [c for c in c5m  if start_ts <= c["timestamp"] <= lookahead_end]
+        pre_15m  = [c for c in c15m if c["timestamp"] < start_ts][-16:]
+        if len(sess_15m) >= 3:
+            sessions_data.append((start_ts, end_ts, sess_15m, day_5m, pre_15m))
+
+    # ── Detect all signals; filter to medium expansion range ───────────────
+    base_params = {**_DAX_SWEEP_BASE, "symbol": symbol}
+    medium_sigs: list = []  # list of (sig, day_5m)
+
+    for start_ts, end_ts, sess_15m, day_5m, pre_15m in sessions_data:
+        sigs = analyzer.detect_dax_session_setup(
+            sess_15m, day_5m, params=base_params,
+            candles_15m_presession=pre_15m,
+        )
+        for sig in sigs:
+            if med_range_lo <= sig["expansion_range"] < med_range_hi:
+                medium_sigs.append((sig, day_5m))
+
+    logging.info("")
+    logging.info("══════ %s SERPE Full-Retrace Analysis ══════", symbol)
+    logging.info("Medium expansion filter: %.0f – %.0f pts  →  %d signals found",
+                 med_range_lo, med_range_hi, len(medium_sigs))
+
+    if not medium_sigs:
+        logging.warning("No medium-expansion signals found.")
+        return
+
+    # ── Evaluate each signal at three TP levels ────────────────────────────
+    scenarios = [
+        ("EQ (tp=0.50)",      0.50),
+        ("75% ret (tp=0.25)", 0.25),
+        ("origin (tp=0.00)",  0.00),
+    ]
+
+    for label, tp_pct in scenarios:
+        wins: list = []
+        losses = 0
+        opens  = 0
+        for sig, day_5m in medium_sigs:
+            # Override TP while keeping same entry and SL
+            bullish_exp = sig["expansion_dir"] == "bullish"
+            origin      = sig["origin"]
+            exp_range   = sig["expansion_range"]
+            if bullish_exp:
+                tp_override = origin + tp_pct * exp_range
+            else:
+                tp_override = origin - tp_pct * exp_range
+
+            modified_sig = {**sig, "tp": round(tp_override, 2)}
+            post_5m = [c for c in day_5m if c["timestamp"] > sig["breakout_ts"]]
+            outcome, eff_r = _evaluate_dax_outcome(modified_sig, post_5m)
+
+            if outcome == "WIN":
+                wins.append(eff_r or tp_pct * exp_range / max(abs(sig["entry"] - sig["sl"]), 1))
+            elif outcome == "LOSS":
+                losses += 1
+            else:
+                opens += 1
+
+        n_res   = len(wins) + losses
+        wr      = len(wins) / n_res if n_res else 0
+        avg_r   = sum(wins) / len(wins) if wins else 0.0
+        ev      = round(avg_r * wr - 1.0 * (1 - wr), 3) if n_res else -1.0
+        logging.info("")
+        logging.info("  ── TP at %-20s ──", label)
+        logging.info("    WR: %.1f%%  avgR: %.2f  EV: %+.3fR  n=%d  (W=%d L=%d O=%d)",
+                     wr * 100, avg_r, ev, n_res, len(wins), losses, opens)
+
+    # ── How far past EQ does price actually go? (depth histogram) ─────────
+    logging.info("")
+    logging.info("  ── Post-EQ depth for medium signals (base TP=EQ wins only) ──")
+    depths = []
+    for sig, day_5m in medium_sigs:
+        eq      = sig["eq_level"]
+        origin  = sig["origin"]
+        entry_ts = sig["breakout_ts"]
+        direction = sig["direction"]
+        post_entry = [c for c in day_5m if c["timestamp"] > entry_ts]
+
+        # Find EQ hit
+        eq_hit_idx = None
+        for i, c in enumerate(post_entry):
+            if direction == "bearish" and c["low"] <= eq:
+                eq_hit_idx = i; break
+            if direction == "bullish" and c["high"] >= eq:
+                eq_hit_idx = i; break
+        if eq_hit_idx is None:
+            continue
+
+        post_eq = post_entry[eq_hit_idx + 1: eq_hit_idx + 1 + 24]  # next 2h (24×5m)
+        if not post_eq:
+            continue
+        half_range = abs(eq - origin)
+        if direction == "bearish":
+            ext = max(0.0, eq - min(c["low"] for c in post_eq))
+        else:
+            ext = max(0.0, max(c["high"] for c in post_eq) - eq)
+        depths.append(round(ext / half_range, 2) if half_range else 0.0)
+
+    if depths:
+        buckets = {"<25%": 0, "25–50%": 0, "50–75%": 0, "75–100%": 0, ">100% (past origin)": 0}
+        for d in depths:
+            if d < 0.25:   buckets["<25%"] += 1
+            elif d < 0.50: buckets["25–50%"] += 1
+            elif d < 0.75: buckets["50–75%"] += 1
+            elif d < 1.00: buckets["75–100%"] += 1
+            else:           buckets[">100% (past origin)"] += 1
+        for bk, cnt in buckets.items():
+            logging.info("    %-22s %2d  (%.0f%%)", bk, cnt, 100 * cnt / len(depths))
+        logging.info("    avg extension: %.2fx half-range", sum(depths) / len(depths))
+
+
+def run_dax_experiment(
+    settings: Settings,
+    db: LocalDB,
+    alert_manager: AlertManager,
+    scan_days: int = 365,
+    update_gold: bool = False,
+) -> None:
+    """DAX Frankfurt open SERPE experiment. Delegates to run_serpe_experiment."""
+    run_serpe_experiment(
+        settings, db, alert_manager,
+        symbol="DAX",
+        session_fn=_dax_session_window,
+        session_label="09:00-12:30 Israel time (Frankfurt open)",
+        scan_days=scan_days,
+        update_gold=update_gold,
+    )
+
+
+def run_us100_experiment(
+    settings: Settings,
+    db: LocalDB,
+    alert_manager: AlertManager,
+    scan_days: int = 365,
+    update_gold: bool = False,
+) -> None:
+    """US100 (NASDAQ CFD) NY open SERPE experiment. Delegates to run_serpe_experiment."""
+    run_serpe_experiment(
+        settings, db, alert_manager,
+        symbol="US100",
+        session_fn=_us100_session_window,
+        session_label="14:30-17:30 Israel time (NY open)",
+        scan_days=scan_days,
+        update_gold=update_gold,
+    )
 
 
 def _fvg_alert_id(symbol: str, timestamp: int) -> str:
@@ -3752,7 +4238,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--experiment-dax",
         action="store_true",
-        help="Scan DE40 for DAX Frankfurt open session setups (09:00-12:30 Israel time)",
+        help="Scan DE40 for DAX Frankfurt open SERPE setups (09:00-12:30 Israel time)",
+    )
+    parser.add_argument(
+        "--experiment-us100",
+        action="store_true",
+        help="Scan US100 (NASDAQ CFD) for NY open SERPE setups (14:30-17:30 Israel time)",
+    )
+    parser.add_argument(
+        "--experiment-serpe-post-eq",
+        action="store_true",
+        help="Analyse post-EQ price behaviour for SERPE WIN trades (use with --symbol DAX or US100)",
+    )
+    parser.add_argument(
+        "--experiment-serpe-full-retrace",
+        action="store_true",
+        help="Test TP at origin (full retrace) vs EQ for medium-expansion signals (use with --symbol)",
+    )
+    parser.add_argument(
+        "--symbol",
+        default="DAX",
+        help="Symbol for --experiment-serpe-post-eq (default: DAX)",
     )
     parser.add_argument(
         "--update-gold",
@@ -3852,6 +4358,28 @@ def main() -> None:
     if args.experiment_dax:
         days = args.scan_days or 365
         run_dax_experiment(settings, db, alert_manager, scan_days=days, update_gold=args.update_gold)
+        db.close()
+        return
+
+    if args.experiment_us100:
+        days = args.scan_days or 365
+        run_us100_experiment(settings, db, alert_manager, scan_days=days, update_gold=args.update_gold)
+        db.close()
+        return
+
+    if args.experiment_serpe_post_eq:
+        sym = args.symbol.upper()
+        session_fn = _us100_session_window if sym == "US100" else _dax_session_window
+        days = args.scan_days or 59
+        run_serpe_post_eq_analysis(db, sym, session_fn, scan_days=days)
+        db.close()
+        return
+
+    if args.experiment_serpe_full_retrace:
+        sym = args.symbol.upper()
+        session_fn = _us100_session_window if sym == "US100" else _dax_session_window
+        days = args.scan_days or 59
+        run_serpe_full_retrace_analysis(db, sym, session_fn, scan_days=days)
         db.close()
         return
 
