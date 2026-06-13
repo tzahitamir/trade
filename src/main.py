@@ -1,4 +1,5 @@
 import argparse
+import bisect
 import logging
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -171,6 +172,252 @@ def validate_candles(symbol: str, timeframe: str, candles: List[dict]) -> None:
 
 
 _5M_ATR_MIN_DIST = 0.2   # 5m close must be >= this × ATR5m past the broken level
+
+# ── 1h BOS retrace-entry ("1h bos, all tf aligned") ─────────────────────────
+# Pairs where the retrace entry has positive EV; EURJPY excluded (negative EV).
+_1H_RETRACE_PAIRS   = frozenset({"NZDUSD", "EURUSD", "USDCHF", "XAUUSD"})
+_1H_RETRACE_MIN_MAE = 0.75   # minimum adverse excursion before retrace-entry triggers
+_1H_RETRACE_LOOKBACK_H = 12  # how far back to search for active 1h BOS events
+
+
+def _h1re_alert_id(symbol: str, direction: str, h1_open_ts: int) -> str:
+    dt  = datetime.fromtimestamp(h1_open_ts, tz=timezone.utc)
+    dir_char = "u" if direction == "bullish" else "d"
+    return (f"h1re_{dir_char}"
+            f"_{dt.day:02d}{dt.month:02d}{dt.year % 100}"
+            f"_{dt.hour:02d}_{symbol.lower()}")
+
+
+def _h1re_4h_pass(symbol: str, prev_h4_aligned: bool, curr_h4_aligned: bool) -> bool:
+    """Per-pair 4h alignment gate for the 1h retrace entry.
+
+    Derived from 13-month backtest (analyze_retrace_4h_alignment.py):
+      EURUSD  : BOTH prev + curr 4h aligned → WR 61.5 % (★★)
+      XAUUSD  : BOTH prev + curr 4h aligned → WR 61.5 % (★)
+      NZDUSD  : curr 4h aligned             → WR 47.6 % (★)  (combo gate needs C3,
+                                              so at C1-close time we gate on curr only)
+      USDCHF  : curr 4h aligned             → WR 53.1 % (★★)
+    """
+    if symbol in ("EURUSD", "XAUUSD"):
+        return prev_h4_aligned and curr_h4_aligned
+    if symbol in ("NZDUSD", "USDCHF"):
+        return curr_h4_aligned
+    return False
+
+
+def _process_symbol_1h_retrace_entry(
+    symbol: str,
+    new_candles: list,
+    db,
+    alert_manager,
+) -> None:
+    """Fire "1h bos, all tf aligned" when all four conditions hold simultaneously:
+
+      1. A 1h BOS fired within the last 12h (standard detector, no strength filter).
+      2. The 5m price tracked >= 0.75R retrace toward the broken level after the entry
+         without hitting SL or TP.
+      3. The CURRENT 5m candle is exactly the first candle after the retrace bottom
+         AND it closes past the bottom candle's extreme in the BOS direction (mini-BOS C1).
+      4. 4h alignment gate passes per-pair (see _h1re_4h_pass).
+
+    Entry  = current 5m close (mini-BOS C1 close)
+    SL     = broken_level (original 1h SL)
+    TP     = original 1h TP (entry + 2R from the initial 5m break)
+    """
+    if symbol not in _1H_RETRACE_PAIRS or not new_candles:
+        return
+
+    latest_5m = new_candles[-1]
+    ts_now    = latest_5m["timestamp"]
+
+    # Session gate: same window as the 5m-early system
+    bar_hour = datetime.fromtimestamp(ts_now, tz=timezone.utc).hour
+    start_h, end_h = _5M_PAIRS_SESSION.get(symbol, (7, 15))
+    if not (start_h <= bar_hour < end_h):
+        return
+
+    # ── Load required data ────────────────────────────────────────────────────
+    h1_desc = db.query_recent(symbol, "1h", limit=60)
+    if not h1_desc or len(h1_desc) < 30:
+        return
+
+    m5_desc = db.query_recent(symbol, "5m", limit=250)
+    if not m5_desc:
+        return
+    m5_chron = list(reversed(m5_desc))
+    m5_ts    = [c["timestamp"] for c in m5_chron]
+    m5_map   = {c["timestamp"]: i for i, c in enumerate(m5_chron)}
+
+    h4_desc  = db.query_recent(symbol, "4h", limit=20)
+    h4_chron = list(reversed(h4_desc)) if h4_desc else []
+    h4_ts    = [c["timestamp"] for c in h4_chron]
+
+    min_5m_ts = m5_chron[0]["timestamp"]
+    latest_idx = m5_map.get(ts_now)
+    if latest_idx is None:
+        return
+
+    h1_n     = len(h1_desc)
+    seen_evs = set()
+
+    for k in range(5, min(h1_n - 5, 20)):   # scan last 20 1h candles (≤ 20h)
+        window  = h1_desc[h1_n - 1 - k:]
+        h1_open = window[0]["timestamp"]
+        h1_end  = h1_open + 3600
+
+        if ts_now - h1_open > _1H_RETRACE_LOOKBACK_H * 3600:
+            break
+        if h1_open < min_5m_ts:
+            continue
+
+        bos_events = alert_manager.analyzer.detect_bos(
+            window,
+            params={"symbol": symbol, "timeframe": "1h",
+                    "min_break_strength": 0.0,
+                    "require_liquidity_sweep": False},
+        )
+        if not bos_events:
+            continue
+
+        for ev in bos_events:
+            direction    = ev["direction"]
+            broken_level = ev["broken_level"]
+            bullish      = direction == "bullish"
+
+            ev_key = (direction, round(broken_level, 5), h1_open)
+            if ev_key in seen_evs:
+                continue
+            seen_evs.add(ev_key)
+
+            # ── Find the 5m break candle (first close past broken level) ──
+            lo = bisect.bisect_left(m5_ts, h1_open)
+            hi = bisect.bisect_left(m5_ts, h1_end)
+            period = m5_chron[lo:hi]
+            if len(period) < 2 or lo < 20:
+                continue
+
+            atr_5m = alert_manager.analyzer.calculate_atr(m5_chron[lo - 20:lo])
+            if not atr_5m:
+                continue
+
+            break_idx = None
+            for i, c in enumerate(period):
+                if bullish and c["close"] > broken_level:     break_idx = i; break
+                if not bullish and c["close"] < broken_level: break_idx = i; break
+            if break_idx is None:
+                continue
+
+            break_c    = period[break_idx]
+            orig_entry = break_c["close"]
+            orig_risk  = abs(orig_entry - broken_level)
+            if orig_risk < atr_5m * 0.05:
+                continue
+
+            orig_tp = (orig_entry + 2 * orig_risk) if bullish else (orig_entry - 2 * orig_risk)
+            g_idx   = m5_map.get(break_c["timestamp"])
+            if g_idx is None:
+                continue
+
+            # ── Walk 5m candles from break to one before the latest ───────
+            # Track: MAE, bottom candle index, whether trade already resolved
+            mae_r       = 0.0
+            max_adv_idx = g_idx
+
+            for j in range(g_idx + 1, latest_idx):
+                fc = m5_chron[j]
+                adverse = (max(0.0, orig_entry - fc["low"]) if bullish
+                           else max(0.0, fc["high"] - orig_entry))
+                if adverse / orig_risk > mae_r:
+                    mae_r       = adverse / orig_risk
+                    max_adv_idx = j
+
+                if bullish:
+                    if fc["high"] >= orig_tp or fc["low"] <= broken_level:
+                        mae_r = -1; break   # trade already resolved — skip
+                else:
+                    if fc["low"] <= orig_tp or fc["high"] >= broken_level:
+                        mae_r = -1; break
+
+            if mae_r < _1H_RETRACE_MIN_MAE:
+                continue   # too shallow retrace, or already resolved
+
+            # ── mini-BOS C1: current 5m must be exactly the next candle ──
+            if latest_idx != max_adv_idx + 1:
+                continue   # not the first post-bottom candle
+
+            bottom_c = m5_chron[max_adv_idx]
+            mini_bos = ((latest_5m["close"] > bottom_c["high"]) if bullish
+                        else (latest_5m["close"] < bottom_c["low"]))
+            if not mini_bos:
+                continue
+
+            # Latest candle must not itself pierce SL
+            if bullish and latest_5m["low"] <= broken_level:
+                continue
+            if not bullish and latest_5m["high"] >= broken_level:
+                continue
+
+            # ── 4h alignment gate ─────────────────────────────────────────
+            h4_pos = bisect.bisect_left(h4_ts, ts_now)
+            if h4_pos < 2:
+                continue
+            prev_h4 = h4_chron[h4_pos - 2]
+            curr_h4 = h4_chron[h4_pos - 1]
+
+            prev_h4_aln = ((prev_h4["close"] > prev_h4["open"]) if bullish
+                           else (prev_h4["close"] < prev_h4["open"]))
+            curr_h4_aln = ((curr_h4["close"] > curr_h4["open"]) if bullish
+                           else (curr_h4["close"] < curr_h4["open"]))
+
+            if not _h1re_4h_pass(symbol, prev_h4_aln, curr_h4_aln):
+                _dlog.info("[H1RE] FILTERED | %s | 4h_gate prev=%s curr=%s dir=%s",
+                           symbol, prev_h4_aln, curr_h4_aln, direction)
+                continue
+
+            # ── Build alert ───────────────────────────────────────────────
+            new_entry = latest_5m["close"]
+            risk      = abs(new_entry - broken_level)
+            if risk < atr_5m * 0.01:
+                continue
+
+            rr     = abs(orig_tp - new_entry) / risk
+            action = "BUY" if bullish else "SELL"
+            h4_tag = ("4h✓✓" if (prev_h4_aln and curr_h4_aln) else "4h✓")
+            ts_str = datetime.fromtimestamp(ts_now, tz=timezone.utc).strftime("%H:%M %d-%b")
+
+            message = (
+                f"1h bos, all tf aligned | {symbol} {action}\n"
+                f"Entry: {new_entry:.5f}  SL: {broken_level:.5f}  TP: {orig_tp:.5f}  R:R ~{rr:.1f}\n"
+                f"1h level: {broken_level:.5f} | retrace {mae_r*100:.0f}% | mini-BOS C1\n"
+                f"{h4_tag} 1h✓ 15m✓ 5m✓ | {ts_str} UTC"
+            )
+
+            alert_id = _h1re_alert_id(symbol, direction, h1_open)
+
+            try:
+                inserted = db.insert_monitor(
+                    alert_id=alert_id,
+                    symbol=symbol,
+                    direction=direction,
+                    entry=new_entry,
+                    sl=broken_level,
+                    tp=orig_tp,
+                    breakout_ts=ts_now,
+                )
+            except Exception:
+                logging.exception("[H1RE] Failed to insert monitor for %s", alert_id)
+                continue
+
+            if not inserted:
+                _dlog.info("[H1RE] DEDUP | %s | id=%s already fired", symbol, alert_id)
+                continue
+
+            _dlog.info("[H1RE] ALERT | %s | dir=%s entry=%.5f sl=%.5f tp=%.5f rr=%.1f "
+                       "mae=%.2fR | id=%s",
+                       symbol, direction, new_entry, broken_level, orig_tp, rr,
+                       mae_r, alert_id)
+            logging.info("H1RE: %s", message)
+            alert_manager.send_alert({"message": message, "alert_id": alert_id})
 
 
 def _5m_candle_quality_pass(
@@ -426,6 +673,7 @@ def process_symbol_timeframe(
     if timeframe in ("5m", "5min"):
         if symbol in _5M_PAIRS_SESSION:
             _process_symbol_5m(symbol, new_candles, db, alert_manager)
+            _process_symbol_1h_retrace_entry(symbol, new_candles, db, alert_manager)
         return len(new_candles)
 
     if timeframe != "15m":
