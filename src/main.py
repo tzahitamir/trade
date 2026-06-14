@@ -382,15 +382,32 @@ def _process_symbol_1h_retrace_entry(
             if risk < atr_5m * 0.01:
                 continue
 
-            rr     = abs(orig_tp - new_entry) / risk
+            # #2 — Tight SL: bottom candle extreme (0 wins→losses in backtest)
+            tight_sl = (max(bottom_c["low"],  broken_level) if bullish
+                        else min(bottom_c["high"], broken_level))
+            risk_tight = abs(new_entry - tight_sl)
+            if risk_tight < atr_5m * 0.01:
+                tight_sl   = broken_level   # bottom candle IS at SL; fall back
+                risk_tight = risk
+
+            rr     = abs(orig_tp - new_entry) / risk_tight
             action = "BUY" if bullish else "SELL"
             h4_tag = ("4h✓✓" if (prev_h4_aln and curr_h4_aln) else "4h✓")
             ts_str = datetime.fromtimestamp(ts_now, tz=timezone.utc).strftime("%H:%M %d-%b")
 
+            # #1 — For XAUUSD: partial-close guidance (price runs median 6× past TP)
+            if symbol == "XAUUSD":
+                tp_label   = "TP1(½)"
+                trail_line = "★ ½ close @ TP1, trail rest to next structure\n"
+            else:
+                tp_label   = "TP"
+                trail_line = ""
+
             message = (
                 f"1h bos, all tf aligned | {symbol} {action}\n"
-                f"Entry: {new_entry:.5f}  SL: {broken_level:.5f}  TP: {orig_tp:.5f}  R:R ~{rr:.1f}\n"
+                f"Entry: {new_entry:.5f}  SL: {tight_sl:.5f}  {tp_label}: {orig_tp:.5f}  R:R ~{rr:.1f}\n"
                 f"1h level: {broken_level:.5f} | retrace {mae_r*100:.0f}% | mini-BOS C1\n"
+                f"{trail_line}"
                 f"{h4_tag} 1h✓ 15m✓ 5m✓ | {ts_str} UTC"
             )
 
@@ -402,7 +419,7 @@ def _process_symbol_1h_retrace_entry(
                     symbol=symbol,
                     direction=direction,
                     entry=new_entry,
-                    sl=broken_level,
+                    sl=tight_sl,
                     tp=orig_tp,
                     breakout_ts=ts_now,
                 )
@@ -414,9 +431,9 @@ def _process_symbol_1h_retrace_entry(
                 _dlog.info("[H1RE] DEDUP | %s | id=%s already fired", symbol, alert_id)
                 continue
 
-            _dlog.info("[H1RE] ALERT | %s | dir=%s entry=%.5f sl=%.5f tp=%.5f rr=%.1f "
+            _dlog.info("[H1RE] ALERT | %s | dir=%s entry=%.5f sl=%.5f(tight) 1h=%.5f tp=%.5f rr=%.1f "
                        "mae=%.2fR | id=%s",
-                       symbol, direction, new_entry, broken_level, orig_tp, rr,
+                       symbol, direction, new_entry, tight_sl, broken_level, orig_tp, rr,
                        mae_r, alert_id)
             logging.info("H1RE: %s", message)
             alert_manager.send_alert({"message": message, "alert_id": alert_id})
