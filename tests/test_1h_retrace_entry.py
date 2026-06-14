@@ -71,19 +71,19 @@ class TestH1re4hPass:
         def test_neither_aligned_fails(self):
             assert not _h1re_4h_pass("EURUSD", prev_h4_aligned=False, curr_h4_aligned=False)
 
-    # XAUUSD: same rule as EURUSD — both required
+    # XAUUSD: no 4h gate — always passes (4h counter still EV +2.33R for XAU)
     class TestXAUUSD:
         def test_both_aligned_passes(self):
             assert _h1re_4h_pass("XAUUSD", prev_h4_aligned=True, curr_h4_aligned=True)
 
-        def test_only_prev_fails(self):
-            assert not _h1re_4h_pass("XAUUSD", prev_h4_aligned=True, curr_h4_aligned=False)
+        def test_only_prev_passes(self):
+            assert _h1re_4h_pass("XAUUSD", prev_h4_aligned=True, curr_h4_aligned=False)
 
-        def test_only_curr_fails(self):
-            assert not _h1re_4h_pass("XAUUSD", prev_h4_aligned=False, curr_h4_aligned=True)
+        def test_only_curr_passes(self):
+            assert _h1re_4h_pass("XAUUSD", prev_h4_aligned=False, curr_h4_aligned=True)
 
-        def test_neither_fails(self):
-            assert not _h1re_4h_pass("XAUUSD", prev_h4_aligned=False, curr_h4_aligned=False)
+        def test_neither_passes(self):
+            assert _h1re_4h_pass("XAUUSD", prev_h4_aligned=False, curr_h4_aligned=False)
 
     # NZDUSD: only curr required
     class TestNZDUSD:

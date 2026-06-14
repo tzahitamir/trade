@@ -191,17 +191,19 @@ def _h1re_alert_id(symbol: str, direction: str, h1_open_ts: int) -> str:
 def _h1re_4h_pass(symbol: str, prev_h4_aligned: bool, curr_h4_aligned: bool) -> bool:
     """Per-pair 4h alignment gate for the 1h retrace entry.
 
-    Derived from 13-month backtest (analyze_retrace_4h_alignment.py):
-      EURUSD  : BOTH prev + curr 4h aligned → WR 61.5 % (★★)
-      XAUUSD  : BOTH prev + curr 4h aligned → WR 61.5 % (★)
-      NZDUSD  : curr 4h aligned             → WR 47.6 % (★)  (combo gate needs C3,
-                                              so at C1-close time we gate on curr only)
-      USDCHF  : curr 4h aligned             → WR 53.1 % (★★)
+    Derived from full-history backtest (analyze_1h_combo_gate.py):
+      EURUSD  : BOTH prev + curr 4h aligned → WR 61.5 % EV +0.69R (★★★)
+      NZDUSD  : curr 4h aligned             → WR 47.6 % EV +0.90R (★★★)
+      USDCHF  : curr 4h aligned             → WR 53.1 % EV +0.31R (★★★)
+      XAUUSD  : no 4h gate — 4h counter group still WR 43.9 % EV +2.33R;
+                filtering it out reduces EV from +1.55R to +0.29R.
     """
-    if symbol in ("EURUSD", "XAUUSD"):
+    if symbol == "EURUSD":
         return prev_h4_aligned and curr_h4_aligned
     if symbol in ("NZDUSD", "USDCHF"):
         return curr_h4_aligned
+    if symbol == "XAUUSD":
+        return True   # no 4h gate: counter-4h trades remain high-EV for XAU
     return False
 
 
