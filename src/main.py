@@ -680,6 +680,10 @@ def process_symbol_timeframe(
                symbol, timeframe, len(new_candles), new_latest)
     logging.info("Inserted %d new candles for %s %s", len(new_candles), symbol, timeframe)
 
+    # 1h retrace entry runs for all pairs in _5M_PAIRS_SESSION regardless of alert_pairs
+    if timeframe in ("5m", "5min") and symbol in _5M_PAIRS_SESSION:
+        _process_symbol_1h_retrace_entry(symbol, new_candles, db, alert_manager)
+
     if not alert_manager.settings.should_alert(symbol):
         _dlog.info("[FETCH] %s %s | alerts_suppressed (not in alert_pairs)", symbol, timeframe)
         logging.debug("Alerts suppressed for %s (not in alert_pairs)", symbol)
@@ -692,7 +696,6 @@ def process_symbol_timeframe(
     if timeframe in ("5m", "5min"):
         if symbol in _5M_PAIRS_SESSION:
             _process_symbol_5m(symbol, new_candles, db, alert_manager)
-            _process_symbol_1h_retrace_entry(symbol, new_candles, db, alert_manager)
         return len(new_candles)
 
     if timeframe != "15m":
@@ -2653,7 +2656,53 @@ def _us100_session_window(trade_date) -> tuple:
     return int(start.timestamp()), int(end.timestamp())
 
 
-_dax_alerted_dates: set = set()
+_dax_alerted_dates:    set = set()
+_dax_prealerted_dates: set = set()
+
+_DAX_PEAK_CUTOFF_HOUR   = 11
+_DAX_PEAK_CUTOFF_MINUTE = 45
+
+# Slowdown thresholds for pre-alert (intentionally loose — any stall candle counts)
+_DAX_SLOWDOWN_BODY_ATR  = 0.40
+_DAX_SLOWDOWN_RANGE_ATR = 0.60
+
+
+def _dax_peak_too_late(peak_ts: int) -> bool:
+    """True if the expansion peak formed at or after 11:45 IDT (poor trade history)."""
+    peak_idt = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ)
+    return (peak_idt.hour, peak_idt.minute) >= (_DAX_PEAK_CUTOFF_HOUR, _DAX_PEAK_CUTOFF_MINUTE)
+
+
+def _dax_slowdown_present(post_peak_5m: list, atr_5m: float) -> bool:
+    """True if any stall candle is detected in the last 2 post-peak 5m candles.
+
+    Loose definition: small body OR compressed range OR inside bar.
+    """
+    window = post_peak_5m[-2:]
+    for i, c in enumerate(window):
+        prev  = window[i - 1] if i > 0 else None
+        body  = abs(c["close"] - c["open"])
+        rng   = c["high"] - c["low"]
+        inside = (prev is not None
+                  and c["high"] <= prev["high"]
+                  and c["low"]  >= prev["low"])
+        if body <= _DAX_SLOWDOWN_BODY_ATR * atr_5m or rng <= _DAX_SLOWDOWN_RANGE_ATR * atr_5m or inside:
+            return True
+    return False
+
+
+def _format_dax_prealert(exp: dict) -> str:
+    """Format a DAX SERPE pre-alert (expansion confirmed, waiting for 5m BOS entry)."""
+    from datetime import timezone as _tz
+    exp_dir = exp["expansion_dir"].upper()
+    ct_dir  = exp["ct_dir"].upper()
+    peak_t  = datetime.fromtimestamp(exp["peak_ts"], tz=_ISRAEL_TZ).strftime("%H:%M")
+    return (
+        f"⚠ DAX setup forming | {ct_dir} trade incoming\n"
+        f"{exp_dir} expansion peaked {peak_t} IDT @ {exp['peak']:.0f}\n"
+        f"Pullback slowing — watch for 5m reversal BOS\n"
+        f"EQ target: {exp['eq_level']:.0f}  Origin: {exp['origin']:.0f}"
+    )
 
 
 def _format_dax_alert(sig: dict) -> str:
@@ -2711,26 +2760,29 @@ def dax_data_job(db: "LocalDB") -> None:
 
 
 def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertManager") -> None:
-    """Check for DAX session_start_expansion_retrace_pull_back_to_equilibrium setup; runs every 5 min during Frankfurt session."""
-    from datetime import date as _date
+    """Check for DAX SERPE setup; runs every 5 min during Frankfurt session.
+
+    Two-phase alert:
+      1. Pre-alert — expansion peak confirmed before 11:45 IDT + slowdown forming in pullback.
+         Fires once per day so the trader is ready at the screen.
+      2. Entry alert — full 5m counter-BOS fires. Suppressed if peak was ≥ 11:45 IDT
+         (late-session expansions have historically poor WR).
+    """
+    from datetime import time as _time
     from analysis.smc_analyzer import SMCAnalyzer
 
-    now_il  = datetime.now(_ISRAEL_TZ)
-    today   = now_il.date()
+    now_il = datetime.now(_ISRAEL_TZ)
+    today  = now_il.date()
 
-    # Skip weekends
     if today.weekday() >= 5:
         return
 
-    # Only within session window 09:00-12:30 Israel time
-    t = now_il.time()
-    from datetime import time as _time
-    if not (_time(9, 0) <= t <= _time(12, 30)):
+    if not (_time(9, 0) <= now_il.time() <= _time(12, 30)):
         return
 
-    _dlog.info("[DAX_SESSION] %s | within_session | checking for setup", now_il.strftime("%H:%M IDT"))
+    _dlog.info("[DAX_SESSION] %s | within_session", now_il.strftime("%H:%M IDT"))
 
-    # One alert per session day
+    # Once entry alert (or late-peak suppression) has fired, stop checking for today
     if today in _dax_alerted_dates:
         _dlog.info("[DAX_SESSION] already_alerted today | skip")
         return
@@ -2740,41 +2792,44 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
     gold = gold_map.get("DAX") or gold_map.get("dax")
     if not gold:
         _dlog.warning("[DAX_SESSION] no gold params | run --experiment-dax --update-gold")
-        logging.warning("DAX session job: no gold params — run --experiment-dax --update-gold first")
         return
     gold_params = db.get_param_set_by_id(gold["param_set_id"])
 
-    # Read candles from DB (kept fresh by dax_data_job every 5 min)
+    # Read candles (kept fresh by dax_data_job every 5 min)
     start_ts, end_ts = _dax_session_window(today)
     candles_15m = db.query_recent("DAX", "15m", limit=200)
     candles_5m  = db.query_recent("DAX", "5m",  limit=500)
 
     if not candles_15m or not candles_5m:
-        _dlog.warning("[DAX_SESSION] no candles in DB | 15m=%d 5m=%d",
+        _dlog.warning("[DAX_SESSION] no candles | 15m=%d 5m=%d",
                       len(candles_15m or []), len(candles_5m or []))
         return
 
-    sess_15m = [c for c in candles_15m if start_ts <= c["timestamp"] <= end_ts]
+    # Sort to oldest→newest (query_recent returns DESC)
+    sess_15m = sorted(
+        [c for c in candles_15m if start_ts <= c["timestamp"] <= end_ts],
+        key=lambda c: c["timestamp"],
+    )
     if len(sess_15m) < 3:
         _dlog.info("[DAX_SESSION] insufficient session candles (%d<3) | waiting", len(sess_15m))
         return
 
-    # Last 16 pre-session 15m candles for context
     pre_15m = sorted(
         [c for c in candles_15m if c["timestamp"] < start_ts],
         key=lambda c: c["timestamp"],
     )[-16:]
 
-    # All 5m candles for today
     day_5m = sorted(
         [c for c in candles_5m if c["timestamp"] >= start_ts],
         key=lambda c: c["timestamp"],
     )
 
-    _dlog.info("[DAX_SESSION] detect_setup | sess_15m=%d day_5m=%d pre_15m=%d | param_set_id=%s",
-               len(sess_15m), len(day_5m), len(pre_15m), gold.get("param_set_id", "?"))
+    analyzer   = SMCAnalyzer()
+    alerts_on  = getattr(settings, "dax_alerts_enabled", False)
 
-    analyzer = SMCAnalyzer()
+    # ── Phase 2: try full entry signal ───────────────────────────────────────
+    _dlog.info("[DAX_SESSION] detect_full | sess_15m=%d day_5m=%d | pset=%s",
+               len(sess_15m), len(day_5m), gold.get("param_set_id", "?"))
     try:
         sigs = analyzer.detect_dax_session_setup(
             sess_15m, day_5m,
@@ -2783,32 +2838,88 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
         )
     except Exception as exc:
         _dlog.error("[DAX_SESSION] detection_failed | %s", exc)
-        logging.error("DAX session job: detection failed: %s", exc)
         return
 
-    if not sigs:
-        _dlog.info("[DAX_SESSION] no_setup_found")
+    if sigs:
+        sig      = sigs[0]
+        peak_ts  = sig.get("peak_ts", 0)
+
+        if _dax_peak_too_late(peak_ts):
+            peak_str = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ).strftime("%H:%M")
+            _dlog.info("[DAX_SESSION] late_peak %s IDT ≥ 11:45 | suppressed for today", peak_str)
+            logging.info("DAX: late peak %s IDT — entry suppressed (poor WR after 11:45)", peak_str)
+            _dax_alerted_dates.add(today)
+            return
+
+        _dax_alerted_dates.add(today)
+        _dlog.info("[DAX_SESSION] ENTRY_SIGNAL | dir=%s entry=%.0f sl=%.0f tp=%.0f | alerts_on=%s",
+                   sig.get("direction"), sig.get("entry", 0), sig.get("sl", 0),
+                   sig.get("tp", 0), alerts_on)
+        msg = _format_dax_alert(sig)
+        logging.info("DAX ENTRY SIGNAL: %s", msg)
+        try:
+            chart_path = alert_manager.render_dax_alert(sig, day_5m, outcome="OPEN")
+        except Exception as exc:
+            logging.warning("DAX chart render failed: %s", exc)
+            chart_path = None
+        if alerts_on:
+            alert_manager.send_alert({"message": msg, "image_path": chart_path,
+                                      "alert_id": sig.get("signal_id", f"dax_{today}")})
+        else:
+            _dlog.info("[DAX_SESSION] entry_alert_suppressed (alerts_off) | chart=%s", chart_path)
         return
 
-    sig = sigs[0]
-    _dax_alerted_dates.add(today)
+    # ── Phase 1: no full signal yet — check for pre-alert ───────────────────
+    if today in _dax_prealerted_dates:
+        _dlog.info("[DAX_SESSION] pre_alerted | waiting for BOS")
+        return
 
-    _dlog.info("[DAX_SESSION] SIGNAL | dir=%s entry=%.0f sl=%.0f tp=%.0f | alerts_enabled=%s",
-               sig.get("direction", "?"), sig.get("entry", 0), sig.get("sl", 0), sig.get("tp", 0),
-               getattr(settings, "dax_alerts_enabled", False))
-
-    msg = _format_dax_alert(sig)
-    logging.info("DAX SIGNAL: %s", msg)
     try:
-        chart_path = alert_manager.render_dax_alert(sig, day_5m, outcome="OPEN")
+        exp = analyzer.detect_dax_expansion_state(
+            sess_15m,
+            params={"symbol": "DAX", "min_expansion_atr": gold_params.get("min_expansion_atr", 1.0)},
+            candles_15m_presession=pre_15m,
+        )
     except Exception as exc:
-        logging.warning("DAX chart render failed: %s", exc)
-        chart_path = None
-    if getattr(settings, "dax_alerts_enabled", False):
-        alert_manager.send_alert({"message": msg, "image_path": chart_path, "alert_id": sig.get("signal_id", "dax")})
-    else:
-        _dlog.info("[DAX_SESSION] alert_suppressed (dax_alerts_enabled=false) | chart=%s", chart_path)
-        logging.info("DAX alert suppressed (dax_alerts_enabled=false) — chart saved to %s", chart_path)
+        _dlog.error("[DAX_SESSION] expansion_detect_failed | %s", exc)
+        return
+
+    if not exp:
+        _dlog.info("[DAX_SESSION] no_expansion_yet")
+        return
+
+    peak_ts = exp["peak_ts"]
+    if _dax_peak_too_late(peak_ts):
+        peak_str = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ).strftime("%H:%M")
+        _dlog.info("[DAX_SESSION] late_peak %s IDT ≥ 11:45 | pre-alert suppressed", peak_str)
+        _dax_alerted_dates.add(today)   # no point checking again today
+        return
+
+    # Check for slowdown in post-peak 5m candles
+    post_peak_5m = [c for c in day_5m if c["timestamp"] >= peak_ts]
+    if len(post_peak_5m) < 3:
+        _dlog.info("[DAX_SESSION] expansion_found | too_few_post_peak_candles=%d | waiting", len(post_peak_5m))
+        return
+
+    atr_5m = analyzer.calculate_atr(list(reversed(post_peak_5m[:20])))
+    if not atr_5m:
+        return
+
+    if not _dax_slowdown_present(post_peak_5m, atr_5m):
+        peak_str = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ).strftime("%H:%M")
+        _dlog.info("[DAX_SESSION] expansion_found peak=%s | no_slowdown_yet", peak_str)
+        return
+
+    # Pre-alert fires
+    _dax_prealerted_dates.add(today)
+    peak_str = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ).strftime("%H:%M")
+    _dlog.info("[DAX_SESSION] PRE_ALERT | expansion_dir=%s peak=%s IDT | alerts_on=%s",
+               exp["expansion_dir"], peak_str, alerts_on)
+    msg = _format_dax_prealert(exp)
+    logging.info("DAX PRE-ALERT: %s", msg)
+    if alerts_on:
+        alert_manager.send_alert({"message": msg, "image_path": None,
+                                  "alert_id": f"dax_pre_{today}"})
 
 
 def _evaluate_dax_outcome(signal: dict, candles_5m_after_entry: list) -> tuple:

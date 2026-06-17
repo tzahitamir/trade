@@ -595,6 +595,98 @@ class SMCAnalyzer:
 
         return events
 
+    def detect_dax_expansion_state(
+        self,
+        candles_15m_session: List[Dict],      # session-window 15m candles, oldest→newest
+        params: Dict = None,
+        candles_15m_presession: List[Dict] = None,
+    ) -> Optional[Dict]:
+        """
+        Steps 1+2 of SERPE only: detect 15m expansion BOS + peak.
+        Returns expansion state dict, or None if no expansion found yet.
+
+        Used for pre-alert: fires when expansion is confirmed but before
+        the 5m counter-trend BOS (the actual entry signal) has formed.
+        """
+        params = params or {}
+        min_exp_atr = params.get("min_expansion_atr", 1.0)
+
+        if len(candles_15m_session) < 3:
+            return None
+
+        session_start_ts = candles_15m_session[0]["timestamp"]
+        pre      = (candles_15m_presession or [])[-16:]
+        combined = pre + candles_15m_session
+
+        if len(combined) < 6:
+            return None
+
+        atr_15m = self.calculate_atr(list(reversed(combined))) or 1.0
+
+        first_bos              = None
+        first_bos_combined_idx = None
+        for i in range(5, len(combined)):
+            if combined[i]["timestamp"] < session_start_ts:
+                continue
+            window_desc = list(reversed(combined[:i + 1]))
+            events = self.detect_bos(
+                window_desc,
+                params={
+                    "min_break_strength":          0.3,
+                    "min_swing_age_candles":        2,
+                    "swing_lookback":               min(16, i),
+                    "min_break_distance_atr_mult":  0.1,
+                    "min_atr_pct":                  0.0001,
+                    "require_liquidity_sweep":      False,
+                    "symbol":                       params.get("symbol"),
+                    "timeframe":                    "15m",
+                },
+            )
+            for ev in events:
+                if ev["breakout_ts"] >= session_start_ts:
+                    first_bos              = ev
+                    first_bos_combined_idx = i
+                    break
+            if first_bos:
+                break
+
+        if first_bos is None:
+            return None
+
+        direction   = first_bos["direction"]
+        bullish_exp = direction == "bullish"
+        bos_ts      = first_bos["breakout_ts"]
+
+        pre_bos  = combined[:first_bos_combined_idx + 1]
+        post_bos = combined[first_bos_combined_idx:]
+
+        if bullish_exp:
+            origin      = min(c["low"]  for c in pre_bos[-16:]) if pre_bos else combined[0]["low"]
+            peak        = max(c["high"] for c in post_bos)      if post_bos else first_bos["broken_level"]
+            peak_candle = max(post_bos, key=lambda c: c["high"])
+        else:
+            origin      = max(c["high"] for c in pre_bos[-16:]) if pre_bos else combined[0]["high"]
+            peak        = min(c["low"]  for c in post_bos)      if post_bos else first_bos["broken_level"]
+            peak_candle = min(post_bos, key=lambda c: c["low"])
+
+        expansion_range = abs(peak - origin)
+        if expansion_range < min_exp_atr * atr_15m:
+            return None
+
+        peak_ts  = peak_candle["timestamp"]
+        eq_level = (origin + 0.5 * expansion_range) if bullish_exp else (origin - 0.5 * expansion_range)
+
+        return {
+            "expansion_dir": direction,
+            "ct_dir":        "bearish" if bullish_exp else "bullish",
+            "bos_15m_ts":    bos_ts,
+            "peak_ts":       peak_ts,
+            "peak":          round(peak,   2),
+            "origin":        round(origin, 2),
+            "eq_level":      round(eq_level, 2),
+            "expansion_range": round(expansion_range, 2),
+        }
+
     def detect_dax_session_setup(
         self,
         candles_15m_session: List[Dict],   # session-window 15m candles, oldest→newest
@@ -603,7 +695,7 @@ class SMCAnalyzer:
         candles_15m_presession: List[Dict] = None,
     ) -> List[Dict]:
         """
-        Counter-trend DAX Frankfurt Open session strategy.
+        DAX session_start_expansion_retrace_pull_back_to_equilibrium (SERPE) strategy.
 
         1. Detect session expansion via 15m BOS against pre-session structure.
         2. Find the expansion peak (session high for bull, session low for bear).
@@ -614,7 +706,7 @@ class SMCAnalyzer:
         5. TP = origin + tp_pct × expansion_range (mean reversion target).
         6. SL = recent 5m swing extreme + sl_atr_mult × ATR_5m.
 
-        Returns at most one signal per session (the first qualifying counter-trend entry).
+        Returns at most one signal per session (the first qualifying SERPE entry).
         """
         params = params or {}
         tp_pct         = params.get("tp_pct", 0.5)
