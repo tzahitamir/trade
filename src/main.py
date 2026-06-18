@@ -2795,6 +2795,10 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
         return
     gold_params = db.get_param_set_by_id(gold["param_set_id"])
 
+    if today.weekday() == 0:  # skip Monday — Frankfurt open tends to be choppier
+        _dlog.info("[DAX_SESSION] Monday | skip")
+        return
+
     # Read candles (kept fresh by dax_data_job every 5 min)
     start_ts, end_ts = _dax_session_window(today)
     candles_15m = db.query_recent("DAX", "15m", limit=200)
