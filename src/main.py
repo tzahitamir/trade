@@ -2706,21 +2706,20 @@ def _format_dax_prealert(exp: dict) -> str:
 
 
 def _format_dax_alert(sig: dict) -> str:
-    """Format a DAX session_start_expansion_retrace_pull_back_to_equilibrium signal for Telegram."""
-    ct_dir   = sig["direction"].upper()        # direction of our trade
-    exp_dir  = sig.get("expansion_dir", "").upper()  # direction of the expansion we fade
+    """Format a DAX SERPE lower-high/higher-low entry signal for Telegram."""
+    ct_dir   = sig["direction"].upper()
+    exp_dir  = sig.get("expansion_dir", "").upper()
     entry    = sig["entry"]
     sl       = sig["sl"]
     tp       = sig["tp"]
-    eq       = sig.get("eq_level")
+    peak     = sig.get("peak", 0)
+    eq       = sig.get("eq_level", 0)
     risk     = abs(entry - sl)
     r        = round(abs(tp - entry) / risk, 1) if risk else 0.0
-    ep_pct   = sig.get("entry_pct_from_origin", 0) * 100
-    eq_str   = f"\nEQ: {eq:.0f}" if eq else ""
     return (
         f"[DAX] SERPE {ct_dir} (fades {exp_dir} expansion)\n"
         f"Entry: {entry:.0f}  SL: {sl:.0f}  TP: {tp:.0f}\n"
-        f"R: 1:{r}  Entry zone: {ep_pct:.0f}% from origin{eq_str}"
+        f"R: 1:{r}  Peak: {peak:.0f}  EQ: {eq:.0f}"
     )
 
 
@@ -2765,8 +2764,8 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
     Two-phase alert:
       1. Pre-alert — expansion peak confirmed before 11:45 IDT + slowdown forming in pullback.
          Fires once per day so the trader is ready at the screen.
-      2. Entry alert — full 5m counter-BOS fires. Suppressed if peak was ≥ 11:45 IDT
-         (late-session expansions have historically poor WR).
+      2. Entry alert — first lower high (bull expansion) or higher low (bear expansion)
+         in premium zone. Suppressed if peak was ≥ 11:45 IDT (poor historical WR).
     """
     from datetime import time as _time
     from analysis.smc_analyzer import SMCAnalyzer

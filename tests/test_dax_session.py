@@ -1,8 +1,10 @@
 """
 Tests for DAX SERPE session job:
   - detect_dax_expansion_state (new helper in SMCAnalyzer)
+  - detect_dax_session_setup lower-high/higher-low entry
   - _dax_peak_too_late gate
   - _dax_slowdown_present
+  - _format_dax_alert message format (peak + EQ)
   - _format_dax_prealert message format
   - 1h retrace entry fires regardless of alert_pairs (gate move)
 """
@@ -18,6 +20,7 @@ from main import (
     _dax_peak_too_late,
     _dax_slowdown_present,
     _format_dax_prealert,
+    _format_dax_alert,
     _ISRAEL_TZ,
 )
 
@@ -206,6 +209,161 @@ class TestDetectDaxExpansionState:
                 assert key in result, f"Missing key: {key}"
             assert result["expansion_dir"] in ("bullish", "bearish")
             assert result["expansion_range"] > 0
+
+
+# ── detect_dax_session_setup lower-high entry ────────────────────────────────
+
+class TestDetectDaxSessionSetupLowerHigh:
+    """End-to-end tests for the new lower-high/higher-low SERPE entry."""
+
+    PARAMS = {
+        "tp_pct":             0.55,
+        "sl_atr_mult":        0.5,
+        "entry_zone_min_pct": 0.5,   # relaxed so synthetic data passes easily
+        "min_expansion_atr":  0.5,
+    }
+
+    def _pre(self, session_start, n=12, lo=100, hi=110):
+        return [_candle(session_start - (n - i) * 900, lo, hi, lo - 2, lo)
+                for i in range(n)]
+
+    def test_bullish_expansion_lower_high_fires(self):
+        """First 5m candle with lower high → signal returned (short entry)."""
+        analyzer = SMCAnalyzer()
+        sess_start = _ts(9, 0)
+        pre  = self._pre(sess_start, lo=100, hi=110)
+        sess = [
+            _candle(sess_start,         100, 140,  99, 138),   # BOS breaks 110
+            _candle(sess_start +  900,  138, 165, 137, 163),
+            _candle(sess_start + 1800,  163, 200, 162, 198),   # peak = 200
+            _candle(sess_start + 2700,  185, 195, 175, 182),
+        ]
+        peak_ts = sess_start + 1800
+        candles_5m = [
+            _candle(peak_ts,         163, 200, 162, 198),   # peak candle
+            _candle(peak_ts + 300,   190, 195, 178, 185),   # lower high (195 < 200)
+        ]
+        sigs = analyzer.detect_dax_session_setup(
+            sess, candles_5m, params=self.PARAMS, candles_15m_presession=pre
+        )
+        assert len(sigs) == 1
+        sig = sigs[0]
+        assert sig["direction"] == "bearish"         # short: fading bull expansion
+        assert sig["expansion_dir"] == "bullish"
+        assert sig["entry"] == 185                   # close of lower-high candle
+        assert sig["sl"] > 200                       # SL above peak high
+        assert sig["tp"] < sig["entry"]              # TP below entry (toward origin)
+        assert sig["peak"] == 200
+        assert sig["eq_level"] > 100 and sig["eq_level"] < 200
+
+    def test_bearish_expansion_higher_low_fires(self):
+        """First 5m candle with higher low → signal returned (long entry)."""
+        analyzer = SMCAnalyzer()
+        sess_start = _ts(9, 0)
+        # Pre-session: flat at 200
+        pre = [_candle(sess_start - (12 - i) * 900, 195, 202, 195, 198)
+               for i in range(12)]
+        sess = [
+            _candle(sess_start,         198,  199, 160, 162),   # BOS breaks 195 (bearish)
+            _candle(sess_start +  900,  162,  163, 135, 137),
+            _candle(sess_start + 1800,  137,  138, 100, 102),   # peak (low = 100)
+            _candle(sess_start + 2700,  105,  118, 108, 115),
+        ]
+        peak_ts = sess_start + 1800
+        candles_5m = [
+            _candle(peak_ts,         137, 138, 100, 102),   # peak candle (low=100)
+            _candle(peak_ts + 300,   105, 120, 108, 115),   # higher low (108 > 100)
+        ]
+        sigs = analyzer.detect_dax_session_setup(
+            sess, candles_5m, params=self.PARAMS, candles_15m_presession=pre
+        )
+        assert len(sigs) == 1
+        sig = sigs[0]
+        assert sig["direction"] == "bullish"         # long: fading bear expansion
+        assert sig["expansion_dir"] == "bearish"
+        assert sig["sl"] < 100                       # SL below peak low
+        assert sig["tp"] > sig["entry"]              # TP above entry (toward origin)
+
+    def test_no_signal_when_peak_extends(self):
+        """If subsequent 5m candles keep making new highs, no signal fires."""
+        analyzer = SMCAnalyzer()
+        sess_start = _ts(9, 0)
+        pre  = self._pre(sess_start, lo=100, hi=110)
+        sess = [
+            _candle(sess_start,        100, 140,  99, 138),
+            _candle(sess_start + 900,  138, 165, 137, 163),
+            _candle(sess_start + 1800, 163, 200, 162, 198),
+            _candle(sess_start + 2700, 195, 210, 193, 208),   # new high — no peak yet
+        ]
+        peak_ts = sess_start + 1800
+        candles_5m = [
+            _candle(peak_ts,         163, 200, 162, 198),   # "peak" at 200
+            _candle(peak_ts + 300,   198, 210, 197, 208),   # NEW high (210 > 200) → no signal
+            _candle(peak_ts + 600,   205, 212, 203, 210),   # still new highs
+        ]
+        sigs = analyzer.detect_dax_session_setup(
+            sess, candles_5m, params=self.PARAMS, candles_15m_presession=pre
+        )
+        assert sigs == []
+
+    def test_no_signal_when_price_below_entry_zone(self):
+        """Lower high below entry zone (price already pulled back past floor) → no signal."""
+        analyzer = SMCAnalyzer()
+        sess_start = _ts(9, 0)
+        pre  = self._pre(sess_start, lo=100, hi=110)
+        sess = [
+            _candle(sess_start,        100, 140,  99, 138),
+            _candle(sess_start + 900,  138, 165, 137, 163),
+            _candle(sess_start + 1800, 163, 200, 162, 198),
+            _candle(sess_start + 2700, 140, 145, 130, 135),
+        ]
+        # entry_zone_min_pct=0.7 → floor = 100 + 0.7*(200-100) = 170
+        # lower-high candle close = 135 < 170 → should be skipped, then EQ break → no signal
+        tight_params = {**self.PARAMS, "entry_zone_min_pct": 0.7}
+        peak_ts = sess_start + 1800
+        candles_5m = [
+            _candle(peak_ts,         163, 200, 162, 198),
+            _candle(peak_ts + 300,   190, 195, 128, 135),   # lower high but close=135 < floor=170
+        ]
+        sigs = analyzer.detect_dax_session_setup(
+            sess, candles_5m, params=tight_params, candles_15m_presession=pre
+        )
+        assert sigs == []
+
+
+# ── _format_dax_alert ─────────────────────────────────────────────────────────
+
+class TestFormatDaxAlert:
+    def _sig(self):
+        return {
+            "direction":    "bearish",
+            "expansion_dir": "bullish",
+            "entry":        25100.0,
+            "sl":           25200.0,
+            "tp":           24900.0,
+            "peak":         25180.0,
+            "eq_level":     24950.0,
+            "entry_pct_from_origin": 0.82,
+        }
+
+    def test_contains_entry_sl_tp(self):
+        msg = _format_dax_alert(self._sig())
+        assert "25100" in msg
+        assert "25200" in msg
+        assert "24900" in msg
+
+    def test_contains_peak(self):
+        msg = _format_dax_alert(self._sig())
+        assert "25180" in msg
+
+    def test_contains_eq(self):
+        msg = _format_dax_alert(self._sig())
+        assert "24950" in msg
+
+    def test_contains_direction(self):
+        msg = _format_dax_alert(self._sig())
+        assert "BEARISH" in msg
+        assert "BULLISH" in msg
 
 
 # ── 1h retrace fires regardless of alert_pairs ───────────────────────────────

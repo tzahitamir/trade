@@ -699,12 +699,11 @@ class SMCAnalyzer:
 
         1. Detect session expansion via 15m BOS against pre-session structure.
         2. Find the expansion peak (session high for bull, session low for bear).
-        3. From the peak, scan 5m for a CHoCH/BOS COUNTER-TREND (bearish for bull
-           expansion, bullish for bear expansion).
-        4. Accept signal only while price is still in premium zone (above eq_level
-           for bearish counter-trade; below eq_level for bullish counter-trade).
-        5. TP = origin + tp_pct × expansion_range (mean reversion target).
-        6. SL = recent 5m swing extreme + sl_atr_mult × ATR_5m.
+        3. From the peak, scan 5m for the FIRST LOWER HIGH (bullish expansion)
+           or FIRST HIGHER LOW (bearish expansion) while price is still in the
+           premium zone (≥ entry_zone_min_pct from origin).
+        4. TP = origin + tp_pct × expansion_range (mean reversion target).
+        5. SL = peak extreme + sl_atr_mult × ATR_5m (structural stop).
 
         Returns at most one signal per session (the first qualifying SERPE entry).
         """
@@ -713,8 +712,6 @@ class SMCAnalyzer:
         sl_atr_mult    = params.get("sl_atr_mult", 0.5)
         min_exp_atr    = params.get("min_expansion_atr", 1.0)
         entry_zone_pct = params.get("entry_zone_min_pct", 0.5)
-        swing_lb_5m    = params.get("swing_lookback_5m", 12)
-        min_str_5m     = params.get("min_break_str_5m", 0.3)
 
         if len(candles_15m_session) < 3:
             return []
@@ -787,68 +784,41 @@ class SMCAnalyzer:
         tp_level    = (origin + tp_pct       * expansion_range) if bullish_exp else (origin - tp_pct       * expansion_range)
         entry_floor = (origin + entry_zone_pct * expansion_range) if bullish_exp else (origin - entry_zone_pct * expansion_range)
 
-        # Step 3 — scan 5m COUNTER-TREND starting from the expansion peak
+        # Step 3 — scan 5m for the FIRST candle after peak that shows reversal:
+        #   bullish expansion → first lower high (high < peak high)
+        #   bearish expansion → first higher low (low > peak low)
+        # Price must still be in the premium entry zone when the signal fires.
         post_peak_5m = [c for c in candles_5m_full if c["timestamp"] >= peak_ts]
-        if len(post_peak_5m) < 5:
+        if len(post_peak_5m) < 2:
             return []
 
-        atr_5m = self.calculate_atr(list(reversed(post_peak_5m[:60]))) or (expansion_range * 0.005)
+        atr_5m   = self.calculate_atr(list(reversed(post_peak_5m[:60]))) or (expansion_range * 0.005)
+        peak_ext = peak  # high for bull expansion, low for bear expansion
 
-        for i in range(4, min(len(post_peak_5m), 120)):
+        for i in range(1, min(len(post_peak_5m), 120)):  # skip index 0 (the peak candle itself)
             cur = post_peak_5m[i]
 
-            # Stop if price has moved through eq_level — mean reversion already playing out
+            # Stop if price has moved through eq_level — mean reversion already in progress
             if bullish_exp  and cur["close"] < eq_level:
                 break
             if not bullish_exp and cur["close"] > eq_level:
                 break
 
-            # Skip if price hasn't pulled back into the premium entry zone yet
+            # Skip if price is not yet in the premium entry zone
             if bullish_exp  and cur["close"] < entry_floor:
                 continue
             if not bullish_exp and cur["close"] > entry_floor:
                 continue
 
-            window_5m      = post_peak_5m[max(0, i - swing_lb_5m + 1): i + 1]
-            window_5m_desc = list(reversed(window_5m))
-            if len(window_5m) < 5:
-                continue
+            lower_high = bullish_exp  and cur["high"] < peak_ext
+            higher_low = not bullish_exp and cur["low"]  > peak_ext
 
-            # detect_bos computes ATR internally, but the 5m window is often < 15
-            # candles, making calculate_atr return None → atr=0 → break_strength=0.
-            # Fix: pass min_break_distance as an absolute value from the wider atr_5m,
-            # and disable the relative strength filter (min_break_strength=0.0).
-            events_5m = self.detect_bos(
-                window_5m_desc,
-                params={
-                    "min_break_strength":       0.0,
-                    "min_break_distance":       min_str_5m * atr_5m,
-                    "min_swing_age_candles":    2,
-                    "swing_lookback":           len(window_5m),
-                    "min_break_distance_atr_mult": 0.0,
-                    "min_atr_pct":              0.0,
-                    "require_liquidity_sweep":  False,
-                    "symbol":                   params.get("symbol"),
-                    "timeframe":                "5m",
-                },
-            )
+            if lower_high or higher_low:
+                entry = cur["close"]
 
-            for ev in events_5m:
-                if ev["direction"] != ct_dir:
-                    continue
-
-                entry_candle = next((c for c in post_peak_5m if c["timestamp"] == ev["breakout_ts"]), cur)
-                entry = entry_candle["close"]
-
-                # Confirm entry is still in premium zone at the signal moment
-                if bullish_exp  and (entry <= eq_level or entry < entry_floor):
-                    continue
-                if not bullish_exp and (entry >= eq_level or entry > entry_floor):
-                    continue
-
-                recent = post_peak_5m[max(0, i - 3): i + 1]
-                sl = (max(c["high"] for c in recent) + sl_atr_mult * atr_5m) if bullish_exp \
-                    else (min(c["low"] for c in recent) - sl_atr_mult * atr_5m)
+                # SL: structural stop beyond the expansion extreme
+                sl = (peak_ext + sl_atr_mult * atr_5m) if bullish_exp \
+                     else (peak_ext - sl_atr_mult * atr_5m)
 
                 risk      = abs(entry - sl) or atr_5m
                 retrace   = abs(peak - entry) / expansion_range if expansion_range else 0.0
@@ -859,7 +829,7 @@ class SMCAnalyzer:
                     "timeframe":             "15m+5m",
                     "direction":             ct_dir,
                     "expansion_dir":         direction,
-                    "breakout_ts":           ev["breakout_ts"],
+                    "breakout_ts":           cur["timestamp"],
                     "bos_15m_ts":            bos_ts,
                     "peak_ts":               peak_ts,
                     "origin":                round(origin, 2),
@@ -870,7 +840,6 @@ class SMCAnalyzer:
                     "sl":                    round(sl, 2),
                     "tp":                    round(tp_level, 2),
                     "risk":                  round(risk, 2),
-                    "bos_5m_level":          round(ev["broken_level"], 2),
                     "retrace_depth_pct":     round(retrace, 2),
                     "entry_pct_from_origin": round(entry_pct, 2),
                 }]
