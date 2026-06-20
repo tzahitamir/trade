@@ -2929,19 +2929,31 @@ def _format_dax_prealert(exp: dict) -> str:
 
 def _format_dax_alert(sig: dict) -> str:
     """Format a DAX SERPE lower-high/higher-low entry signal for Telegram."""
-    ct_dir   = sig["direction"].upper()
-    exp_dir  = sig.get("expansion_dir", "").upper()
-    entry    = sig["entry"]
-    sl       = sig["sl"]
-    tp       = sig["tp"]
-    peak     = sig.get("peak", 0)
-    eq       = sig.get("eq_level", 0)
-    risk     = abs(entry - sl)
-    r        = round(abs(tp - entry) / risk, 1) if risk else 0.0
+    ct_dir    = sig["direction"].upper()       # BEARISH = SHORT, BULLISH = LONG
+    exp_dir   = sig.get("expansion_dir", "").upper()
+    entry     = sig["entry"]
+    sl        = sig["sl"]
+    tp        = sig["tp"]
+    peak      = sig.get("peak", 0)
+    origin    = sig.get("origin", 0)
+    eq        = sig.get("eq_level", 0)
+    extreme   = sig.get("signal_extreme", 0)  # LH high (short) or HL low (long)
+    exp_size  = abs(peak - origin)
+    risk      = abs(entry - sl)
+    r         = round(abs(tp - entry) / risk, 1) if risk else 0.0
+    lh_hl     = "LH" if ct_dir == "BEARISH" else "HL"
+    action    = "SELL ↓" if ct_dir == "BEARISH" else "BUY  ↑"
     return (
-        f"[DAX] SERPE {ct_dir} (fades {exp_dir} expansion)\n"
-        f"Entry: {entry:.0f}  SL: {sl:.0f}  TP: {tp:.0f}\n"
-        f"R: 1:{r}  Peak: {peak:.0f}  EQ: {eq:.0f}"
+        f"<b>[DAX] SERPE {ct_dir}</b>  (fades {exp_dir} expansion)\n"
+        f"\n"
+        f"Expansion:  <code>{origin:.0f} → {peak:.0f}  ({exp_size:.0f} pts)</code>\n"
+        f"EQ (50%):   <code>{eq:.0f}</code>\n"
+        f"{lh_hl} extreme: <code>{extreme:.0f}</code>\n"
+        f"\n"
+        f"{action}  Entry: <code>{entry:.0f}</code>\n"
+        f"SL:          <code>{sl:.0f}</code>\n"
+        f"TP:          <code>{tp:.0f}</code>\n"
+        f"R:R          <code>1:{r}</code>"
     )
 
 
@@ -3077,6 +3089,11 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
             return
 
         _dax_alerted_dates.add(today)
+        # Enrich signal with LH/HL candle extreme for alert text and chart
+        entry_bar = next((c for c in day_5m if c["timestamp"] == sig.get("breakout_ts")), None)
+        if entry_bar:
+            extreme = entry_bar["high"] if sig["direction"] == "bearish" else entry_bar["low"]
+            sig = {**sig, "signal_extreme": extreme}
         _dlog.info("[DAX_SESSION] ENTRY_SIGNAL | dir=%s entry=%.0f sl=%.0f tp=%.0f | alerts_on=%s",
                    sig.get("direction"), sig.get("entry", 0), sig.get("sl", 0),
                    sig.get("tp", 0), alerts_on)

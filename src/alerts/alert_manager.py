@@ -1056,8 +1056,8 @@ class AlertManager:
         lows    = [b["low"]  for b in all_bars]
         highs   = [b["high"] for b in all_bars]
         pad     = (max(highs) - min(lows)) * 0.06
-        y_lo    = min(min(lows), sl, tp) - pad
-        y_hi    = max(max(highs), sl, tp) + pad
+        y_lo    = min(min(lows), sl, tp, origin, peak) - pad
+        y_hi    = max(max(highs), sl, tp, origin, peak) + pad
         ax.set_xlim(-1, x_total)
         ax.set_ylim(y_lo, y_hi)
 
@@ -1079,17 +1079,33 @@ class AlertManager:
             ax.axvline(peak_x, color="darkorange", linestyle="--", linewidth=1.2, alpha=0.8, zorder=1)
             ax.text(peak_x + 0.3, y_hi - pad * 0.3, "PEAK", fontsize=6, color="darkorange", va="top")
 
-        # Horizontal levels
-        ax.hlines(origin,   0, x_total, colors="gray",       linestyles=":",  linewidth=1.0, zorder=2, label="origin")
-        ax.hlines(peak,     0, x_total, colors="steelblue",  linestyles=":",  linewidth=1.0, zorder=2, label="peak")
-        ax.hlines(eq_level, 0, x_total, colors="orange",     linestyles="--", linewidth=1.2, zorder=2, label="EQ 50%")
-        ax.hlines(sl,  entry_x, x_total, colors="red",       linestyles="--", linewidth=1.3, zorder=3)
-        ax.hlines(tp,  entry_x, x_total, colors="limegreen", linestyles="--", linewidth=1.3, zorder=3)
+        # LH/HL candle extreme (signal candle high for short, low for long)
+        signal_bar    = display_5m[-1]
+        signal_extreme = signal_bar["high"] if direction == "bearish" else signal_bar["low"]
+        lh_hl_label   = "LH" if direction == "bearish" else "HL"
+
+        # Horizontal levels — full width for structure, entry_x+ for trade levels
+        ax.hlines(origin,         0,       x_total, colors="#888888",   linestyles=":",  linewidth=1.0, zorder=2)
+        ax.hlines(peak,           0,       x_total, colors="steelblue", linestyles=":",  linewidth=1.0, zorder=2)
+        ax.hlines(eq_level,       0,       x_total, colors="orange",    linestyles="--", linewidth=1.4, zorder=2)
+        ax.hlines(signal_extreme, 0,       entry_x, colors="#cc88ff",   linestyles="-",  linewidth=1.0, zorder=3)
+        ax.hlines(entry,          entry_x, x_total, colors="yellow",    linestyles="-",  linewidth=1.0, zorder=3, alpha=0.8)
+        ax.hlines(sl,             entry_x, x_total, colors="#ff4444",   linestyles="--", linewidth=1.8, zorder=4)
+        ax.hlines(tp,             entry_x, x_total, colors="#44ff88",   linestyles="--", linewidth=1.8, zorder=4)
+
+        # Right-side labels
+        origin_lbl = "LOW" if bullish_exp else "HIGH"
         for lvl, lbl, col in [
-            (origin, "orig", "gray"), (peak, "peak", "steelblue"),
-            (eq_level, "EQ", "orange"), (sl, "SL", "red"), (tp, "TP", "limegreen"),
+            (origin,         origin_lbl,   "#888888"),
+            (peak,           "PEAK",       "steelblue"),
+            (eq_level,       "EQ",         "orange"),
+            (signal_extreme, lh_hl_label,  "#cc88ff"),
+            (entry,          "ENTRY",      "goldenrod"),
+            (sl,             f"SL  {sl:.0f}",  "#ff4444"),
+            (tp,             f"TP  {tp:.0f}",  "#44ff88"),
         ]:
-            ax.text(x_total - 0.2, lvl, f" {lbl}", fontsize=7, color=col, va="center", fontweight="bold")
+            ax.text(x_total - 0.2, lvl, f"  {lbl}", fontsize=7, color=col,
+                    va="center", fontweight="bold")
 
         # Entry arrow
         action      = "SELL" if direction == "bearish" else "BUY"
@@ -1114,13 +1130,20 @@ class AlertManager:
         )
 
         # Trade info box — top left
-        risk   = abs(entry - sl)
-        r      = round(abs(tp - entry) / risk, 1) if risk else 0.0
-        ep_pct = sig.get("entry_pct_from_origin", 0) * 100
-        info   = f"Entry: {entry:.0f}  SL: {sl:.0f}  TP: {tp:.0f}  R: 1:{r}  zone: {ep_pct:.0f}%"
+        risk      = abs(entry - sl)
+        r         = round(abs(tp - entry) / risk, 1) if risk else 0.0
+        exp_size  = abs(peak - origin)
+        origin_lbl2 = "Low" if bullish_exp else "High"
+        info = (
+            f"{'Low' if bullish_exp else 'High'}: {origin:.0f}   Peak: {peak:.0f}   "
+            f"Exp: {exp_size:.0f} pts\n"
+            f"EQ: {eq_level:.0f}   {lh_hl_label}: {signal_extreme:.0f}   "
+            f"Entry: {entry:.0f}\n"
+            f"SL: {sl:.0f}   TP: {tp:.0f}   R:R 1:{r}"
+        )
         ax.text(
-            0.01, 0.98, info, transform=ax.transAxes, fontsize=7,
-            color="black", ha="left", va="top", zorder=10,
+            0.01, 0.02, info, transform=ax.transAxes, fontsize=7,
+            color="black", ha="left", va="bottom", zorder=10, family="monospace",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.95, edgecolor="gray"),
         )
 
@@ -1140,7 +1163,6 @@ class AlertManager:
             fontsize=9,
         )
         ax.tick_params(axis="y", labelsize=7)
-        ax.legend(fontsize=7, loc="lower left")
 
         bos_dt      = datetime.fromtimestamp(entry_ts, tz=timezone.utc)
         outcome_tag = outcome.lower().replace(" ", "_")
