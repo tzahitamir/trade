@@ -20,8 +20,15 @@ Key times (UTC, summer CEST = UTC+2, IDT = UTC+3):
 
 import sys
 import logging
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, date
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyArrowPatch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from db.local_db import LocalDB
@@ -330,7 +337,7 @@ def run_brief(target_date: date, db: LocalDB | None = None,
         tp_level = sweep_level + (fkft_close - sweep_level) * 0.33 if bullish \
                    else sweep_level - (sweep_level - fkft_close) * 0.33
 
-    return {
+    state = {
         # Identity
         "date":               target_date,
         "setup_type":         setup_type,
@@ -356,7 +363,193 @@ def run_brief(target_date: date, db: LocalDB | None = None,
         "sl_level":           sl_b if sweep_expected else sl_a,
         # Output
         "brief":              brief,
+        "chart_path":         None,
     }
+
+    # Render chart (skip_small / skip_event don't need one)
+    if setup_type not in (SETUP_SKIP_SMALL, SETUP_SKIP_EVENT):
+        try:
+            state["chart_path"] = render_brief_chart(state, all5m)
+        except Exception as exc:
+            logging.warning("Brief chart render failed: %s", exc)
+
+    return state
+
+
+def render_brief_chart(result: dict, all5m: list, out_path: str | None = None) -> str:
+    """
+    Render overnight GER40 5m chart for the morning brief and save as PNG.
+    Shows: Frankfurt close line, Asian session shading, sweep level, current price.
+    Returns the file path.
+    """
+    target_date  = result["date"]
+    prev_date    = prev_trading_day(target_date)
+    fkft_close   = result["fkft_close"]
+    asian_low    = result["asian_low"]
+    asian_high   = result["asian_high"]
+    asian_mid    = result["asian_mid"]
+    sweep_level  = result["sweep_level"]
+    sweep_label  = result["sweep_label"]
+    current_price = result["current_price"]
+    setup_type   = result["setup_type"]
+    gap_atr      = result["gap_atr"]
+    bullish      = result["bullish"]
+    trade_dir    = result["trade_dir"]
+    tp_level     = result["tp_level"]
+
+    # ── Filter candles: 14:30 UTC prev_date → 04:30 UTC target_date ──────────
+    t_start = ts_utc(prev_date, 14, 30)
+    t_end   = ts_utc(target_date, 4, 30)
+    candles = [c for c in all5m if t_start <= c["timestamp"] <= t_end]
+    if len(candles) < 10:
+        raise ValueError(f"Too few candles for chart ({len(candles)})")
+
+    # Convert timestamps → datetime objects for x-axis
+    dts = [datetime.fromtimestamp(c["timestamp"], timezone.utc) for c in candles]
+    xs  = list(range(len(candles)))
+
+    # ── Key x positions ───────────────────────────────────────────────────────
+    fkft_close_ts  = ts_utc(prev_date, 15, 25)
+    asian_start_ts = ts_utc(prev_date, 22,  5)
+    entry_ts       = ts_utc(target_date, 4,  0)
+
+    def nearest_x(ts: int) -> int:
+        best, best_x = None, 0
+        for i, c in enumerate(candles):
+            diff = abs(c["timestamp"] - ts)
+            if best is None or diff < best:
+                best, best_x = diff, i
+        return best_x
+
+    x_fkft_close   = nearest_x(fkft_close_ts)
+    x_asian_start  = nearest_x(asian_start_ts)
+    x_entry        = nearest_x(entry_ts)
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 6))
+    fig.patch.set_facecolor("#1a1a2e")
+    ax.set_facecolor("#16213e")
+
+    # Candles
+    W = 0.6
+    for i, c in enumerate(candles):
+        o, h_, l, cl = c["open"], c["high"], c["low"], c["close"]
+        color = "#26a69a" if cl >= o else "#ef5350"
+        ax.add_patch(plt.Rectangle((i - W/2, min(o, cl)), W, abs(cl - o),
+                                   color=color, zorder=3))
+        ax.plot([i, i], [l, h_], color=color, linewidth=0.8, zorder=2)
+
+    # ── Session background shading ────────────────────────────────────────────
+    # Frankfurt close to Asian open = NY evening (dim)
+    ax.axvspan(x_fkft_close, x_asian_start, color="#ffffff", alpha=0.03, zorder=1, label="_nolegend_")
+    # Asian session = light blue tint
+    ax.axvspan(x_asian_start, x_entry, color="#4fc3f7", alpha=0.07, zorder=1, label="_nolegend_")
+
+    # ── Vertical markers ──────────────────────────────────────────────────────
+    ax.axvline(x_fkft_close,  color="#FFD700", linestyle="--", linewidth=0.9, alpha=0.6, zorder=2)
+    ax.axvline(x_asian_start, color="#4fc3f7",  linestyle="--", linewidth=0.9, alpha=0.6, zorder=2)
+    ax.axvline(x_entry,       color="#90caf9",  linestyle=":",  linewidth=1.1, alpha=0.8, zorder=2)
+
+    all_prices = [c["high"] for c in candles] + [c["low"] for c in candles]
+    y_min, y_max = min(all_prices), max(all_prices)
+    y_pad = (y_max - y_min) * 0.08
+    label_y = y_max + y_pad * 0.3
+
+    for vx, label, color in [
+        (x_fkft_close,  "Prev Close", "#FFD700"),
+        (x_asian_start, "Asian Open", "#4fc3f7"),
+        (x_entry,       "07:00 IDT",  "#90caf9"),
+    ]:
+        ax.text(vx + 0.3, label_y, label, color=color, fontsize=7,
+                va="bottom", ha="left", rotation=0,
+                bbox=dict(facecolor="#1a1a2e", edgecolor="none", pad=1), zorder=5)
+
+    LABEL_X = len(xs) + 0.8  # right-side label anchor
+
+    def hline(price, color, lw, ls, alpha, label_txt, label_color=None):
+        ax.axhline(price, color=color, linewidth=lw, linestyle=ls, alpha=alpha, zorder=4)
+        ax.text(LABEL_X, price, f" {label_txt}", color=label_color or color,
+                fontsize=8, va="center", ha="left", zorder=5,
+                bbox=dict(facecolor="#1a1a2e", edgecolor="none", pad=1))
+
+    # Frankfurt close — most important line
+    hline(fkft_close,  "#FFD700", 1.8, "-",  0.90, f"Close {fkft_close:.0f}")
+    # Asian range
+    hline(asian_high,  "#ef5350", 1.0, "--", 0.75, f"Asian H {asian_high:.0f}")
+    hline(asian_low,   "#26a69a", 1.0, "--", 0.75, f"Asian L {asian_low:.0f}")
+    hline(asian_mid,   "#888888", 0.8, ":",  0.60, f"Mid {asian_mid:.0f}")
+    # Sweep level (highlighted)
+    sweep_color = "#26a69a" if bullish else "#ef5350"
+    hline(sweep_level, sweep_color, 1.6, "--", 0.90,
+          f"SWEEP {sweep_level:.0f}", label_color="#ffffff")
+    # Current price at 07:00 IDT
+    hline(current_price, "#90caf9", 1.0, ":", 0.85, f"Now {current_price:.0f}")
+    # TP line (subtle)
+    hline(tp_level, "#FFD700", 0.7, ":", 0.45, f"TP {tp_level:.0f}")
+
+    # Gap annotation arrow
+    mid_x  = (x_fkft_close + x_entry) // 2
+    y_from = current_price
+    y_to   = fkft_close
+    ax.annotate(
+        "", xy=(mid_x, y_to), xytext=(mid_x, y_from),
+        arrowprops=dict(arrowstyle="<->", color="#FFD700", lw=1.2),
+        zorder=5,
+    )
+    ax.text(mid_x + 0.5, (y_from + y_to) / 2,
+            f"gap\n{abs(gap_atr):.2f}×ATR",
+            color="#FFD700", fontsize=7.5, va="center", ha="left", zorder=5,
+            bbox=dict(facecolor="#1a1a2e", edgecolor="none", pad=1))
+
+    # ── X-axis: hourly labels ──────────────────────────────────────────────────
+    label_xs, label_strs = [], []
+    for i, c in enumerate(candles):
+        dt = dts[i]
+        idt_h = (dt.hour + 3) % 24
+        if dt.minute == 0 and idt_h % 2 == 1:  # label every 2h, on the odd IDT hour
+            label_xs.append(i)
+            if dt.date() != prev_date:
+                label_strs.append(f"{idt_h:02d}:00\n{dt.strftime('%d/%m')}")
+            else:
+                label_strs.append(f"{idt_h:02d}:00")
+    ax.set_xticks(label_xs)
+    ax.set_xticklabels(label_strs, fontsize=7.5, color="#cccccc")
+
+    ax.set_ylim(y_min - y_pad, y_max + y_pad * 2.5)
+    ax.set_xlim(-1, len(xs) + 10)
+    ax.tick_params(axis="y", colors="#cccccc", labelsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    for s in ["bottom", "left"]:
+        ax.spines[s].set_color("#444466")
+    ax.yaxis.grid(color="#2a2a4a", linewidth=0.5, zorder=0)
+
+    # ── Title + info box ──────────────────────────────────────────────────────
+    dow_name = ["Mon", "Tue", "Wed", "Thu", "Fri"][target_date.weekday()]
+    ax.set_title(
+        f"GER40 5m  │  {dow_name} {target_date}  │  Setup {setup_type.upper()}  │  gap {gap_atr:.2f}×ATR  [{trade_dir}]",
+        fontsize=10.5, fontweight="bold", color="#e0e0e0", pad=8,
+    )
+
+    # Legend patches
+    legend_items = [
+        mpatches.Patch(color="#FFD700", label=f"Frankfurt close {fkft_close:.0f}"),
+        mpatches.Patch(color=sweep_color, label=f"{sweep_label} (sweep) {sweep_level:.0f}"),
+        mpatches.Patch(color="#4fc3f7",  label="Asian session"),
+    ]
+    ax.legend(handles=legend_items, loc="upper left", fontsize=8,
+              facecolor="#1a1a2e", edgecolor="#444466", labelcolor="white",
+              framealpha=0.9)
+
+    plt.tight_layout()
+
+    if out_path is None:
+        fd, out_path = tempfile.mkstemp(suffix=".png", prefix="dax_brief_")
+        import os; os.close(fd)
+    plt.savefig(out_path, dpi=130, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out_path
 
 
 def _send_telegram(msg: str) -> None:

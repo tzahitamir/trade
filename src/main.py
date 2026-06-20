@@ -2640,6 +2640,7 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
     trading brief, and sends it to Telegram.
     If the EA file is missing/stale, sends a Telegram alert instead.
     """
+    global _dax_brief_state
     from datetime import date as _date
     from data.ger40_file_reader import read_candles, check_staleness, get_file_paths, StaleFeedError
 
@@ -2649,6 +2650,7 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
     if now_utc.weekday() >= 5:
         return
 
+    _dax_brief_state = {}   # reset each morning before computing new state
     _dlog.info("[DAX_BRIEF] START | %s UTC", now_utc.strftime("%H:%M"))
 
     _, hb_path = get_file_paths()
@@ -2694,12 +2696,16 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
             source = "DB (MT5 feed unavailable)"
 
         if result:
-            brief_text = result["brief"].replace("<", "&lt;").replace(">", "&gt;")
-            msg = f"<pre>{brief_text}</pre>\n<i>Source: {source}</i>"
-            alert_manager.notifier.send(msg)
-            _dlog.info("[DAX_BRIEF] Sent | gap_atr=%.2f dir=%s sweep_dist=%.2f",
-                       result.get("gap_atr", 0), result.get("trade_dir", "?"),
-                       result.get("dist_to_sweep_atr", 0))
+            _dax_brief_state = {**result, "sweep_triggered": False}
+            caption = f"<code>{result['brief']}</code>\n\n<i>Source: {source}</i>"
+            chart   = result.get("chart_path")
+            if chart:
+                alert_manager.notifier.send_photo(chart, caption=caption)
+            else:
+                alert_manager.notifier.send_message(caption)
+            _dlog.info("[DAX_BRIEF] Sent | setup=%s gap_atr=%.2f dir=%s sweep_dist=%.2f",
+                       result.get("setup_type"), result.get("gap_atr", 0),
+                       result.get("trade_dir", "?"), result.get("dist_to_sweep_atr", 0))
         else:
             _dlog.info("[DAX_BRIEF] No tradeable gap today — skip alert")
 
