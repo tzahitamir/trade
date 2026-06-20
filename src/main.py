@@ -2630,6 +2630,213 @@ def _run_fvg_param_sweep(raw_signals: list, db: LocalDB,
     return all_pair_stats, all_symbols, pset_ids
 
 
+# ──────────────────────── DAX PRE-FRANKFURT MORNING BRIEF ────────────────────
+
+
+def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
+    """
+    Runs at 04:00 UTC (07:00 IDT) Mon–Fri.
+    Reads live GER40 5m data from the MT5 EA file, generates a pre-Frankfurt
+    trading brief, and sends it to Telegram.
+    If the EA file is missing/stale, sends a Telegram alert instead.
+    """
+    from datetime import date as _date
+    from data.ger40_file_reader import read_candles, check_staleness, get_file_paths, StaleFeedError
+
+    now_utc = datetime.now(timezone.utc)
+    target  = now_utc.date()
+
+    if now_utc.weekday() >= 5:
+        return
+
+    _dlog.info("[DAX_BRIEF] START | %s UTC", now_utc.strftime("%H:%M"))
+
+    _, hb_path = get_file_paths()
+
+    # 1. Check MT5 / EA staleness
+    try:
+        check_staleness(hb_path, now_utc=now_utc)
+    except StaleFeedError as exc:
+        msg = (
+            f"⚠️ <b>DAX Morning Brief — MT5 FEED DOWN</b>\n"
+            f"{now_utc.strftime('%H:%M UTC')} / {(now_utc.hour+3)%24:02d}:{now_utc.minute:02d} IDT\n\n"
+            f"{exc}\n\n"
+            "Cannot generate pre-Frankfurt brief.\n"
+            "Check MT5 is running and <code>GER40_M5_export</code> EA is on the GER40 M5 chart."
+        )
+        _dlog.warning("[DAX_BRIEF] MT5 feed stale: %s", exc)
+        alert_manager.notifier.send(msg)
+        return
+
+    # 2. Load live candles
+    try:
+        all5m = read_candles(limit=350)
+    except (FileNotFoundError, StaleFeedError) as exc:
+        _dlog.warning("[DAX_BRIEF] File read error: %s — falling back to DB", exc)
+        all5m = None
+
+    # 3. Run brief
+    try:
+        # Import the brief runner from local_dev (sibling of src/)
+        import importlib.util, pathlib
+        spec   = importlib.util.spec_from_file_location(
+            "dax_morning_brief",
+            pathlib.Path(__file__).resolve().parents[1] / "local_dev" / "dax_morning_brief.py"
+        )
+        mod    = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        if all5m:
+            result = mod.run_brief(target, all5m=all5m, verbose=False)
+            source = "live MT5 feed"
+        else:
+            result = mod.run_brief(target, db=db, verbose=False)
+            source = "DB (MT5 feed unavailable)"
+
+        if result:
+            brief_text = result["brief"].replace("<", "&lt;").replace(">", "&gt;")
+            msg = f"<pre>{brief_text}</pre>\n<i>Source: {source}</i>"
+            alert_manager.notifier.send(msg)
+            _dlog.info("[DAX_BRIEF] Sent | gap_atr=%.2f dir=%s sweep_dist=%.2f",
+                       result.get("gap_atr", 0), result.get("trade_dir", "?"),
+                       result.get("dist_to_sweep_atr", 0))
+        else:
+            _dlog.info("[DAX_BRIEF] No tradeable gap today — skip alert")
+
+    except Exception as exc:
+        _dlog.error("[DAX_BRIEF] Error generating brief: %s", exc, exc_info=True)
+
+
+# ── DAX brief state — shared between morning brief job and sweep watcher ──────
+_dax_brief_state: dict = {}   # populated at 04:00 UTC, read every minute until 06:30 UTC
+
+
+def dax_sweep_watcher_job(alert_manager) -> None:
+    """
+    Runs every minute 04:00–06:30 UTC (07:00–09:30 IDT) Mon–Fri.
+    Watches for sweep trigger on Setup B / large_gap_sweep days.
+    Also fires 'no sweep — enter now' at 07:20 IDT for uncertain zone.
+    Also fires 'window expired' at 09:30 IDT if sweep never came.
+    """
+    global _dax_brief_state
+    from data.ger40_file_reader import read_candles, StaleFeedError
+
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:
+        return
+
+    h, m = now_utc.hour, now_utc.minute
+    # Only run 04:00–06:35 UTC
+    if not (4 <= h < 6 or (h == 6 and m <= 35)):
+        return
+
+    state = _dax_brief_state
+    if not state or not state.get("sweep_expected"):
+        # Uncertain zone: fire Setup A alert at 07:20 IDT (04:20 UTC) if no sweep yet
+        if (state and state.get("setup_type") == "uncertain"
+                and h == 4 and 19 <= m <= 21
+                and not state.get("uncertain_a_sent")):
+            _send_setup_a_now(state, alert_manager, now_utc)
+            _dax_brief_state["uncertain_a_sent"] = True
+        return
+
+    if state.get("sweep_triggered"):
+        return  # already fired, nothing to do
+
+    # Window expiry at 09:30 IDT (06:30 UTC)
+    if h == 6 and m >= 30 and not state.get("expire_sent"):
+        _dax_brief_state["expire_sent"] = True
+        setup = state["setup_type"]
+        msg = (
+            f"<b>DAX — Sweep window expired  09:30 IDT</b>\n"
+            f"Setup {setup.upper()} was watching {state['sweep_level']:.0f} "
+            f"({state['sweep_label']})\n"
+            f"No sweep materialised — skip, window closed.\n"
+            f"(Frankfurt opens 10:00 IDT — avoid 09:50–10:10)"
+        )
+        alert_manager.notifier.send(msg)
+        _dlog.info("[DAX_SWEEP] Window expired, no sweep")
+        return
+
+    # Read latest price from EA file
+    try:
+        candles = read_candles(limit=5)
+        if not candles:
+            return
+        latest = candles[-1]
+        price_high = latest["high"]
+        price_low  = latest["low"]
+    except Exception as exc:
+        _dlog.debug("[DAX_SWEEP] Candle read error: %s", exc)
+        return
+
+    bullish     = state["bullish"]
+    sweep_level = state["sweep_level"]
+    swept       = (price_low <= sweep_level) if bullish else (price_high >= sweep_level)
+
+    if not swept:
+        return
+
+    # Sweep detected — fire entry alert
+    _dax_brief_state["sweep_triggered"] = True
+    setup       = state["setup_type"]
+    trade_dir   = state["trade_dir"]
+    tp          = state["tp_level"]
+    sl          = state["sl_level"]
+    atr         = state["atr"]
+    sl_pts      = abs(sweep_level - sl)
+    tp_pts      = abs(tp - sweep_level)
+    rr          = tp_pts / sl_pts if sl_pts > 0 else 0
+    idt_h       = (now_utc.hour + 3) % 24
+
+    if setup == "large_gap_sweep":
+        gap_pct_label = "33% of gap"
+        extra = f"\nGap {state['gap_atr']:.1f}×ATR — large gap setup. Exit 09:30 IDT hard."
+    else:
+        gap_pct_label = "Frankfurt close"
+        extra = f"\nR:R ~{rr:.1f}× (historical median ~8.5×)"
+
+    msg = (
+        f"<b>DAX SWEEP TRIGGERED  {idt_h:02d}:{now_utc.minute:02d} IDT</b>\n"
+        f"\n"
+        f"Price touched {state['sweep_label']} at {sweep_level:.0f}\n"
+        f"\n"
+        f"ENTER NOW — {trade_dir}\n"
+        f"Entry : {sweep_level:.0f}  (at sweep extreme)\n"
+        f"TP    : {tp:.0f}  ({gap_pct_label})\n"
+        f"SL    : {sl:.0f}  ({atr*0.25:.0f} pts beyond sweep){extra}\n"
+        f"\n"
+        f"Exit hard stop : 09:30 IDT"
+    )
+    alert_manager.notifier.send(msg)
+    _dlog.info("[DAX_SWEEP] Triggered | setup=%s price=%.0f sweep_level=%.0f",
+               setup, price_low if bullish else price_high, sweep_level)
+
+
+def _send_setup_a_now(state: dict, alert_manager, now_utc) -> None:
+    """Fire 'no sweep — enter Setup A now' alert for uncertain zone at 07:20 IDT."""
+    trade_dir = state["trade_dir"]
+    entry     = state["current_price"]
+    tp1       = state["asian_mid"]
+    tp2       = state["fkft_close"]
+    sl        = state["sl_level"]
+    sl_pts    = abs(entry - sl)
+    idt_h     = (now_utc.hour + 3) % 24
+    msg = (
+        f"<b>DAX — No sweep by 07:20 IDT → SETUP A</b>\n"
+        f"\n"
+        f"Enter now at market — {trade_dir}\n"
+        f"Entry : {entry:.0f}\n"
+        f"TP1   : {tp1:.0f}  (Asian mid — 81% hit rate)\n"
+        f"TP2   : {tp2:.0f}  (Frankfurt close)\n"
+        f"SL    : {sl:.0f}  ({sl_pts:.0f} pts)\n"
+        f"\n"
+        f"Exit hard stop : 09:30 IDT"
+    )
+    alert_manager.notifier.send(msg)
+    _dlog.info("[DAX_SWEEP] Uncertain zone — no sweep, firing Setup A")
+
+
 # ──────────────────────────────── DAX STRATEGY ────────────────────────────────
 
 try:
@@ -4842,11 +5049,35 @@ def main() -> None:
         max_instances=1,
         id="trade_heartbeat_job",
     )
+    scheduler.add_job(
+        dax_morning_brief_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=4,
+        minute=0,
+        second=0,
+        args=[db, alert_manager],
+        max_instances=1,
+        id="trade_dax_morning_brief_job",
+    )
+    scheduler.add_job(
+        dax_sweep_watcher_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="4-6",
+        minute="*",
+        second=15,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_dax_sweep_watcher_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
     logging.info("Gap check job runs daily at 06:00 UTC")
     logging.info("Daily report job runs at 21:00 IDT (18:00 UTC)")
+    logging.info("DAX morning brief job runs Mon-Fri at 04:00 UTC (07:00 IDT)")
+    logging.info("DAX sweep watcher runs every minute Mon-Fri 04:00-06:35 UTC (07:00-09:35 IDT)")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
