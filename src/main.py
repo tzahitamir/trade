@@ -2881,8 +2881,8 @@ def _us100_session_window(trade_date) -> tuple:
 _dax_alerted_dates:    set = set()
 _dax_prealerted_dates: set = set()
 
-_DAX_PEAK_CUTOFF_HOUR   = 10
-_DAX_PEAK_CUTOFF_MINUTE = 30
+_DAX_PEAK_CUTOFF_HOUR   = 12
+_DAX_PEAK_CUTOFF_MINUTE = 0
 
 # Slowdown thresholds for pre-alert (intentionally loose — any stall candle counts)
 _DAX_SLOWDOWN_BODY_ATR  = 0.40
@@ -2890,7 +2890,7 @@ _DAX_SLOWDOWN_RANGE_ATR = 0.60
 
 
 def _dax_peak_too_late(peak_ts: int) -> bool:
-    """True if the expansion peak formed at or after 10:30 IDT (WR drops significantly after)."""
+    """True if the expansion peak formed at or after 12:00 IDT (WR drops significantly after)."""
     peak_idt = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ)
     return (peak_idt.hour, peak_idt.minute) >= (_DAX_PEAK_CUTOFF_HOUR, _DAX_PEAK_CUTOFF_MINUTE)
 
@@ -2984,10 +2984,10 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
     """Check for DAX SERPE setup; runs every 5 min during Frankfurt session.
 
     Two-phase alert:
-      1. Pre-alert — expansion peak confirmed before 10:30 IDT + slowdown forming in pullback.
+      1. Pre-alert — expansion peak confirmed before 12:00 IDT + slowdown forming in pullback.
          Fires once per day so the trader is ready at the screen.
       2. Entry alert — first lower high (bull expansion) or higher low (bear expansion)
-         in premium zone. Suppressed if peak was ≥ 10:30 IDT (WR drops significantly after).
+         in premium zone. Suppressed if peak was ≥ 12:00 IDT (WR drops significantly after).
     """
     from datetime import time as _time
     from analysis.smc_analyzer import SMCAnalyzer
@@ -3071,8 +3071,8 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
 
         if _dax_peak_too_late(peak_ts):
             peak_str = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ).strftime("%H:%M")
-            _dlog.info("[DAX_SESSION] late_peak %s IDT ≥ 10:30 | suppressed for today", peak_str)
-            logging.info("DAX: late peak %s IDT — entry suppressed (poor WR after 10:30)", peak_str)
+            _dlog.info("[DAX_SESSION] late_peak %s IDT ≥ 12:00 | suppressed for today", peak_str)
+            logging.info("DAX: late peak %s IDT — entry suppressed (poor WR after 12:00)", peak_str)
             _dax_alerted_dates.add(today)
             return
 
@@ -3116,7 +3116,7 @@ def dax_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertMa
     peak_ts = exp["peak_ts"]
     if _dax_peak_too_late(peak_ts):
         peak_str = datetime.fromtimestamp(peak_ts, tz=_ISRAEL_TZ).strftime("%H:%M")
-        _dlog.info("[DAX_SESSION] late_peak %s IDT ≥ 10:30 | pre-alert suppressed", peak_str)
+        _dlog.info("[DAX_SESSION] late_peak %s IDT ≥ 12:00 | pre-alert suppressed", peak_str)
         _dax_alerted_dates.add(today)   # no point checking again today
         return
 
