@@ -2713,10 +2713,9 @@ _dax_brief_state: dict = {}   # populated at 04:00 UTC, read every minute until 
 
 def dax_sweep_watcher_job(alert_manager) -> None:
     """
-    Runs every minute 04:00–06:30 UTC (07:00–09:30 IDT) Mon–Fri.
-    Watches for sweep trigger on Setup B / large_gap_sweep days.
+    Runs every minute 04:00–06:35 UTC (07:00–09:35 IDT) Mon–Fri.
+    Watches for sweep trigger on Setup B / large_gap_sweep / uncertain days.
     Also fires 'no sweep — enter now' at 07:20 IDT for uncertain zone.
-    Also fires 'window expired' at 09:30 IDT if sweep never came.
     """
     global _dax_brief_state
     from data.ger40_file_reader import read_candles, StaleFeedError
@@ -2742,21 +2741,6 @@ def dax_sweep_watcher_job(alert_manager) -> None:
 
     if state.get("sweep_triggered"):
         return  # already fired, nothing to do
-
-    # Window expiry at 09:30 IDT (06:30 UTC)
-    if h == 6 and m >= 30 and not state.get("expire_sent"):
-        _dax_brief_state["expire_sent"] = True
-        setup = state["setup_type"]
-        msg = (
-            f"<b>DAX — Sweep window expired  09:30 IDT</b>\n"
-            f"Setup {setup.upper()} was watching {state['sweep_level']:.0f} "
-            f"({state['sweep_label']})\n"
-            f"No sweep materialised — skip, window closed.\n"
-            f"(Frankfurt opens 10:00 IDT — avoid 09:50–10:10)"
-        )
-        alert_manager.notifier.send(msg)
-        _dlog.info("[DAX_SWEEP] Window expired, no sweep")
-        return
 
     # Read latest price from EA file
     try:
@@ -2784,17 +2768,22 @@ def dax_sweep_watcher_job(alert_manager) -> None:
     tp          = state["tp_level"]
     sl          = state["sl_level"]
     atr         = state["atr"]
+    fkft_close  = state["fkft_close"]
+    asian_mid   = state["asian_mid"]
+    gap_atr     = state["gap_atr"]
     sl_pts      = abs(sweep_level - sl)
     tp_pts      = abs(tp - sweep_level)
     rr          = tp_pts / sl_pts if sl_pts > 0 else 0
     idt_h       = (now_utc.hour + 3) % 24
 
     if setup == "large_gap_sweep":
-        gap_pct_label = "33% of gap"
-        extra = f"\nGap {state['gap_atr']:.1f}×ATR — large gap setup. Exit 09:30 IDT hard."
+        tp_label = f"33% of gap ({tp:.0f})"
+        odds     = "~78% reach target before 09:30 IDT"
+        exit_note = "Exit hard 09:30 IDT — large gap, do NOT hold"
     else:
-        gap_pct_label = "Frankfurt close"
-        extra = f"\nR:R ~{rr:.1f}× (historical median ~8.5×)"
+        tp_label  = f"Frankfurt close ({tp:.0f})"
+        odds      = "~90% fill to Frankfurt close post-sweep"
+        exit_note = "Exit hard 09:30 IDT"
 
     msg = (
         f"<b>DAX SWEEP TRIGGERED  {idt_h:02d}:{now_utc.minute:02d} IDT</b>\n"
@@ -2802,11 +2791,16 @@ def dax_sweep_watcher_job(alert_manager) -> None:
         f"Price touched {state['sweep_label']} at {sweep_level:.0f}\n"
         f"\n"
         f"ENTER NOW — {trade_dir}\n"
-        f"Entry : {sweep_level:.0f}  (at sweep extreme)\n"
-        f"TP    : {tp:.0f}  ({gap_pct_label})\n"
-        f"SL    : {sl:.0f}  ({atr*0.25:.0f} pts beyond sweep){extra}\n"
+        f"Entry     : {sweep_level:.0f}\n"
+        f"TP        : {tp_label}\n"
+        f"SL        : {sl:.0f}  ({atr*0.25:.0f} pts beyond sweep)\n"
+        f"R:R       : ~{rr:.1f}×\n"
+        f"Odds      : {odds}\n"
         f"\n"
-        f"Exit hard stop : 09:30 IDT"
+        f"Yest. close : {fkft_close:.0f}  |  Asian mid : {asian_mid:.0f}\n"
+        f"Gap         : {gap_atr:.2f}×ATR\n"
+        f"\n"
+        f"{exit_note}"
     )
     alert_manager.notifier.send(msg)
     _dlog.info("[DAX_SWEEP] Triggered | setup=%s price=%.0f sweep_level=%.0f",
@@ -2815,21 +2809,36 @@ def dax_sweep_watcher_job(alert_manager) -> None:
 
 def _send_setup_a_now(state: dict, alert_manager, now_utc) -> None:
     """Fire 'no sweep — enter Setup A now' alert for uncertain zone at 07:20 IDT."""
-    trade_dir = state["trade_dir"]
-    entry     = state["current_price"]
-    tp1       = state["asian_mid"]
-    tp2       = state["fkft_close"]
-    sl        = state["sl_level"]
-    sl_pts    = abs(entry - sl)
-    idt_h     = (now_utc.hour + 3) % 24
+    trade_dir  = state["trade_dir"]
+    entry      = state["current_price"]
+    tp1        = state["asian_mid"]
+    tp2        = state["fkft_close"]
+    sl         = state["sl_level"]
+    gap_atr    = state["gap_atr"]
+    sl_pts     = abs(entry - sl)
+    rr_tp1     = abs(tp1 - entry) / sl_pts if sl_pts > 0 else 0
+    rr_tp2     = abs(tp2 - entry) / sl_pts if sl_pts > 0 else 0
+    # Fill odds derived from gap size (no-sweep days backtested)
+    if gap_atr < 0.5:
+        odds = "89% full fill"
+    elif gap_atr < 1.0:
+        odds = "70% full fill"
+    elif gap_atr < 1.5:
+        odds = "57% full fill"
+    else:
+        odds = "19% full fill  (large gap — consider skipping)"
     msg = (
         f"<b>DAX — No sweep by 07:20 IDT → SETUP A</b>\n"
         f"\n"
         f"Enter now at market — {trade_dir}\n"
-        f"Entry : {entry:.0f}\n"
-        f"TP1   : {tp1:.0f}  (Asian mid — 81% hit rate)\n"
-        f"TP2   : {tp2:.0f}  (Frankfurt close)\n"
-        f"SL    : {sl:.0f}  ({sl_pts:.0f} pts)\n"
+        f"Entry  : {entry:.0f}\n"
+        f"TP1    : {tp1:.0f}  (Asian mid)  R:R {rr_tp1:.1f}×\n"
+        f"TP2    : {tp2:.0f}  (Frankfurt close)  R:R {rr_tp2:.1f}×\n"
+        f"SL     : {sl:.0f}  ({sl_pts:.0f} pts)\n"
+        f"Odds   : 81% hit TP1  |  {odds} to TP2\n"
+        f"\n"
+        f"Yest. close : {tp2:.0f}  |  Asian mid : {tp1:.0f}\n"
+        f"Gap         : {gap_atr:.2f}×ATR\n"
         f"\n"
         f"Exit hard stop : 09:30 IDT"
     )
