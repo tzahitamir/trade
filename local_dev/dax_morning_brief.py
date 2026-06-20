@@ -379,23 +379,32 @@ def run_brief(target_date: date, db: LocalDB | None = None,
 def render_brief_chart(result: dict, all5m: list, out_path: str | None = None) -> str:
     """
     Render overnight GER40 5m chart for the morning brief and save as PNG.
-    Shows: Frankfurt close line, Asian session shading, sweep level, current price.
     Returns the file path.
     """
-    target_date  = result["date"]
-    prev_date    = prev_trading_day(target_date)
-    fkft_close   = result["fkft_close"]
-    asian_low    = result["asian_low"]
-    asian_high   = result["asian_high"]
-    asian_mid    = result["asian_mid"]
-    sweep_level  = result["sweep_level"]
-    sweep_label  = result["sweep_label"]
+    target_date   = result["date"]
+    prev_date     = prev_trading_day(target_date)
+    fkft_close    = result["fkft_close"]
+    asian_low     = result["asian_low"]
+    asian_high    = result["asian_high"]
+    asian_mid     = result["asian_mid"]
+    sweep_level   = result["sweep_level"]
+    sweep_label   = result["sweep_label"]
     current_price = result["current_price"]
-    setup_type   = result["setup_type"]
-    gap_atr      = result["gap_atr"]
-    bullish      = result["bullish"]
-    trade_dir    = result["trade_dir"]
-    tp_level     = result["tp_level"]
+    setup_type    = result["setup_type"]
+    gap_atr       = result["gap_atr"]
+    bullish       = result["bullish"]
+    trade_dir     = result["trade_dir"]
+    tp_level      = result["tp_level"]
+    sl_level      = result["sl_level"]
+    sweep_expected = result["sweep_expected"]
+
+    # Entry price: at sweep level for B/large_gap_sweep, at current price otherwise
+    entry_price = sweep_level if sweep_expected else current_price
+
+    # R:R
+    sl_pts = abs(entry_price - sl_level)
+    tp_pts = abs(tp_level    - entry_price)
+    rr     = tp_pts / sl_pts if sl_pts > 0 else 0
 
     # ── Filter candles: 14:30 UTC prev_date → 04:30 UTC target_date ──────────
     t_start = ts_utc(prev_date, 14, 30)
@@ -404,15 +413,10 @@ def render_brief_chart(result: dict, all5m: list, out_path: str | None = None) -
     if len(candles) < 10:
         raise ValueError(f"Too few candles for chart ({len(candles)})")
 
-    # Convert timestamps → datetime objects for x-axis
     dts = [datetime.fromtimestamp(c["timestamp"], timezone.utc) for c in candles]
     xs  = list(range(len(candles)))
 
     # ── Key x positions ───────────────────────────────────────────────────────
-    fkft_close_ts  = ts_utc(prev_date, 15, 25)
-    asian_start_ts = ts_utc(prev_date, 22,  5)
-    entry_ts       = ts_utc(target_date, 4,  0)
-
     def nearest_x(ts: int) -> int:
         best, best_x = None, 0
         for i, c in enumerate(candles):
@@ -421,9 +425,9 @@ def render_brief_chart(result: dict, all5m: list, out_path: str | None = None) -
                 best, best_x = diff, i
         return best_x
 
-    x_fkft_close   = nearest_x(fkft_close_ts)
-    x_asian_start  = nearest_x(asian_start_ts)
-    x_entry        = nearest_x(entry_ts)
+    x_fkft_close  = nearest_x(ts_utc(prev_date, 15, 25))
+    x_asian_start = nearest_x(ts_utc(prev_date, 22,  5))
+    x_entry       = nearest_x(ts_utc(target_date, 4,  0))
 
     # ── Figure ────────────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(14, 6))
@@ -439,84 +443,105 @@ def render_brief_chart(result: dict, all5m: list, out_path: str | None = None) -
                                    color=color, zorder=3))
         ax.plot([i, i], [l, h_], color=color, linewidth=0.8, zorder=2)
 
-    # ── Session background shading ────────────────────────────────────────────
-    # Frankfurt close to Asian open = NY evening (dim)
-    ax.axvspan(x_fkft_close, x_asian_start, color="#ffffff", alpha=0.03, zorder=1, label="_nolegend_")
-    # Asian session = light blue tint
-    ax.axvspan(x_asian_start, x_entry, color="#4fc3f7", alpha=0.07, zorder=1, label="_nolegend_")
+    # ── Session shading ───────────────────────────────────────────────────────
+    ax.axvspan(x_fkft_close,  x_asian_start, color="#ffffff", alpha=0.03, zorder=1)
+    ax.axvspan(x_asian_start, x_entry,        color="#4fc3f7", alpha=0.07, zorder=1)
 
     # ── Vertical markers ──────────────────────────────────────────────────────
-    ax.axvline(x_fkft_close,  color="#FFD700", linestyle="--", linewidth=0.9, alpha=0.6, zorder=2)
-    ax.axvline(x_asian_start, color="#4fc3f7",  linestyle="--", linewidth=0.9, alpha=0.6, zorder=2)
-    ax.axvline(x_entry,       color="#90caf9",  linestyle=":",  linewidth=1.1, alpha=0.8, zorder=2)
+    ax.axvline(x_fkft_close,  color="#FFD700", linestyle="--", linewidth=0.9, alpha=0.5, zorder=2)
+    ax.axvline(x_asian_start, color="#4fc3f7",  linestyle="--", linewidth=0.9, alpha=0.5, zorder=2)
+    ax.axvline(x_entry,       color="#90caf9",  linestyle=":",  linewidth=1.2, alpha=0.9, zorder=2)
 
     all_prices = [c["high"] for c in candles] + [c["low"] for c in candles]
     y_min, y_max = min(all_prices), max(all_prices)
-    y_pad = (y_max - y_min) * 0.08
-    label_y = y_max + y_pad * 0.3
+    y_pad  = (y_max - y_min) * 0.08
+    LABEL_X = len(xs) + 0.8
 
-    for vx, label, color in [
+    # Top vertical-marker labels
+    label_y = y_max + y_pad * 0.25
+    for vx, lbl, col in [
         (x_fkft_close,  "Prev Close", "#FFD700"),
         (x_asian_start, "Asian Open", "#4fc3f7"),
         (x_entry,       "07:00 IDT",  "#90caf9"),
     ]:
-        ax.text(vx + 0.3, label_y, label, color=color, fontsize=7,
-                va="bottom", ha="left", rotation=0,
+        ax.text(vx + 0.3, label_y, lbl, color=col, fontsize=7, va="bottom", ha="left",
                 bbox=dict(facecolor="#1a1a2e", edgecolor="none", pad=1), zorder=5)
 
-    LABEL_X = len(xs) + 0.8  # right-side label anchor
-
+    # ── Horizontal price lines ────────────────────────────────────────────────
     def hline(price, color, lw, ls, alpha, label_txt, label_color=None):
         ax.axhline(price, color=color, linewidth=lw, linestyle=ls, alpha=alpha, zorder=4)
         ax.text(LABEL_X, price, f" {label_txt}", color=label_color or color,
                 fontsize=8, va="center", ha="left", zorder=5,
                 bbox=dict(facecolor="#1a1a2e", edgecolor="none", pad=1))
 
-    # Frankfurt close — most important line
-    hline(fkft_close,  "#FFD700", 1.8, "-",  0.90, f"Close {fkft_close:.0f}")
-    # Asian range
-    hline(asian_high,  "#ef5350", 1.0, "--", 0.75, f"Asian H {asian_high:.0f}")
-    hline(asian_low,   "#26a69a", 1.0, "--", 0.75, f"Asian L {asian_low:.0f}")
-    hline(asian_mid,   "#888888", 0.8, ":",  0.60, f"Mid {asian_mid:.0f}")
-    # Sweep level (highlighted)
     sweep_color = "#26a69a" if bullish else "#ef5350"
-    hline(sweep_level, sweep_color, 1.6, "--", 0.90,
-          f"SWEEP {sweep_level:.0f}", label_color="#ffffff")
-    # Current price at 07:00 IDT
-    hline(current_price, "#90caf9", 1.0, ":", 0.85, f"Now {current_price:.0f}")
-    # TP line (subtle)
-    hline(tp_level, "#FFD700", 0.7, ":", 0.45, f"TP {tp_level:.0f}")
+    dir_color   = "#26a69a" if bullish else "#ef5350"
 
-    # Gap annotation arrow
-    mid_x  = (x_fkft_close + x_entry) // 2
-    y_from = current_price
-    y_to   = fkft_close
-    ax.annotate(
-        "", xy=(mid_x, y_to), xytext=(mid_x, y_from),
-        arrowprops=dict(arrowstyle="<->", color="#FFD700", lw=1.2),
-        zorder=5,
-    )
-    ax.text(mid_x + 0.5, (y_from + y_to) / 2,
-            f"gap\n{abs(gap_atr):.2f}×ATR",
-            color="#FFD700", fontsize=7.5, va="center", ha="left", zorder=5,
+    # Background context lines (dim)
+    hline(asian_high, "#ef5350", 0.9, "--", 0.55, f"Asian H  {asian_high:.0f}")
+    hline(asian_low,  "#26a69a", 0.9, "--", 0.55, f"Asian L  {asian_low:.0f}")
+    hline(asian_mid,  "#666688", 0.7, ":",  0.45, f"Mid      {asian_mid:.0f}")
+    hline(current_price, "#90caf9", 0.9, ":", 0.70, f"Now  {current_price:.0f}")
+
+    # Sweep level — bold if sweep expected
+    if sweep_expected:
+        hline(sweep_level, sweep_color, 1.8, "--", 0.95,
+              f"SWEEP  {sweep_level:.0f}", label_color="#ffffff")
+    else:
+        hline(sweep_level, sweep_color, 1.0, "--", 0.55, f"Sweep  {sweep_level:.0f}")
+
+    # Frankfurt close — the target
+    hline(fkft_close, "#FFD700", 2.0, "-", 0.95, f"Close  {fkft_close:.0f}")
+
+    # ── Trade lines: SL and TP ────────────────────────────────────────────────
+    # SL — red, solid, thick
+    ax.axhline(sl_level, color="#ff1744", linewidth=2.0, linestyle="-", alpha=0.90, zorder=5)
+    ax.text(LABEL_X, sl_level, f" SL  {sl_level:.0f}", color="#ff1744",
+            fontsize=9, fontweight="bold", va="center", ha="left", zorder=6,
+            bbox=dict(facecolor="#2a0010", edgecolor="#ff1744", linewidth=0.8, pad=2))
+
+    # TP — green for bull, amber for bear (reaching up/down toward Frankfurt close)
+    tp_color = "#00e676" if bullish else "#ffab40"
+    ax.axhline(tp_level, color=tp_color, linewidth=2.0, linestyle="-", alpha=0.90, zorder=5)
+    tp_suffix = "  (33% gap)" if setup_type == SETUP_LARGE_SWEEP else "  (Frankfurt close)"
+    ax.text(LABEL_X, tp_level, f" TP  {tp_level:.0f}{tp_suffix}", color=tp_color,
+            fontsize=9, fontweight="bold", va="center", ha="left", zorder=6,
+            bbox=dict(facecolor="#001a0a" if bullish else "#1a1000",
+                      edgecolor=tp_color, linewidth=0.8, pad=2))
+
+    # Shade the trade zone between entry and TP
+    tp_shade_color = "#00e676" if bullish else "#ffab40"
+    ax.axhspan(min(entry_price, tp_level), max(entry_price, tp_level),
+               color=tp_shade_color, alpha=0.06, zorder=1)
+    # Shade the risk zone between entry and SL
+    ax.axhspan(min(entry_price, sl_level), max(entry_price, sl_level),
+               color="#ff1744", alpha=0.06, zorder=1)
+
+    # ── Gap arrow ─────────────────────────────────────────────────────────────
+    mid_x = (x_fkft_close + x_entry) // 2
+    ax.annotate("", xy=(mid_x, fkft_close), xytext=(mid_x, current_price),
+                arrowprops=dict(arrowstyle="<->", color="#FFD700", lw=1.2), zorder=5)
+    ax.text(mid_x + 0.5, (current_price + fkft_close) / 2,
+            f"gap\n{gap_atr:.2f}×ATR", color="#FFD700", fontsize=7.5,
+            va="center", ha="left", zorder=5,
             bbox=dict(facecolor="#1a1a2e", edgecolor="none", pad=1))
 
-    # ── X-axis: hourly labels ──────────────────────────────────────────────────
+    # ── X-axis labels (IDT time) ──────────────────────────────────────────────
     label_xs, label_strs = [], []
     for i, c in enumerate(candles):
-        dt = dts[i]
+        dt    = dts[i]
         idt_h = (dt.hour + 3) % 24
-        if dt.minute == 0 and idt_h % 2 == 1:  # label every 2h, on the odd IDT hour
+        if dt.minute == 0 and idt_h % 2 == 1:
             label_xs.append(i)
-            if dt.date() != prev_date:
-                label_strs.append(f"{idt_h:02d}:00\n{dt.strftime('%d/%m')}")
-            else:
-                label_strs.append(f"{idt_h:02d}:00")
+            label_strs.append(
+                f"{idt_h:02d}:00\n{dt.strftime('%d/%m')}" if dt.date() != prev_date
+                else f"{idt_h:02d}:00"
+            )
     ax.set_xticks(label_xs)
     ax.set_xticklabels(label_strs, fontsize=7.5, color="#cccccc")
 
-    ax.set_ylim(y_min - y_pad, y_max + y_pad * 2.5)
-    ax.set_xlim(-1, len(xs) + 10)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad * 2.2)
+    ax.set_xlim(-1, len(xs) + 14)
     ax.tick_params(axis="y", colors="#cccccc", labelsize=8)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -524,22 +549,52 @@ def render_brief_chart(result: dict, all5m: list, out_path: str | None = None) -
         ax.spines[s].set_color("#444466")
     ax.yaxis.grid(color="#2a2a4a", linewidth=0.5, zorder=0)
 
-    # ── Title + info box ──────────────────────────────────────────────────────
+    # ── Title ─────────────────────────────────────────────────────────────────
     dow_name = ["Mon", "Tue", "Wed", "Thu", "Fri"][target_date.weekday()]
     ax.set_title(
-        f"GER40 5m  │  {dow_name} {target_date}  │  Setup {setup_type.upper()}  │  gap {gap_atr:.2f}×ATR  [{trade_dir}]",
+        f"GER40 5m  │  {dow_name} {target_date}  │  gap {gap_atr:.2f}×ATR",
         fontsize=10.5, fontweight="bold", color="#e0e0e0", pad=8,
     )
 
-    # Legend patches
-    legend_items = [
-        mpatches.Patch(color="#FFD700", label=f"Frankfurt close {fkft_close:.0f}"),
-        mpatches.Patch(color=sweep_color, label=f"{sweep_label} (sweep) {sweep_level:.0f}"),
-        mpatches.Patch(color="#4fc3f7",  label="Asian session"),
-    ]
-    ax.legend(handles=legend_items, loc="upper left", fontsize=8,
-              facecolor="#1a1a2e", edgecolor="#444466", labelcolor="white",
-              framealpha=0.9)
+    # ── Trade info panel (top-left) ───────────────────────────────────────────
+    if setup_type in (SETUP_B, SETUP_LARGE_SWEEP):
+        action_line = f"{'SELL' if not bullish else 'BUY'} ↓  @  SWEEP {entry_price:.0f}"
+        wait_line   = f"Wait for sweep first →"
+    elif setup_type == SETUP_UNCERTAIN:
+        action_line = f"{'BUY ↑' if bullish else 'SELL ↓'}  (sweep → {sweep_level:.0f} or enter @{current_price:.0f})"
+        wait_line   = "Wait until 07:20 IDT"
+    elif setup_type == SETUP_LARGE_SERPE:
+        action_line = f"Skip — watch SERPE @ Frankfurt open (10:00)"
+        wait_line   = f"Direction bias: {trade_dir}"
+    else:
+        action_line = f"{'BUY ↑' if bullish else 'SELL ↓'}  @  {entry_price:.0f}  (enter now)"
+        wait_line   = None
+
+    setup_label = {
+        SETUP_A:           "Setup A",
+        SETUP_A_WEAK:      "Setup A (weak)",
+        SETUP_B:           "Setup B",
+        SETUP_UNCERTAIN:   "Uncertain",
+        SETUP_LARGE_SWEEP: "Large Gap Sweep",
+        SETUP_LARGE_SERPE: "Large Gap — SKIP",
+    }.get(setup_type, setup_type.upper())
+
+    panel_lines = [f"◆ {setup_label}", action_line]
+    if wait_line:
+        panel_lines.append(wait_line)
+    if setup_type != SETUP_LARGE_SERPE:
+        panel_lines += [
+            f"TP  {tp_level:.0f}",
+            f"SL  {sl_level:.0f}",
+            f"R:R  {rr:.1f}×",
+        ]
+
+    panel_txt = "\n".join(panel_lines)
+    ax.text(0.01, 0.99, panel_txt,
+            transform=ax.transAxes, fontsize=9, family="monospace",
+            color="#e0e0e0", va="top", ha="left", zorder=7,
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="#0d0d1a",
+                      edgecolor=dir_color, linewidth=1.5, alpha=0.92))
 
     plt.tight_layout()
 
