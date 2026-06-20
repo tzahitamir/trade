@@ -7,13 +7,9 @@ fx_pairs:
   # USDCAD removed: lowest EV (2.148), limited 5m data (18 days)
   # USDJPY removed: 14% in-period stop rate on 5m — not viable for early entry
 
-# All fx_pairs receive live Telegram alerts (all are now on 5m-early).
-alert_pairs:
-  - NZDUSD
-  - EURJPY
-  - EURUSD
-  - USDCHF
-  - XAUUSD
+# 15m BOS + 5m-early alerts held. Only 1h retrace entry and DAX SERPE alerts active.
+# 1h retrace runs outside this gate (see _process_symbol_1h_retrace_entry in main.py).
+alert_pairs: []
 
 timeframes:
   - 5m
@@ -33,4 +29,4 @@ telegram:
 
 alert_threshold: 0.0
 dev_mode: false
-dax_alerts_enabled: false  # n=5 is too thin; gathering more data before enabling
+dax_alerts_enabled: true   # pre-alert + entry alert enabled; peak gate ≥11:45 IDT suppresses late setups

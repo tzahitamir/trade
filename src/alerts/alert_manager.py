@@ -1015,7 +1015,7 @@ class AlertManager:
         candles_5m: List[Dict],
         outcome: str = "OPEN",
     ) -> str:
-        """Render a DAX 5m counter-trend chart with premium/discount zone shading. Returns chart path."""
+        """Render a DAX 5m session_start_expansion_retrace_pull_back_to_equilibrium chart with premium/discount zone shading. Returns chart path."""
         try:
             from zoneinfo import ZoneInfo as _ZI
             _FFM_TZ = _ZI("Europe/Berlin")
@@ -1135,7 +1135,7 @@ class AlertManager:
         ax.set_xticklabels(tick_lbl, fontsize=6, rotation=45, ha="right")
         ax.set_xlabel("Frankfurt time", fontsize=7)
         ax.set_title(
-            f"DAX  {direction.upper()} counter-trend (fades {exp_dir.upper()} expansion)"
+            f"DAX  SERPE  {direction.upper()} (fades {exp_dir.upper()} expansion)"
             f"  |  {sig.get('symbol', 'DAX')}",
             fontsize=9,
         )
