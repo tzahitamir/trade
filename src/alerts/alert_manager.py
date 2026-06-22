@@ -1174,6 +1174,134 @@ class AlertManager:
         logging.info("DAX chart saved: %s", chart_path.name)
         return str(chart_path)
 
+    def render_frank_rejection_chart(
+        self,
+        pre_candles: List[Dict],
+        frank_candle: Dict,
+        post_candles: List[Dict],
+        pre_high: float,
+        pre_low: float,
+        eq_level: float,
+        direction: str,
+        pre_pct: float,
+        fk_body: float,
+    ) -> str:
+        """Render pre-Frankfurt expansion + rejection candle chart. Returns chart path."""
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _IDT = _ZI("Asia/Jerusalem")
+        except Exception:
+            from datetime import timedelta as _td
+            _IDT = timezone(_td(hours=3))
+
+        is_short    = direction == "SHORT"
+        lookahead   = post_candles[:16]
+        display     = pre_candles + [frank_candle]
+        all_bars    = display + lookahead
+        frank_x     = len(pre_candles)   # index of the rejection candle
+        x_total     = len(all_bars)
+
+        lows  = [b["low"]  for b in all_bars]
+        highs = [b["high"] for b in all_bars]
+        pad   = (max(highs) - min(lows)) * 0.06
+        y_lo  = min(min(lows),  pre_low,  eq_level) - pad
+        y_hi  = max(max(highs), pre_high, eq_level) + pad
+
+        fig, ax = plt.subplots(figsize=(14, 5), constrained_layout=True)
+
+        # Pre-Frankfurt candles (full) + lookahead (dimmed)
+        self._draw_candles(ax, display,    x_offset=0,           alpha=1.0)
+        self._draw_candles(ax, lookahead,  x_offset=len(display), alpha=0.35)
+
+        ax.set_xlim(-1, x_total)
+        ax.set_ylim(y_lo, y_hi)
+
+        # Zone shading: premium above EQ (red), discount below (green)
+        if is_short:
+            ax.axhspan(eq_level, pre_high, alpha=0.07, color="crimson")
+            ax.axhspan(pre_low,  eq_level, alpha=0.07, color="green")
+        else:
+            ax.axhspan(pre_low,  eq_level, alpha=0.07, color="crimson")
+            ax.axhspan(eq_level, pre_high, alpha=0.07, color="green")
+
+        # Frankfurt open vertical marker
+        ax.axvline(frank_x, color="gold", linestyle="--", linewidth=1.4, alpha=0.9, zorder=3)
+        ax.text(frank_x + 0.3, y_hi - pad * 0.3, "FFM OPEN", fontsize=6,
+                color="gold", va="top", fontweight="bold")
+
+        # Horizontal levels
+        ax.hlines(pre_low,  0, x_total, colors="#888888",   linestyles=":",  linewidth=1.0, zorder=2)
+        ax.hlines(pre_high, 0, x_total, colors="steelblue", linestyles=":",  linewidth=1.0, zorder=2)
+        ax.hlines(eq_level, 0, x_total, colors="orange",    linestyles="--", linewidth=1.4, zorder=2)
+
+        # Right-side labels
+        origin_lbl = "ORIGIN (LOW)" if is_short else "ORIGIN (HIGH)"
+        for lvl, lbl, col in [
+            (pre_low,  origin_lbl, "#888888"),
+            (pre_high, "PEAK",     "steelblue"),
+            (eq_level, f"EQ  {eq_level:.0f}", "orange"),
+        ]:
+            ax.text(x_total - 0.2, lvl, f"  {lbl}", fontsize=7, color=col,
+                    va="center", fontweight="bold")
+
+        # Entry arrow on rejection candle
+        action     = "SELL" if is_short else "BUY"
+        tip_y      = frank_candle["high"] if is_short else frank_candle["low"]
+        price_range = max(highs) - min(lows) or 1.0
+        offset     = price_range * 0.10
+        text_y     = tip_y + offset if is_short else tip_y - offset
+        entry_color = "crimson" if is_short else "green"
+        ax.annotate(
+            action, xy=(frank_x, tip_y), xytext=(frank_x, text_y),
+            fontsize=9, fontweight="bold", color="white", ha="center", zorder=6,
+            arrowprops=dict(arrowstyle="-|>", color=entry_color, lw=1.5),
+            bbox=dict(boxstyle="round,pad=0.25", facecolor=entry_color, alpha=0.9),
+        )
+
+        # Info box
+        exp_pts = round(pre_high - pre_low)
+        entry_close = round(frank_candle["close"])
+        info = (
+            f"Pre-Frankfurt: {pre_pct:.2f}%  ({exp_pts} pts)    "
+            f"{'HIGH' if is_short else 'LOW'}: {round(pre_high if is_short else pre_low):.0f}    "
+            f"Peak: {round(pre_high if is_short else pre_low):.0f}\n"
+            f"Rejection body: {abs(fk_body):.0f} pts    "
+            f"Entry: ~{entry_close}    EQ: {eq_level:.0f}    "
+            f"Origin: {round(pre_low if is_short else pre_high):.0f}\n"
+            f"Historical: 12/13 = 92% WR (1-yr backtest)"
+        )
+        ax.text(
+            0.01, 0.02, info, transform=ax.transAxes, fontsize=7,
+            color="black", ha="left", va="bottom", zorder=10, family="monospace",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.95, edgecolor="gray"),
+        )
+
+        # X-axis: IDT time labels every 30 min
+        tick_pos, tick_lbl = [], []
+        for i, bar in enumerate(all_bars):
+            dt_il = datetime.fromtimestamp(bar["timestamp"], tz=_IDT)
+            if dt_il.minute % 30 == 0:
+                tick_pos.append(i)
+                tick_lbl.append(dt_il.strftime("%H:%M"))
+        ax.set_xticks(tick_pos)
+        ax.set_xticklabels(tick_lbl, fontsize=6, rotation=45, ha="right")
+        ax.set_xlabel("Israel time (IDT)", fontsize=7)
+        ax.set_title(
+            f"DAX  Frankfurt Rejection — {direction}  |  "
+            f"Pre-Frankfurt expansion {pre_pct:.2f}%  →  10:00 IDT reversal",
+            fontsize=9,
+        )
+        ax.tick_params(axis="y", labelsize=7)
+
+        frank_dt   = datetime.fromtimestamp(frank_candle["timestamp"], tz=timezone.utc)
+        chart_path = self.charts_dir / (
+            f"frank-rej-{frank_dt.strftime('%Y%m%d')}-{direction.lower()}.png"
+        )
+        fig.savefig(str(chart_path), dpi=100)
+        plt.close(fig)
+        logging.info("Frankfurt rejection chart saved: %s", chart_path.name)
+        return str(chart_path)
+
     def format_alert(self, alert: Dict) -> str:
         return f"[{alert.get('alert_id')}] {alert.get('message')}"
 

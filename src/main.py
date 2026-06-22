@@ -2960,10 +2960,9 @@ def dax_frank_rejection_job(alert_manager) -> None:
     entry       = round(fk["close"])
     pts_to_eq   = abs(entry - eq)
     pts_to_orig = abs(entry - origin)
-    # SL reference is the peak itself — trader adds own buffer above/below
     sl_ref      = peak
 
-    msg = (
+    caption = (
         f"<b>🔔 Frankfurt Open Rejection — {direction}</b>\n\n"
         f"Pre-Frankfurt: {net:+.0f} pts ({pre_pct:.2f}%) {arrow_pre}\n"
         f"07:00–09:55 IDT: {pre_from} → {pre_to}\n\n"
@@ -2975,15 +2974,37 @@ def dax_frank_rejection_job(alert_manager) -> None:
         f"📊 Historical: 12/13 = 92% WR on this setup"
     )
 
+    # Render chart
+    post_candles = [c for c in today_candles if c["timestamp"] > fk["timestamp"]]
+    try:
+        chart_path = alert_manager.render_frank_rejection_chart(
+            pre_candles=pre,
+            frank_candle=fk,
+            post_candles=post_candles,
+            pre_high=pre_high,
+            pre_low=pre_low,
+            eq_level=float(eq),
+            direction=direction,
+            pre_pct=pre_pct,
+            fk_body=fk_body,
+        )
+    except Exception as exc:
+        _dlog.warning("[FRANK_REJ] chart render failed: %s", exc)
+        chart_path = None
+
     _frank_rejection_alerted_date = today
     _dlog.info(
-        "[FRANK_REJ] alert sent | dir=%s pre_pct=%.2f%% fk_body=%.0f entry=%s eq=%s origin=%s sl_ref=%s",
-        direction, pre_pct, abs(fk_body), entry, eq, origin, sl_ref,
+        "[FRANK_REJ] alert sent | dir=%s pre_pct=%.2f%% fk_body=%.0f entry=%s eq=%s origin=%s chart=%s",
+        direction, pre_pct, abs(fk_body), entry, eq, origin,
+        chart_path.split("/")[-1] if chart_path else "none",
     )
     if alert_manager.notifier:
-        alert_manager.notifier.send_message(msg)
+        if chart_path:
+            alert_manager.notifier.send_photo(chart_path, caption=caption)
+        else:
+            alert_manager.notifier.send_message(caption)
     else:
-        _dlog.info("[FRANK_REJ] no notifier — %s", msg)
+        _dlog.info("[FRANK_REJ] no notifier — %s", caption)
 
 
 # ──────────────────────────────── DAX STRATEGY ────────────────────────────────
