@@ -2716,6 +2716,7 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
 
 # ── DAX brief state — shared between morning brief job and sweep watcher ──────
 _dax_brief_state: dict = {}   # populated at 04:00 UTC, read every minute until 06:30 UTC
+_frank_rejection_alerted_date: "date | None" = None   # prevents duplicate alerts per day
 
 
 def dax_sweep_watcher_job(alert_manager) -> None:
@@ -2853,6 +2854,136 @@ def _send_setup_a_now(state: dict, alert_manager, now_utc) -> None:
     if alert_manager.notifier:
         alert_manager.notifier.send_message(msg)
     _dlog.info("[DAX_SWEEP] Uncertain zone — no sweep, firing Setup A")
+
+
+# ──────────────────── DAX FRANKFURT OPEN REJECTION ───────────────────────────
+
+
+def dax_frank_rejection_job(alert_manager) -> None:
+    """
+    Runs every 5 min from 07:05–07:30 UTC (10:05–10:30 IDT) Mon–Fri.
+    Detects: significant pre-Frankfurt directional expansion (≥0.35%) whose
+    first Frankfurt open candle (07:00 UTC / 10:00 IDT) rejects the expansion.
+    Fires once per day with levels, stats, and a sweep-watch warning.
+    Historical edge: 12/13 = 92% WR (1-year backtest, Jun 2025–Jun 2026).
+    """
+    global _frank_rejection_alerted_date
+    from data.ger40_file_reader import read_candles, StaleFeedError
+
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:
+        return
+
+    h, m = now_utc.hour, now_utc.minute
+    # Only active 07:05–07:30 UTC (10:05–10:30 IDT)
+    if not (h == 7 and 5 <= m <= 30):
+        return
+
+    today = now_utc.date()
+    if _frank_rejection_alerted_date == today:
+        return
+
+    try:
+        candles = read_candles(limit=300)
+        if not candles:
+            return
+    except StaleFeedError:
+        return
+    except Exception as exc:
+        _dlog.debug("[FRANK_REJ] candle read error: %s", exc)
+        return
+
+    # Filter today's candles
+    today_midnight = int(datetime(today.year, today.month, today.day, tzinfo=timezone.utc).timestamp())
+    today_candles  = [c for c in candles if c["timestamp"] >= today_midnight]
+    today_candles.sort(key=lambda c: c["timestamp"])
+
+    # Pre-Frankfurt window: 04:00–06:55 UTC (07:00–09:55 IDT)
+    pre_start = today_midnight + 4 * 3600
+    pre_end   = today_midnight + 7 * 3600
+    pre = [c for c in today_candles if pre_start <= c["timestamp"] < pre_end]
+
+    # Frankfurt open candle: first candle at or after 07:00 UTC
+    frank_candles = [c for c in today_candles if c["timestamp"] >= pre_end]
+    if len(pre) < 6 or not frank_candles:
+        return
+
+    fk = frank_candles[0]  # 10:00 IDT candle
+
+    # Pre-Frankfurt expansion metrics
+    pre_high  = max(c["high"]  for c in pre)
+    pre_low   = min(c["low"]   for c in pre)
+    pre_range = pre_high - pre_low
+    pre_pct   = pre_range / pre_low * 100
+    net       = pre[-1]["close"] - pre[0]["open"]
+
+    # Conditions: significant directional expansion
+    if pre_pct < 0.35:
+        return
+    if abs(net) / pre_range < 0.35:
+        _dlog.debug("[FRANK_REJ] expansion not directional (net=%.0f range=%.0f)", net, pre_range)
+        return
+
+    is_bullish = net > 0
+    fk_body    = fk["close"] - fk["open"]
+
+    # Rejection: opposite body ≥ 8 pts, doesn't extend far beyond the pre range
+    if is_bullish:
+        if fk_body > -8:
+            return
+        if fk["high"] > pre_high + pre_range * 0.15:
+            return
+        peak      = max(pre_high, fk["high"])
+        sl        = round(peak + 15)
+        eq        = round(pre_high - pre_range * 0.50)
+        origin    = round(pre_low)
+        direction = "SHORT"
+        arrow_pre = "↑"
+        arrow_fk  = "↓"
+        pre_from  = round(pre_low)
+        pre_to    = round(pre_high)
+    else:
+        if fk_body < 8:
+            return
+        if fk["low"] < pre_low - pre_range * 0.15:
+            return
+        peak      = min(pre_low, fk["low"])
+        sl        = round(peak - 15)
+        eq        = round(pre_low + pre_range * 0.50)
+        origin    = round(pre_high)
+        direction = "LONG"
+        arrow_pre = "↓"
+        arrow_fk  = "↑"
+        pre_from  = round(pre_high)
+        pre_to    = round(pre_low)
+
+    entry       = round(fk["close"])
+    pts_to_eq   = abs(entry - eq)
+    pts_to_orig = abs(entry - origin)
+    # SL reference is the peak itself — trader adds own buffer above/below
+    sl_ref      = peak
+
+    msg = (
+        f"<b>🔔 Frankfurt Open Rejection — {direction}</b>\n\n"
+        f"Pre-Frankfurt: {net:+.0f} pts ({pre_pct:.2f}%) {arrow_pre}\n"
+        f"07:00–09:55 IDT: {pre_from} → {pre_to}\n\n"
+        f"10:00 IDT candle: body {fk_body:+.0f} pts {arrow_fk}\n"
+        f"Entry: ~{entry}  |  SL: above {sl_ref}\n\n"
+        f"EQ (mid):  {eq}   ({pts_to_eq} pts)\n"
+        f"Origin:    {origin}   ({pts_to_orig} pts)\n\n"
+        f"⚠️ Watch for sweep above {sl_ref} — stay patient\n\n"
+        f"📊 Historical: 12/13 = 92% WR on this setup"
+    )
+
+    _frank_rejection_alerted_date = today
+    _dlog.info(
+        "[FRANK_REJ] alert sent | dir=%s pre_pct=%.2f%% fk_body=%.0f entry=%s eq=%s origin=%s sl_ref=%s",
+        direction, pre_pct, abs(fk_body), entry, eq, origin, sl_ref,
+    )
+    if alert_manager.notifier:
+        alert_manager.notifier.send_message(msg)
+    else:
+        _dlog.info("[FRANK_REJ] no notifier — %s", msg)
 
 
 # ──────────────────────────────── DAX STRATEGY ────────────────────────────────
@@ -5114,6 +5245,17 @@ def main() -> None:
         max_instances=1,
         id="trade_dax_sweep_watcher_job",
     )
+    scheduler.add_job(
+        dax_frank_rejection_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=10,
+        minute="5,10,15,20,25,30",
+        second=30,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_dax_frank_rejection_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
@@ -5121,6 +5263,7 @@ def main() -> None:
     logging.info("Daily report job runs at 21:00 IDT (18:00 UTC)")
     logging.info("DAX morning brief job runs Mon-Fri at 04:00 UTC (07:00 IDT)")
     logging.info("DAX sweep watcher runs every minute Mon-Fri 04:00-06:35 UTC (07:00-09:35 IDT)")
+    logging.info("DAX Frankfurt rejection job runs Mon-Fri 07:05-07:30 UTC (10:05-10:30 IDT)")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
