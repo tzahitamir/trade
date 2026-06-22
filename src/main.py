@@ -2635,7 +2635,7 @@ def _run_fvg_param_sweep(raw_signals: list, db: LocalDB,
 
 def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
     """
-    Runs at 04:00 UTC (07:00 IDT) Mon–Fri.
+    Runs at 07:00 IDT (04:00 UTC) Mon–Fri.
     Reads live GER40 5m data from the MT5 EA file, generates a pre-Frankfurt
     trading brief, and sends it to Telegram.
     If the EA file is missing/stale, sends a Telegram alert instead.
@@ -2667,7 +2667,8 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
             "Check MT5 is running and <code>GER40_M5_export</code> EA is on the GER40 M5 chart."
         )
         _dlog.warning("[DAX_BRIEF] MT5 feed stale: %s", exc)
-        alert_manager.notifier.send(msg)
+        if alert_manager.notifier:
+            alert_manager.notifier.send_message(msg)
         return
 
     # 2. Load live candles
@@ -2808,7 +2809,8 @@ def dax_sweep_watcher_job(alert_manager) -> None:
         f"\n"
         f"{exit_note}"
     )
-    alert_manager.notifier.send(msg)
+    if alert_manager.notifier:
+        alert_manager.notifier.send_message(msg)
     _dlog.info("[DAX_SWEEP] Triggered | setup=%s price=%.0f sweep_level=%.0f",
                setup, price_low if bullish else price_high, sweep_level)
 
@@ -2848,7 +2850,8 @@ def _send_setup_a_now(state: dict, alert_manager, now_utc) -> None:
         f"\n"
         f"Exit hard stop : 09:30 IDT"
     )
-    alert_manager.notifier.send(msg)
+    if alert_manager.notifier:
+        alert_manager.notifier.send_message(msg)
     _dlog.info("[DAX_SWEEP] Uncertain zone — no sweep, firing Setup A")
 
 
@@ -5093,7 +5096,7 @@ def main() -> None:
         dax_morning_brief_job,
         trigger="cron",
         day_of_week="mon-fri",
-        hour=4,
+        hour=7,
         minute=0,
         second=0,
         args=[db, alert_manager],
@@ -5104,7 +5107,7 @@ def main() -> None:
         dax_sweep_watcher_job,
         trigger="cron",
         day_of_week="mon-fri",
-        hour="4-6",
+        hour="7-9",
         minute="*",
         second=15,
         args=[alert_manager],
