@@ -2927,9 +2927,10 @@ def dax_frank_rejection_job(alert_manager) -> None:
     is_bullish = net > 0
     fk_body    = fk["close"] - fk["open"]
 
-    # Rejection: opposite body ≥ 8 pts, doesn't extend far beyond the pre range
+    # Rejection: opposite body ≥ 20% of pre-Frankfurt range (filters weak indecision candles)
+    min_body = pre_range * 0.20
     if is_bullish:
-        if fk_body > -8:
+        if fk_body > -min_body:
             return
         if fk["high"] > pre_high + pre_range * 0.15:
             return
@@ -2943,7 +2944,7 @@ def dax_frank_rejection_job(alert_manager) -> None:
         pre_from  = round(pre_low)
         pre_to    = round(pre_high)
     else:
-        if fk_body < 8:
+        if fk_body < min_body:
             return
         if fk["low"] < pre_low - pre_range * 0.15:
             return
