@@ -2861,7 +2861,7 @@ def _send_setup_a_now(state: dict, alert_manager, now_utc) -> None:
 
 def dax_frank_rejection_job(alert_manager) -> None:
     """
-    Runs every 5 min from 07:05–07:30 UTC (10:05–10:30 IDT) Mon–Fri.
+    Runs at 07:06, 07:21, 07:36, 07:51 UTC (10:06, 10:21, 10:36, 10:51 IDT) Mon–Fri.
     Detects: significant pre-Frankfurt directional expansion (≥0.35%) whose
     first Frankfurt open candle (07:00 UTC / 10:00 IDT) rejects the expansion.
     Fires once per day with levels, stats, and a sweep-watch warning.
@@ -2875,8 +2875,8 @@ def dax_frank_rejection_job(alert_manager) -> None:
         return
 
     h, m = now_utc.hour, now_utc.minute
-    # Only active 07:05–07:30 UTC (10:05–10:30 IDT)
-    if not (h == 7 and 5 <= m <= 30):
+    # Only active at scheduled ticks: 07:06, 07:21, 07:36, 07:51 UTC
+    if not (h == 7 and 6 <= m <= 52):
         return
 
     today = now_utc.date()
@@ -2963,14 +2963,20 @@ def dax_frank_rejection_job(alert_manager) -> None:
     pts_to_orig = abs(entry - origin)
     sl_ref      = peak
 
+    low_opp_warning = (
+        f"\n⚠️ Only {pts_to_orig} pts to origin — less than 30 pts, not worth the risk"
+        if pts_to_orig < 30 else ""
+    )
     caption = (
         f"<b>🔔 Frankfurt Open Rejection — {direction}</b>\n\n"
         f"Pre-Frankfurt: {net:+.0f} pts ({pre_pct:.2f}%) {arrow_pre}\n"
         f"07:00–09:55 IDT: {pre_from} → {pre_to}\n\n"
         f"10:00 IDT candle: body {fk_body:+.0f} pts {arrow_fk}\n"
         f"Entry: ~{entry}  |  SL: above {sl_ref}\n\n"
-        f"EQ (mid):  {eq}   ({pts_to_eq} pts)\n"
-        f"Origin:    {origin}   ({pts_to_orig} pts)\n\n"
+        f"Opportunity:  {pts_to_orig} pts to origin\n"
+        f"EQ (mid):     {eq}   ({pts_to_eq} pts)\n"
+        f"Origin:       {origin}   ({pts_to_orig} pts)"
+        f"{low_opp_warning}\n\n"
         f"⚠️ Watch for sweep above {sl_ref} — stay patient\n\n"
         f"📊 Historical: 12/13 = 92% WR on this setup"
     )
@@ -5272,7 +5278,7 @@ def main() -> None:
         trigger="cron",
         day_of_week="mon-fri",
         hour=10,
-        minute="5,10,15,20,25,30",
+        minute="6,21,36,51",
         second=30,
         args=[alert_manager],
         max_instances=1,
@@ -5285,7 +5291,7 @@ def main() -> None:
     logging.info("Daily report job runs at 21:00 IDT (18:00 UTC)")
     logging.info("DAX morning brief job runs Mon-Fri at 04:00 UTC (07:00 IDT)")
     logging.info("DAX sweep watcher runs every minute Mon-Fri 04:00-06:35 UTC (07:00-09:35 IDT)")
-    logging.info("DAX Frankfurt rejection job runs Mon-Fri 07:05-07:30 UTC (10:05-10:30 IDT)")
+    logging.info("DAX Frankfurt rejection job runs Mon-Fri at 07:06/21/36/51 UTC (10:06/21/36/51 IDT)")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
