@@ -2636,12 +2636,10 @@ def _run_fvg_param_sweep(raw_signals: list, db: LocalDB,
 def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
     """
     Runs at 07:06, 07:21, 07:36, 07:51 IDT (04:06, 04:21, 04:36, 04:51 UTC) Mon–Fri.
-    Fires once per day (retries at :21/:36/:51 if the first run failed).
-    Reads live GER40 5m data from the MT5 EA file, generates a pre-Frankfurt
-    trading brief, and sends it to Telegram.
-    If the EA file is missing/stale, sends a Telegram alert instead.
+    Sends a live-updated brief at each slot. sweep_triggered is preserved across
+    refreshes so the sweep watcher doesn't re-fire if sweep already happened.
     """
-    global _dax_brief_state, _dax_brief_sent_date
+    global _dax_brief_state
     from datetime import date as _date
     from data.ger40_file_reader import read_candles, check_staleness, get_file_paths, StaleFeedError
 
@@ -2651,10 +2649,9 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
     if now_utc.weekday() >= 5:
         return
 
-    if _dax_brief_sent_date == target:
-        return
-
-    _dax_brief_state = {}   # reset each morning before computing new state
+    # Preserve sweep_triggered so watcher doesn't re-fire after a refresh
+    prior_swept = _dax_brief_state.get("sweep_triggered", False)
+    _dax_brief_state = {}   # reset each run to pick up latest MT5 data
     _dlog.info("[DAX_BRIEF] START | %s UTC", now_utc.strftime("%H:%M"))
 
     _, hb_path = get_file_paths()
@@ -2701,7 +2698,7 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
             source = "DB (MT5 feed unavailable)"
 
         if result:
-            _dax_brief_state = {**result, "sweep_triggered": False}
+            _dax_brief_state = {**result, "sweep_triggered": prior_swept}
             gap_pts    = abs(result.get("gap_pts", 0) or 0)
             opp_line   = f"Trade opportunity: {gap_pts:.0f} pts"
             if gap_pts > 0 and gap_pts < 30:
@@ -2716,7 +2713,6 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
                 alert_manager.notifier.send_photo(chart, caption=caption)
             else:
                 alert_manager.notifier.send_message(caption)
-            _dax_brief_sent_date = target
             _dlog.info("[DAX_BRIEF] Sent | setup=%s gap_atr=%.2f dir=%s sweep_dist=%.2f",
                        result.get("setup_type"), result.get("gap_atr", 0),
                        result.get("trade_dir", "?"), result.get("dist_to_sweep_atr", 0))
@@ -2730,7 +2726,6 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
 # ── DAX brief state — shared between morning brief job and sweep watcher ──────
 _dax_brief_state: dict = {}   # populated at 04:00 UTC, read every minute until 06:30 UTC
 _frank_rejection_alerted_date: "date | None" = None   # prevents duplicate alerts per day
-_dax_brief_sent_date: "date | None" = None            # prevents re-sending the morning brief same day
 
 
 def dax_sweep_watcher_job(alert_manager) -> None:
@@ -5303,7 +5298,7 @@ def main() -> None:
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
     logging.info("Gap check job runs daily at 06:00 UTC")
     logging.info("Daily report job runs at 21:00 IDT (18:00 UTC)")
-    logging.info("DAX morning brief job runs Mon-Fri at 04:06/21/36/51 UTC (07:06/21/36/51 IDT) — once per day")
+    logging.info("DAX morning brief job runs Mon-Fri at 04:06/21/36/51 UTC (07:06/21/36/51 IDT) — live update each slot")
     logging.info("DAX sweep watcher runs every minute Mon-Fri 04:00-06:35 UTC (07:00-09:35 IDT)")
     logging.info("DAX Frankfurt rejection job runs Mon-Fri at 07:06/21/36/51 UTC (10:06/21/36/51 IDT)")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
