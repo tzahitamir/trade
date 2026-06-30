@@ -97,7 +97,7 @@ def prev_trading_day(d: date) -> date:
 
 
 def run_brief(target_date: date, db: LocalDB | None = None,
-              all5m: list | None = None, verbose=True) -> dict | None:
+              all5m: list | None = None, verbose=True, now_utc=None) -> dict | None:
     """
     all5m: pre-loaded candle list (oldest→newest). If None, loads from db.
     db:    LocalDB instance. Used only when all5m is None.
@@ -153,7 +153,20 @@ def run_brief(target_date: date, db: LocalDB | None = None,
             if verbose:
                 print(f"No price data found at 07:00 IDT for {target_date}.")
             return None
-    current_price = entry_c[0]["open"]
+    # Use the most recent candle before now_utc (live updates stay current);
+    # fall back to 07:00 IDT open if now_utc not provided (e.g. backtest/manual run)
+    if now_utc is not None:
+        now_ts   = int(now_utc.timestamp())
+        live_c   = [c for c in entry_c if c["timestamp"] <= now_ts]
+        ref_c    = live_c[-1] if live_c else entry_c[0]
+        ref_price = ref_c["close"]
+        ref_dt    = datetime.fromtimestamp(ref_c["timestamp"], timezone.utc)
+        idt_h     = (ref_dt.hour + 3) % 24
+        price_label = f"{idt_h:02d}:{ref_dt.minute:02d} IDT"
+    else:
+        ref_price   = entry_c[0]["open"]
+        price_label = "07:00 IDT"
+    current_price = ref_price
 
     # ── Core metrics ──────────────────────────────────────────────────────────
     gap_pts   = current_price - fkft_close
@@ -215,12 +228,12 @@ def run_brief(target_date: date, db: LocalDB | None = None,
     # ── Build output ──────────────────────────────────────────────────────────
     lines = []
     lines.append(f"{'─'*52}")
-    lines.append(f"DAX Morning Brief — {dow_name} {target_date}  07:00 IDT")
+    lines.append(f"DAX Morning Brief — {dow_name} {target_date}  {price_label}")
     lines.append(f"{'─'*52}")
     lines.append(f"")
     lines.append(f"Yesterday Frankfurt close : {fkft_close:.0f}")
     lines.append(f"ATR (prev session, 5m×20) : {atr:.0f} pts")
-    lines.append(f"Current price (07:00 IDT) : {current_price:.0f}")
+    lines.append(f"Current price ({price_label}) : {current_price:.0f}")
     lines.append(f"")
     lines.append(f"Gap : {gap_pts:+.0f} pts  ({gap_atr:.2f}×ATR)  [{trade_dir} toward close]")
     lines.append(f"")

@@ -2691,10 +2691,10 @@ def dax_morning_brief_job(db: "LocalDB", alert_manager) -> None:
         spec.loader.exec_module(mod)
 
         if all5m:
-            result = mod.run_brief(target, all5m=all5m, verbose=False)
+            result = mod.run_brief(target, all5m=all5m, verbose=False, now_utc=now_utc)
             source = "live MT5 feed"
         else:
-            result = mod.run_brief(target, db=db, verbose=False)
+            result = mod.run_brief(target, db=db, verbose=False, now_utc=now_utc)
             source = "DB (MT5 feed unavailable)"
 
         if result:
