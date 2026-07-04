@@ -774,6 +774,23 @@ class SMCAnalyzer:
             peak        = min(c["low"]  for c in post_bos)      if post_bos else first_bos["broken_level"]
             peak_candle = min(post_bos, key=lambda c: c["low"])
 
+        # Cross-check peak with 5m data — Yahoo 15m candles can miss intra-bar extremes.
+        # Use the more extreme 5m value so SL is never placed inside a candle the
+        # market already visited.
+        post_bos_start_ts = post_bos[0]["timestamp"] if post_bos else session_start_ts
+        post_bos_5m = [c for c in candles_5m_full if c["timestamp"] >= post_bos_start_ts]
+        if post_bos_5m:
+            if bullish_exp:
+                peak_5m = max(c["high"] for c in post_bos_5m)
+                if peak_5m > peak:
+                    peak = peak_5m
+                    peak_candle = max(post_bos_5m, key=lambda c: c["high"])
+            else:
+                peak_5m = min(c["low"] for c in post_bos_5m)
+                if peak_5m < peak:
+                    peak = peak_5m
+                    peak_candle = min(post_bos_5m, key=lambda c: c["low"])
+
         expansion_range = abs(peak - origin)
         if expansion_range < min_exp_atr * atr_15m:
             return []
