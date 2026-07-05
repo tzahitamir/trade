@@ -4830,6 +4830,228 @@ def _format_tsla_alert(sig: dict) -> str:
     )
 
 
+# ── XAU BOS/ChoCH + pullback alert ───────────────────────────────────────────
+# Active hours (UTC): 01, 03, 14, 15, 17 — best from 1-year backtest
+# Days: Mon–Thu only
+# Filters: 4h MA20 direction · TP ≥ 1R away · pullback SL
+_XAU_BOS_ALERTED: set[str] = set()   # dedup by alert_id across the session
+_XAU_SWING_N       = 3
+_XAU_SWEEP_WINDOW  = 15
+_XAU_PULLBACK_MAX  = 6
+_XAU_SWING_TP_WIN  = 40
+_XAU_BOS_COOLDOWN  = 8
+_XAU_MA4H_PERIOD   = 20
+_XAU_BEST_HOURS    = frozenset({1, 3, 14, 15, 17})   # UTC
+_XAU_MIN_TP_R      = 1.0
+
+
+def _xau_find_swings(candles: list) -> tuple[list, list]:
+    n = len(candles); sh = [False]*n; sl = [False]*n
+    for i in range(_XAU_SWING_N, n - _XAU_SWING_N):
+        wh = [candles[j]["high"] for j in range(i-_XAU_SWING_N, i+_XAU_SWING_N+1)]
+        wl = [candles[j]["low"]  for j in range(i-_XAU_SWING_N, i+_XAU_SWING_N+1)]
+        if candles[i]["high"] == max(wh): sh[i] = True
+        if candles[i]["low"]  == min(wl): sl[i] = True
+    return sh, sl
+
+
+def _xau_find_sweeps(candles: list, sh: list, sl: list):
+    n = len(candles)
+    sb = [False]*n; sbe = [False]*n
+    for i in range(_XAU_SWING_N+1, n):
+        c = candles[i]
+        for j in range(i-1, max(i-_XAU_SWEEP_WINDOW-1, _XAU_SWING_N-1), -1):
+            if sl[j] and c["low"] < candles[j]["low"] and c["close"] > candles[j]["low"]:
+                sb[i] = True; break
+        for j in range(i-1, max(i-_XAU_SWEEP_WINDOW-1, _XAU_SWING_N-1), -1):
+            if sh[j] and c["high"] > candles[j]["high"] and c["close"] < candles[j]["high"]:
+                sbe[i] = True; break
+    return sb, sbe
+
+
+def _xau_4h_bias(candles_4h: list) -> str | None:
+    """Return 'BULL', 'BEAR', or None from the last completed 4h bar vs MA20."""
+    if len(candles_4h) < _XAU_MA4H_PERIOD:
+        return None
+    closes = [c["close"] for c in candles_4h]
+    ma20 = sum(closes[-_XAU_MA4H_PERIOD:]) / _XAU_MA4H_PERIOD
+    last_close = closes[-1]
+    return "BULL" if last_close > ma20 else "BEAR"
+
+
+def _xau_detect_bos(candles: list, sh: list, sl: list,
+                    sb: list, sbe: list, bias: str | None) -> dict | None:
+    """
+    Scan the last _XAU_BOS_COOLDOWN+_XAU_PULLBACK_MAX bars for a fresh BOS/ChoCH
+    setup with pullback entry.  Returns a setup dict or None.
+    """
+    n = len(candles)
+    scan_start = _XAU_SWING_N + _XAU_SWEEP_WINDOW + 1
+
+    for i in range(scan_start, n - _XAU_PULLBACK_MAX - 1):
+        c = candles[i]
+        ts = c["ts"] if "ts" in c else datetime.utcfromtimestamp(c["timestamp"]).replace(tzinfo=timezone.utc)
+
+        for direction in ("BULL", "BEAR"):
+            if direction == "BULL" and bias == "BEAR": continue
+            if direction == "BEAR" and bias == "BULL": continue
+
+            if direction == "BULL":
+                pivots = [(j, candles[j]["high"])
+                          for j in range(i-1, max(i-_XAU_SWEEP_WINDOW-1, _XAU_SWING_N), -1)
+                          if sh[j]]
+            else:
+                pivots = [(j, candles[j]["low"])
+                          for j in range(i-1, max(i-_XAU_SWEEP_WINDOW-1, _XAU_SWING_N), -1)
+                          if sl[j]]
+
+            for (_, level) in pivots:
+                if direction == "BULL" and c["close"] <= level: continue
+                if direction == "BEAR" and c["close"] >= level: continue
+
+                n_bos   = sum(1 for k in range(max(0,i-_XAU_SWEEP_WINDOW), i) if (sb[k]  if direction=="BULL" else sbe[k]))
+                n_choch = sum(1 for k in range(max(0,i-_XAU_SWEEP_WINDOW), i) if (sbe[k] if direction=="BULL" else sb[k]))
+                if n_bos + n_choch < 1: break
+                setup_type = "BOS" if n_bos >= n_choch else "ChoCH"
+
+                pb_extreme = c["low"] if direction == "BULL" else c["high"]
+                entry_bar = None; entry_price = None
+                for pb in range(i+1, min(i+1+_XAU_PULLBACK_MAX, n)):
+                    pc = candles[pb]
+                    if direction == "BULL":
+                        if pc["low"] < level: break
+                        pb_extreme = min(pb_extreme, pc["low"])
+                        if pc["close"] > c["high"]:
+                            entry_bar = pb; entry_price = pc["close"]; break
+                    else:
+                        if pc["high"] > level: break
+                        pb_extreme = max(pb_extreme, pc["high"])
+                        if pc["close"] < c["low"]:
+                            entry_bar = pb; entry_price = pc["close"]; break
+
+                if entry_bar is None: break
+
+                sl_val = pb_extreme
+                risk = (entry_price - sl_val) if direction == "BULL" else (sl_val - entry_price)
+                if risk <= 0: break
+
+                # structural TP: nearest swing high/low above/below entry
+                if direction == "BULL":
+                    tp_cands = [candles[j]["high"]
+                                for j in range(max(0, entry_bar-_XAU_SWING_TP_WIN), entry_bar)
+                                if sh[j] and candles[j]["high"] > entry_price]
+                    tp = min(tp_cands) if tp_cands else entry_price + 2*risk
+                else:
+                    tp_cands = [candles[j]["low"]
+                                for j in range(max(0, entry_bar-_XAU_SWING_TP_WIN), entry_bar)
+                                if sl[j] and candles[j]["low"] < entry_price]
+                    tp = max(tp_cands) if tp_cands else entry_price - 2*risk
+
+                r_at_tp = abs(tp - entry_price) / risk
+                if r_at_tp < _XAU_MIN_TP_R: break
+
+                entry_ts = candles[entry_bar].get("ts") or \
+                    datetime.utcfromtimestamp(candles[entry_bar]["timestamp"]).replace(tzinfo=timezone.utc)
+
+                return {
+                    "direction":  direction,
+                    "setup_type": setup_type,
+                    "bias4h":     bias or "—",
+                    "entry":      entry_price,
+                    "sl":         sl_val,
+                    "tp":         tp,
+                    "risk":       risk,
+                    "r_at_tp":    r_at_tp,
+                    "bos_ts":     int(ts.timestamp()),
+                    "entry_ts":   entry_ts,
+                }
+                break
+            else:
+                continue
+            break
+
+    return None
+
+
+def xau_bos_job(alert_manager) -> None:
+    """
+    Scan XAUUSD M15 data from MT5 file bridge for BOS/ChoCH + pullback setups.
+
+    Runs every 15 min. Only fires during best hours (01,03,14,15,17 UTC) on Mon–Thu.
+    Sends one Telegram alert per unique setup (deduped by entry timestamp + direction).
+    """
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 4:   # Fri=4, Sat=5, Sun=6 — skip
+        return
+    if now.hour not in _XAU_BEST_HOURS:
+        return
+
+    try:
+        from data.xauusd_m15_reader import load_mt5_candles, load_h4_candles, is_available, h4_available
+    except ImportError:
+        _dlog.warning("[XAU_BOS] xauusd_m15_reader not importable")
+        return
+
+    if not is_available():
+        _dlog.info("[XAU_BOS] M15 file not found — EA not attached?")
+        return
+
+    try:
+        candles_15m = load_mt5_candles()
+        candles_h4  = load_h4_candles() if h4_available() else []
+    except Exception as exc:
+        _dlog.error("[XAU_BOS] data load failed: %s", exc)
+        return
+
+    # keep only last 200 bars for scanning (enough for swings + sweeps)
+    candles_15m = candles_15m[-200:]
+    if len(candles_15m) < 50:
+        _dlog.info("[XAU_BOS] insufficient bars (%d)", len(candles_15m))
+        return
+
+    bias = _xau_4h_bias(candles_h4) if candles_h4 else None
+    sh, sl_arr = _xau_find_swings(candles_15m)
+    sb, sbe    = _xau_find_sweeps(candles_15m, sh, sl_arr)
+    setup      = _xau_detect_bos(candles_15m, sh, sl_arr, sb, sbe, bias)
+
+    if setup is None:
+        _dlog.info("[XAU_BOS] no_setup | bias=%s | bars=%d", bias, len(candles_15m))
+        return
+
+    # dedup: one alert per entry bar + direction
+    alert_id = f"xau_bos_{setup['direction']}_{setup['bos_ts']}"
+    if alert_id in _XAU_BOS_ALERTED:
+        _dlog.info("[XAU_BOS] DEDUP | %s", alert_id)
+        return
+    _XAU_BOS_ALERTED.add(alert_id)
+
+    d   = setup["direction"]
+    st  = setup["setup_type"]
+    e   = setup["entry"]
+    sl  = setup["sl"]
+    tp  = setup["tp"]
+    rr  = setup["r_at_tp"]
+    b4  = setup["bias4h"]
+    risk_pts = setup["risk"]
+
+    action  = "BUY"  if d == "BULL" else "SELL"
+    emoji   = "🟢"   if d == "BULL" else "🔴"
+    ts_str  = setup["entry_ts"].strftime("%H:%M UTC")
+
+    msg = (
+        f"{emoji} <b>XAUUSD {action} — {st}</b>\n"
+        f"Entry:  <code>{e:.2f}</code>\n"
+        f"SL:     <code>{sl:.2f}</code>  (risk {risk_pts:.1f} pts)\n"
+        f"TP:     <code>{tp:.2f}</code>  ({rr:.1f}R)\n"
+        f"4h:     {b4} | Signal: {ts_str}\n"
+        f"Filter: Mon–Thu · hour {now.hour:02d}UTC · TP≥{_XAU_MIN_TP_R:.0f}R"
+    )
+
+    _dlog.info("[XAU_BOS] SIGNAL | %s %s | entry=%.2f sl=%.2f tp=%.2f rr=%.1f | id=%s",
+               d, st, e, sl, tp, rr, alert_id)
+    alert_manager.send_alert({"message": msg, "alert_id": alert_id})
+
+
 def tsla_data_job(db: "LocalDB") -> None:
     """Read TSLA 5m candles from MT5 file bridge and store 5m + resampled 15m to DB.
 
@@ -5535,6 +5757,17 @@ def main() -> None:
         max_instances=1,
         id="trade_tsla_session_job",
     )
+    scheduler.add_job(
+        xau_bos_job,
+        trigger="cron",
+        day_of_week="mon-thu",
+        hour="1,3,14,15,17",
+        minute="1,16,31,46",
+        second=30,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_xau_bos_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
@@ -5545,6 +5778,7 @@ def main() -> None:
     logging.info("DAX Frankfurt rejection job runs Mon-Fri at 07:06/21/36/51 UTC (10:06/21/36/51 IDT)")
     logging.info("TSLA data job runs Tue-Fri 13:00-20:55 UTC (09:00-16:55 ET) — reads MT5 TSLA_M5.csv")
     logging.info("TSLA session job runs Tue-Fri 13:00-16:55 UTC (09:00-12:55 ET) — SERPE detection")
+    logging.info("XAU BOS job runs Mon-Thu at hours 01/03/14/15/17 UTC — BOS/ChoCH + pullback alert")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 

@@ -28,7 +28,7 @@ PATCHES = [
 
 
 def _fetch_at_minute(minute):
-    """Return a datetime that triggers 15m fetch (minute % 15 == 4)."""
+    """Return a datetime that triggers 15m fetch (minute % 15 == 1)."""
     return datetime(2026, 6, 2, 9, minute, 0, tzinfo=timezone.utc)  # Monday
 
 
@@ -40,7 +40,7 @@ def test_no_fetch_when_limit_reached(db):
     with patch("main.time.sleep"), \
          patch("main.process_symbol_timeframe") as mock_fetch, \
          patch("main.datetime") as mock_dt:
-        mock_dt.now.return_value = _fetch_at_minute(4)
+        mock_dt.now.return_value = _fetch_at_minute(1)
         fetch_job(settings, MagicMock(), db, am)
 
     mock_fetch.assert_not_called()
@@ -60,7 +60,7 @@ def test_alert_sent_exactly_once_when_limit_crossed(db):
     with patch("main.time.sleep"), \
          patch("main.process_symbol_timeframe", side_effect=fake_process), \
          patch("main.datetime") as mock_dt:
-        mock_dt.now.return_value = _fetch_at_minute(4)
+        mock_dt.now.return_value = _fetch_at_minute(1)
         fetch_job(settings, fetcher, db, am)  # hits limit after NZDUSD
         fetch_job(settings, fetcher, db, am)  # already exhausted — silent
 
@@ -83,7 +83,7 @@ def test_priority_order_respected(db):
     with patch("main.time.sleep"), \
          patch("main.process_symbol_timeframe", side_effect=fake_process), \
          patch("main.datetime") as mock_dt:
-        mock_dt.now.return_value = _fetch_at_minute(4)
+        mock_dt.now.return_value = _fetch_at_minute(1)
         fetch_job(settings, MagicMock(), db, MagicMock())
 
     assert fetched_order == FETCH_PRIORITY
@@ -101,7 +101,7 @@ def test_usdjpy_fetched_last(db):
     with patch("main.time.sleep"), \
          patch("main.process_symbol_timeframe", side_effect=fake_process), \
          patch("main.datetime") as mock_dt:
-        mock_dt.now.return_value = _fetch_at_minute(4)
+        mock_dt.now.return_value = _fetch_at_minute(1)
         fetch_job(settings, MagicMock(), db, MagicMock())
 
     assert fetched_order[-1] == "USDJPY"
@@ -121,7 +121,7 @@ def test_best_pairs_survive_budget_pressure(db):
     with patch("main.time.sleep"), \
          patch("main.process_symbol_timeframe", side_effect=fake_process), \
          patch("main.datetime") as mock_dt:
-        mock_dt.now.return_value = _fetch_at_minute(4)
+        mock_dt.now.return_value = _fetch_at_minute(1)
         fetch_job(settings, MagicMock(), db, MagicMock())
 
     assert "NZDUSD" in fetched

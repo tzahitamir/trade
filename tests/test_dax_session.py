@@ -59,14 +59,14 @@ class TestDaxPeakTooLate:
     def test_before_cutoff_passes(self):
         assert not _dax_peak_too_late(_ts(11, 0))
 
-    def test_at_11_44_passes(self):
-        assert not _dax_peak_too_late(_ts(11, 44))
+    def test_at_11_59_passes(self):
+        assert not _dax_peak_too_late(_ts(11, 59))
 
-    def test_at_cutoff_11_45_blocked(self):
-        assert _dax_peak_too_late(_ts(11, 45))
+    def test_at_cutoff_12_00_blocked(self):
+        assert _dax_peak_too_late(_ts(12, 0))
 
     def test_after_cutoff_blocked(self):
-        assert _dax_peak_too_late(_ts(12, 0))
+        assert _dax_peak_too_late(_ts(12, 15))
         assert _dax_peak_too_late(_ts(12, 30))
 
     def test_early_session_passes(self):

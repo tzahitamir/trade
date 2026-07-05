@@ -64,7 +64,7 @@ def test_tp_hit_bullish_sends_alert(db):
     assert not monitors  # closed
 
 
-def test_sl_hit_bullish_sends_alert(db):
+def test_sl_hit_bullish_closes_monitor(db):
     entry, sl, tp = 1.1000, 1.0950, 1.1100
     bos_ts = 2_000_000
     _open_monitor(db, "A2", "EURUSD", "bullish", entry, sl, tp, bos_ts)
@@ -76,9 +76,9 @@ def test_sl_hit_bullish_sends_alert(db):
     am = _make_am()
     momentum_monitor_job(db, am)
 
-    am.send_alert.assert_called_once()
-    msg = am.send_alert.call_args[0][0]
-    assert "SL HIT" in msg
+    # SL hit closes the monitor silently (no Telegram noise on losses)
+    am.send_alert.assert_not_called()
+    assert not db.get_open_monitors()
 
 
 def test_tp_hit_bearish_sends_alert(db):
