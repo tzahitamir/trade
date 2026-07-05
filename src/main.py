@@ -4841,7 +4841,7 @@ _XAU_PULLBACK_MAX  = 6
 _XAU_SWING_TP_WIN  = 40
 _XAU_BOS_COOLDOWN  = 8
 _XAU_MA4H_PERIOD   = 20
-_XAU_BEST_HOURS    = frozenset({6, 14, 15, 17})   # UTC = 09,17,18,20 IDT
+_XAU_BEST_HOURS    = frozenset({6, 14, 15, 16, 17})   # UTC = 09,17,18,19,20 IDT
 _XAU_MIN_TP_R      = 1.0
 
 
@@ -5761,7 +5761,7 @@ def main() -> None:
         xau_bos_job,
         trigger="cron",
         day_of_week="mon-thu",
-        hour="6,14,15,17",
+        hour="6,14,15,16,17",
         minute="1,16,31,46",
         second=30,
         args=[alert_manager],
