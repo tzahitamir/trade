@@ -2944,7 +2944,6 @@ def dax_frank_rejection_job(alert_manager) -> None:
         if fk["high"] > pre_high + pre_range * 0.15:
             return
         peak      = max(pre_high, fk["high"])
-        sl        = round(peak + 15)
         eq        = round(pre_high - pre_range * 0.50)
         origin    = round(pre_low)
         direction = "SHORT"
@@ -2958,7 +2957,6 @@ def dax_frank_rejection_job(alert_manager) -> None:
         if fk["low"] < pre_low - pre_range * 0.15:
             return
         peak      = min(pre_low, fk["low"])
-        sl        = round(peak - 15)
         eq        = round(pre_low + pre_range * 0.50)
         origin    = round(pre_high)
         direction = "LONG"
@@ -2970,23 +2968,33 @@ def dax_frank_rejection_job(alert_manager) -> None:
     entry       = round(fk["close"])
     pts_to_eq   = abs(entry - eq)
     pts_to_orig = abs(entry - origin)
-    sl_ref      = peak
+
+    # Direction-aware SL language: SHORT stops above expansion peak; LONG stops below expansion low.
+    peak_disp = round(peak)
+    if direction == "SHORT":
+        sl_side      = "above"
+        rejection_desc = "Strong rejection to the downside"
+        sweep_msg    = f"⚠️ Watch for sweep above {peak_disp} before drop — stay patient"
+    else:
+        sl_side      = "below"
+        rejection_desc = "Strong rejection to the upside"
+        sweep_msg    = f"⚠️ Watch for sweep below {peak_disp} before rally — stay patient"
 
     low_opp_warning = (
         f"\n⚠️ Only {pts_to_orig} pts to origin — less than 30 pts, not worth the risk"
         if pts_to_orig < 30 else ""
     )
     caption = (
-        f"<b>🔔 Frankfurt Open Rejection — {direction}</b>\n\n"
+        f"<b>🔔 Frankfurt Open Rejection — {direction} Setup</b>\n\n"
         f"Pre-Frankfurt: {net:+.0f} pts ({pre_pct:.2f}%) {arrow_pre}\n"
         f"07:00–09:55 IDT: {pre_from} → {pre_to}\n\n"
-        f"10:00 IDT candle: body {fk_body:+.0f} pts {arrow_fk}\n"
-        f"Entry: ~{entry}  |  SL: above {sl_ref}\n\n"
+        f"10:00 IDT candle: body {fk_body:+.0f} pts {arrow_fk}  —  {rejection_desc}\n"
+        f"Entry: ~{entry}  |  SL: {sl_side} {peak_disp}\n\n"
         f"Opportunity:  {pts_to_orig} pts to origin\n"
         f"EQ (mid):     {eq}   ({pts_to_eq} pts)\n"
         f"Origin:       {origin}   ({pts_to_orig} pts)"
         f"{low_opp_warning}\n\n"
-        f"⚠️ Watch for sweep above {sl_ref} — stay patient\n\n"
+        f"{sweep_msg}\n\n"
         f"📊 Historical: 12/13 = 92% WR on this setup"
     )
 
@@ -4754,6 +4762,218 @@ def run_bos_experiment(
     return all_pair_stats, all_symbols, pset_ids, all_raw_signals, sweep_sets
 
 
+# ──────────────────────────────── TSLA SERPE ─────────────────────────────────
+#
+# Same counter-trend strategy as DAX SERPE, applied to TSLA CFD on the NY open.
+# Session: 9:30–12:30 ET  |  Peak cutoff: 11:45 ET  |  Skip Monday
+# Data source: MT5 file bridge (GER40_M5_export EA attached to TSLA M5 chart
+#   with CsvFileName=TSLA_M5.csv, HbFileName=TSLA_heartbeat.txt)
+#
+# Gold params confirmed by 1-year backtest (218 sessions, 73 signals, 100% WR):
+#   tp=0.55  ez=0.70  sl=0.50  exp=1.00  (same as DAX gold analysis params)
+
+try:
+    from zoneinfo import ZoneInfo as _ZI2
+    _ET_TZ = _ZI2("America/New_York")
+except Exception:
+    from datetime import timezone as _tz2, timedelta as _td2
+    _ET_TZ = _tz2(_td2(hours=-4))   # fallback: EDT (summer, UTC-4)
+
+_TSLA_GOLD_PARAMS = {
+    "tp_pct":             0.55,
+    "sl_atr_mult":        0.50,
+    "min_expansion_atr":  1.00,
+    "entry_zone_min_pct": 0.70,
+    "symbol":             "TSLA",
+}
+_TSLA_PEAK_CUTOFF = (11, 45)   # ET — discard peaks at/after this time (WR degrades)
+
+_tsla_alerted_dates: set = set()
+
+
+def _tsla_session_window(trade_date) -> tuple:
+    """Return (start_ts_utc, end_ts_utc) for TSLA NY open: 9:30–12:30 ET."""
+    from datetime import datetime as _dt
+    start = _dt(trade_date.year, trade_date.month, trade_date.day, 9,  30, tzinfo=_ET_TZ)
+    end   = _dt(trade_date.year, trade_date.month, trade_date.day, 12, 30, tzinfo=_ET_TZ)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def _format_tsla_alert(sig: dict) -> str:
+    """Format a TSLA SERPE entry signal for Telegram."""
+    ct_dir   = sig["direction"].upper()      # BEARISH = SHORT, BULLISH = LONG
+    exp_dir  = sig.get("expansion_dir", "").upper()
+    entry    = sig["entry"]
+    sl       = sig["sl"]
+    tp       = sig["tp"]
+    peak     = sig.get("peak", 0)
+    origin   = sig.get("origin", 0)
+    eq       = sig.get("eq_level", 0)
+    extreme  = sig.get("signal_extreme", 0)
+    exp_size = abs(peak - origin)
+    risk     = abs(entry - sl)
+    r        = round(abs(tp - entry) / risk, 1) if risk else 0.0
+    lh_hl    = "LH" if ct_dir == "BEARISH" else "HL"
+    action   = "SELL ↓" if ct_dir == "BEARISH" else "BUY  ↑"
+    peak_t   = datetime.fromtimestamp(sig.get("peak_ts", 0), tz=_ET_TZ).strftime("%H:%M")
+    return (
+        f"<b>[TSLA] SERPE {ct_dir}</b>  (fades {exp_dir} expansion)\n"
+        f"\n"
+        f"Expansion:  <code>${origin:.2f} → ${peak:.2f}  (${exp_size:.2f})</code>\n"
+        f"EQ (50%):   <code>${eq:.2f}</code>  |  Peak: {peak_t} ET\n"
+        f"{lh_hl} extreme: <code>${extreme:.2f}</code>\n"
+        f"\n"
+        f"{action}  Entry: <code>${entry:.2f}</code>\n"
+        f"SL:          <code>${sl:.2f}</code>\n"
+        f"TP:          <code>${tp:.2f}</code>\n"
+        f"R:R          <code>1:{r}</code>"
+    )
+
+
+def tsla_data_job(db: "LocalDB") -> None:
+    """Read TSLA 5m candles from MT5 file bridge and store 5m + resampled 15m to DB.
+
+    Runs every 5 min during US session (09:00–16:45 ET / 13:00–20:45 UTC).
+    Falls back silently if the MT5 file is not found (EA not yet configured).
+    """
+    from datetime import time as _time
+    from data.mt5_file_reader import read_mt5_candles, resample_to_15m, StaleFeedError
+
+    now_et = datetime.now(_ET_TZ)
+    if now_et.weekday() >= 5:
+        return
+    if not (_time(9, 0) <= now_et.time() <= _time(16, 45)):
+        return
+
+    _dlog.info("[TSLA_DATA] START | time_et=%s", now_et.strftime("%H:%M ET"))
+    try:
+        candles_5m = read_mt5_candles("TSLA_M5.csv", limit=500)
+    except FileNotFoundError:
+        _dlog.warning("[TSLA_DATA] TSLA_M5.csv not found — attach export EA to TSLA M5 chart")
+        return
+    except StaleFeedError as exc:
+        _dlog.warning("[TSLA_DATA] stale feed: %s", exc)
+        return
+    except Exception as exc:
+        _dlog.error("[TSLA_DATA] ERROR | %s", exc)
+        return
+
+    if not candles_5m:
+        return
+
+    candles_15m = resample_to_15m(candles_5m)
+    db.insert_candles("TSLA", "5m",  candles_5m)
+    db.insert_candles("TSLA", "15m", candles_15m)
+    _dlog.info("[TSLA_DATA] stored %d 5m + %d 15m candles",
+               len(candles_5m), len(candles_15m))
+
+
+def tsla_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertManager") -> None:
+    """Check for TSLA SERPE setup every 5 min during NY open (9:30–12:30 ET).
+
+    Fires one Telegram alert per day when the first LH/HL forms in the entry zone.
+    Peak must form before 11:45 ET; Monday is skipped.
+    """
+    from datetime import time as _time
+    from analysis.smc_analyzer import SMCAnalyzer
+
+    now_et = datetime.now(_ET_TZ)
+    today  = now_et.date()
+
+    if today.weekday() >= 5:
+        return
+    if not (_time(9, 30) <= now_et.time() <= _time(12, 30)):
+        return
+    if today in _tsla_alerted_dates:
+        _dlog.info("[TSLA_SESSION] already_alerted today | skip")
+        return
+
+    alerts_on = getattr(settings, "dax_alerts_enabled", False)
+
+    start_ts, end_ts = _tsla_session_window(today)
+    mc_ts = int(datetime(today.year, today.month, today.day, 16, 0, tzinfo=_ET_TZ).timestamp())
+
+    candles_15m = db.query_recent("TSLA", "15m", limit=200)
+    candles_5m  = db.query_recent("TSLA", "5m",  limit=500)
+
+    if not candles_15m or not candles_5m:
+        _dlog.warning("[TSLA_SESSION] no candles | 15m=%d 5m=%d",
+                      len(candles_15m or []), len(candles_5m or []))
+        return
+
+    sess_15m = sorted(
+        [c for c in candles_15m if start_ts <= c["timestamp"] <= end_ts],
+        key=lambda c: c["timestamp"],
+    )
+    if len(sess_15m) < 3:
+        _dlog.info("[TSLA_SESSION] insufficient session candles (%d<3) | waiting", len(sess_15m))
+        return
+
+    pre_15m = sorted(
+        [c for c in candles_15m if c["timestamp"] < start_ts],
+        key=lambda c: c["timestamp"],
+    )[-16:]
+
+    day_5m = sorted(
+        [c for c in candles_5m if start_ts <= c["timestamp"] <= mc_ts],
+        key=lambda c: c["timestamp"],
+    )
+
+    analyzer = SMCAnalyzer()
+    try:
+        sigs = analyzer.detect_dax_session_setup(
+            sess_15m, day_5m,
+            params=_TSLA_GOLD_PARAMS,
+            candles_15m_presession=pre_15m,
+        )
+    except Exception as exc:
+        _dlog.error("[TSLA_SESSION] detection_failed | %s", exc)
+        return
+
+    if not sigs:
+        _dlog.info("[TSLA_SESSION] no_signal | sess_15m=%d day_5m=%d", len(sess_15m), len(day_5m))
+        return
+
+    sig     = sigs[0]
+    peak_ts = sig.get("peak_ts", 0)
+    peak_et = datetime.fromtimestamp(peak_ts, tz=_ET_TZ)
+
+    if (peak_et.hour, peak_et.minute) >= _TSLA_PEAK_CUTOFF:
+        peak_str = peak_et.strftime("%H:%M")
+        _dlog.info("[TSLA_SESSION] late_peak %s ET ≥ 11:45 | suppressed", peak_str)
+        _tsla_alerted_dates.add(today)
+        return
+
+    _tsla_alerted_dates.add(today)
+
+    entry_bar = next((c for c in day_5m if c["timestamp"] == sig.get("breakout_ts")), None)
+    if entry_bar:
+        extreme = entry_bar["high"] if sig["direction"] == "bearish" else entry_bar["low"]
+        sig = {**sig, "signal_extreme": extreme}
+
+    _dlog.info("[TSLA_SESSION] ENTRY_SIGNAL | dir=%s entry=%.2f sl=%.2f tp=%.2f | alerts_on=%s",
+               sig.get("direction"), sig.get("entry", 0), sig.get("sl", 0),
+               sig.get("tp", 0), alerts_on)
+
+    msg = _format_tsla_alert(sig)
+    logging.info("TSLA ENTRY SIGNAL: %s", msg)
+
+    try:
+        chart_path = alert_manager.render_dax_alert(sig, day_5m, outcome="OPEN")
+    except Exception as exc:
+        logging.warning("TSLA chart render failed: %s", exc)
+        chart_path = None
+
+    if alerts_on:
+        alert_manager.send_alert({
+            "message":    msg,
+            "image_path": chart_path,
+            "alert_id":   sig.get("signal_id", f"tsla_{today}"),
+        })
+    else:
+        _dlog.info("[TSLA_SESSION] alert_suppressed (alerts_off) | chart=%s", chart_path)
+
+
 def scheduler_heartbeat_job() -> None:
     """Log a heartbeat every 30 minutes so the debug log confirms the scheduler is alive."""
     _dlog.info("[SCHEDULER] heartbeat | alive | %s UTC",
@@ -5293,6 +5513,28 @@ def main() -> None:
         max_instances=1,
         id="trade_dax_frank_rejection_job",
     )
+    scheduler.add_job(
+        tsla_data_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="13-20",
+        minute="*/5",
+        second=15,
+        args=[db],
+        max_instances=1,
+        id="trade_tsla_data_job",
+    )
+    scheduler.add_job(
+        tsla_session_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="13-16",
+        minute="*/5",
+        second=45,
+        args=[settings, db, alert_manager],
+        max_instances=1,
+        id="trade_tsla_session_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
@@ -5301,6 +5543,8 @@ def main() -> None:
     logging.info("DAX morning brief job runs Mon-Fri at 04:06/21/36/51 UTC (07:06/21/36/51 IDT) — live update each slot")
     logging.info("DAX sweep watcher runs every minute Mon-Fri 04:00-06:35 UTC (07:00-09:35 IDT)")
     logging.info("DAX Frankfurt rejection job runs Mon-Fri at 07:06/21/36/51 UTC (10:06/21/36/51 IDT)")
+    logging.info("TSLA data job runs Tue-Fri 13:00-20:55 UTC (09:00-16:55 ET) — reads MT5 TSLA_M5.csv")
+    logging.info("TSLA session job runs Tue-Fri 13:00-16:55 UTC (09:00-12:55 ET) — SERPE detection")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
