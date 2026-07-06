@@ -5058,6 +5058,177 @@ def xau_bos_job(alert_manager) -> None:
     alert_manager.send_alert({"message": msg, "alert_id": alert_id})
 
 
+# ── NAS100 US Open expansion + EQ retrace alert ───────────────────────────────
+# Strategy: initial expansion ≥3 bars, 0.2–1.2% range, Def-D trigger (first
+# opposite-colour bar after peak), entry at close, SL at expansion extreme,
+# TP at EQ (50%).  78% WR, +0.59R EV over 263 trades / 5.5 years.
+_NAS100_ALERTED_DATES: set[str] = set()   # one alert per date per direction
+
+_NAS100_US_OPEN_HOUR   = 13
+_NAS100_US_OPEN_MINUTE = 30
+_NAS100_EXP_BARS       = 12    # look up to 60 min for expansion
+_NAS100_MIN_EXP_PCT    = 0.20
+_NAS100_MAX_EXP_PCT    = 1.20
+_NAS100_RETRACE_PCT    = 0.30  # give-back threshold to cap expansion
+
+
+def _nas100_find_expansion(bars: list) -> dict | None:
+    """
+    From the US open bar onwards, find the expansion end, direction,
+    extreme, and EQ.  Returns None if expansion doesn't qualify.
+    """
+    b0 = bars[0]
+    direction = "BULL" if b0["close"] > b0["open"] else "BEAR"
+    high_so_far = b0["high"]
+    low_so_far  = b0["low"]
+    exp_end = 0
+
+    for k in range(1, min(_NAS100_EXP_BARS, len(bars))):
+        b = bars[k]
+        exp_range = high_so_far - low_so_far
+        if direction == "BULL":
+            if b["high"] > high_so_far:
+                high_so_far = b["high"]; exp_end = k
+            elif exp_range > 0 and b["high"] < high_so_far - exp_range * _NAS100_RETRACE_PCT:
+                break
+        else:
+            if b["low"] < low_so_far:
+                low_so_far = b["low"]; exp_end = k
+            elif exp_range > 0 and b["low"] > low_so_far + exp_range * _NAS100_RETRACE_PCT:
+                break
+
+    if exp_end < 2:   # need at least 3 bars (15 min)
+        return None
+
+    exp_range = high_so_far - low_so_far
+    mid_price = (high_so_far + low_so_far) / 2
+    exp_pct   = exp_range / mid_price * 100
+
+    if not (_NAS100_MIN_EXP_PCT <= exp_pct < _NAS100_MAX_EXP_PCT):
+        return None
+
+    return {
+        "direction":  direction,
+        "exp_high":   high_so_far,
+        "exp_low":    low_so_far,
+        "exp_range":  exp_range,
+        "exp_pct":    round(exp_pct, 3),
+        "mid_price":  mid_price,
+        "exp_end":    exp_end,
+    }
+
+
+def nas100_open_job(alert_manager) -> None:
+    """
+    Scan US100 M5 data around the 09:30 ET open for an expansion + Def-D trigger.
+
+    Runs every 5 min Mon-Fri 13:30–14:35 UTC.  One alert per direction per day.
+    """
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return
+
+    try:
+        from data.us100_m5_reader import load_mt5_candles, is_available
+    except ImportError:
+        _dlog.warning("[NAS100_OPEN] us100_m5_reader not importable")
+        return
+
+    if not is_available():
+        _dlog.info("[NAS100_OPEN] US100_M5.csv not found")
+        return
+
+    try:
+        candles = load_mt5_candles()
+    except Exception as exc:
+        _dlog.error("[NAS100_OPEN] data load failed: %s", exc)
+        return
+
+    # Find today's 13:30 UTC bar
+    today = now.date()
+    open_ts = datetime(today.year, today.month, today.day,
+                       _NAS100_US_OPEN_HOUR, _NAS100_US_OPEN_MINUTE,
+                       tzinfo=timezone.utc)
+
+    ts_map = {c["ts"]: i for i, c in enumerate(candles)}
+    oi = ts_map.get(open_ts)
+    if oi is None:
+        _dlog.info("[NAS100_OPEN] no open bar found for %s", today)
+        return
+
+    # Need enough bars from open to now for expansion + trigger
+    bars_since_open = candles[oi: oi + _NAS100_EXP_BARS + 3]
+    if len(bars_since_open) < 4:
+        return
+
+    exp = _nas100_find_expansion(bars_since_open)
+    if exp is None:
+        _dlog.info("[NAS100_OPEN] no_expansion | %s", today)
+        return
+
+    # Def-D trigger: first bar after expansion peak is opposite colour
+    trigger_idx = oi + exp["exp_end"] + 1
+    if trigger_idx >= len(candles):
+        return
+    tb = candles[trigger_idx]
+
+    if exp["direction"] == "BULL":
+        if tb["close"] >= tb["open"]:
+            _dlog.info("[NAS100_OPEN] waiting_for_defd | BULL | %s", today)
+            return
+        entry = tb["close"]; sl = exp["exp_high"]
+    else:
+        if tb["close"] <= tb["open"]:
+            _dlog.info("[NAS100_OPEN] waiting_for_defd | BEAR | %s", today)
+            return
+        entry = tb["close"]; sl = exp["exp_low"]
+
+    eq = (exp["exp_high"] + exp["exp_low"]) / 2
+
+    # Entry must be between EQ and SL
+    if exp["direction"] == "BULL" and (entry <= eq or entry >= sl):
+        return
+    if exp["direction"] == "BEAR" and (entry >= eq or entry <= sl):
+        return
+
+    # Freshness: trigger bar must have closed within last 10 min
+    trigger_age = (now - tb["ts"]).total_seconds() / 60
+    if trigger_age > 10:
+        _dlog.info("[NAS100_OPEN] STALE | age=%.0fm", trigger_age)
+        return
+
+    risk   = abs(entry - sl)
+    reward = abs(entry - eq)
+    if risk <= 0:
+        return
+    rr = reward / risk
+
+    # Dedup: one alert per direction per date
+    alert_id = f"nas100_open_{exp['direction']}_{today}"
+    if alert_id in _NAS100_ALERTED_DATES:
+        _dlog.info("[NAS100_OPEN] DEDUP | %s", alert_id)
+        return
+    _NAS100_ALERTED_DATES.add(alert_id)
+
+    d      = exp["direction"]
+    action = "BUY"  if d == "BULL" else "SELL"
+    emoji  = "🟢"   if d == "BULL" else "🔴"
+    trigger_str = tb["ts"].strftime("%H:%M UTC")
+
+    msg = (
+        f"{emoji} <b>NAS100 {action} — US Open Expansion</b>\n"
+        f"Entry:     <code>{entry:.1f}</code>\n"
+        f"SL:        <code>{sl:.1f}</code>  (risk {risk:.0f} pts)\n"
+        f"TP (EQ):   <code>{eq:.1f}</code>  ({rr:.1f}R)\n"
+        f"Expansion: {exp['exp_pct']:.2f}%  ({exp['exp_end']+1} bars)\n"
+        f"Trigger:   {trigger_str} (Def-D bar closed)"
+    )
+
+    _dlog.info("[NAS100_OPEN] SIGNAL | %s | entry=%.1f sl=%.1f tp=%.1f rr=%.2f | %s",
+               d, entry, sl, eq, rr, alert_id)
+    alert_manager.send_alert({"message": msg, "alert_id": alert_id})
+
+
 def tsla_data_job(db: "LocalDB") -> None:
     """Read TSLA 5m candles from MT5 file bridge and store 5m + resampled 15m to DB.
 
@@ -5774,6 +5945,17 @@ def main() -> None:
         max_instances=1,
         id="trade_xau_bos_job",
     )
+    scheduler.add_job(
+        nas100_open_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="13,14",
+        minute="1,6,11,16,21,26,31,36,41,46,51,56",
+        second=30,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_nas100_open_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
@@ -5785,6 +5967,7 @@ def main() -> None:
     logging.info("TSLA data job runs Tue-Fri 13:00-20:55 UTC (09:00-16:55 ET) — reads MT5 TSLA_M5.csv")
     logging.info("TSLA session job runs Tue-Fri 13:00-16:55 UTC (09:00-12:55 ET) — SERPE detection")
     logging.info("XAU BOS job runs Mon-Thu at hours 01/03/14/15/17 UTC — BOS/ChoCH + pullback alert")
+    logging.info("NAS100 open job runs Mon-Fri 13:30-14:35 UTC every 5 min — US open expansion + EQ retrace")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
