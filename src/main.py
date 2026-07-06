@@ -5018,6 +5018,12 @@ def xau_bos_job(alert_manager) -> None:
         _dlog.info("[XAU_BOS] no_setup | bias=%s | bars=%d", bias, len(candles_15m))
         return
 
+    # freshness: entry must have happened within the last 30 minutes
+    entry_age = (now - setup["entry_ts"]).total_seconds() / 60
+    if entry_age > 30:
+        _dlog.info("[XAU_BOS] STALE | entry_age=%.0fm | skipping", entry_age)
+        return
+
     # dedup: one alert per entry bar + direction
     alert_id = f"xau_bos_{setup['direction']}_{setup['bos_ts']}"
     if alert_id in _XAU_BOS_ALERTED:
