@@ -1,8 +1,7 @@
 """
-GER40 M5 candle loader — reads from MT5 EA file bridge (GER40_M5_export.mq5).
+US100 M5 candle loader — reads from MT5 EA file bridge (US100_M5_export.mq5).
 
 Returns candles as dicts: {'ts': datetime(UTC), 'open', 'high', 'low', 'close'}
-Supports both WSL (Windows dev) and Wine (Linux prod) MT5 Common/Files paths.
 """
 
 from __future__ import annotations
@@ -13,13 +12,12 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-# WSL path (Windows dev machine) and Wine path (Linux prod) — first match wins
 _MT5_COMMON_GLOBS = [
     "/mnt/c/Users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files",
     os.path.expanduser("~/.wine/drive_c/users/*/AppData/Roaming/MetaQuotes/Terminal/Common/Files"),
 ]
-CSV_FILENAME = "GER40_M5.csv"
-HB_FILENAME  = "GER40_M5_heartbeat.txt"
+CSV_FILENAME = "US100_M5.csv"
+HB_FILENAME  = "US100_M5_heartbeat.txt"
 
 
 def _common_dir() -> Path | None:
@@ -50,12 +48,12 @@ def load_mt5_candles() -> list[dict]:
                 dt = datetime.strptime(
                     row["datetime_utc"], "%Y.%m.%d %H:%M:%S"
                 ).replace(tzinfo=timezone.utc)
-                total_min   = dt.hour * 60 + dt.minute
+                total_min = dt.hour * 60 + dt.minute
                 rounded_min = round(total_min / 5) * 5
                 dt = dt.replace(
                     hour=rounded_min // 60 % 24,
                     minute=rounded_min % 60,
-                    second=0, microsecond=0,
+                    second=0, microsecond=0
                 )
                 candles.append({
                     "ts":    dt,
