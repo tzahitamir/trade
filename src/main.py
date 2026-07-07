@@ -5229,6 +5229,161 @@ def nas100_open_job(alert_manager) -> None:
     alert_manager.send_alert({"message": msg, "alert_id": alert_id})
 
 
+# ── DAX Initial Expansion alert ───────────────────────────────────────────────
+# Strategy: BEAR expansion only at Frankfurt open (07:00 UTC), 0.30–0.60% range,
+# Def-D trigger (first bull bar after peak), SL at exp_low, TP at EQ (50%).
+# 2-year backtest: 89.6% WR, +0.676R EV (~24 trades/year).
+_DAX_IE_ALERTED_DATES: set[str] = set()
+
+_DAX_IE_OPEN_HOUR   = 7
+_DAX_IE_OPEN_MINUTE = 0
+_DAX_IE_EXP_BARS    = 12     # up to 60 min of expansion
+_DAX_IE_MIN_EXP_PCT = 0.30
+_DAX_IE_MAX_EXP_PCT = 0.60
+_DAX_IE_RETRACE_PCT = 0.30   # give-back threshold to cap expansion
+
+
+def _dax_ie_find_expansion(bars: list) -> dict | None:
+    """Find a BEAR expansion starting at bars[0].  Returns None if not qualifying."""
+    b0 = bars[0]
+    if b0["close"] >= b0["open"]:   # BEAR only
+        return None
+
+    high_so_far = b0["high"]
+    low_so_far  = b0["low"]
+    exp_end     = 0
+
+    for k in range(1, min(_DAX_IE_EXP_BARS, len(bars))):
+        b = bars[k]
+        exp_range = high_so_far - low_so_far
+        if b["low"] < low_so_far:
+            low_so_far = b["low"]; exp_end = k
+        elif exp_range > 0 and b["low"] > low_so_far + exp_range * _DAX_IE_RETRACE_PCT:
+            break
+
+    if exp_end < 2:
+        return None
+
+    exp_range = high_so_far - low_so_far
+    mid_price  = (high_so_far + low_so_far) / 2
+    exp_pct    = exp_range / mid_price * 100
+
+    if not (_DAX_IE_MIN_EXP_PCT <= exp_pct < _DAX_IE_MAX_EXP_PCT):
+        return None
+
+    return {
+        "exp_high":  high_so_far,
+        "exp_low":   low_so_far,
+        "exp_range": exp_range,
+        "exp_pct":   round(exp_pct, 3),
+        "mid_price": mid_price,
+        "exp_end":   exp_end,
+    }
+
+
+def dax_initial_expansion_job(alert_manager) -> None:
+    """
+    Scan GER40 M5 data from the 07:00 UTC Frankfurt open for a BEAR expansion
+    followed by a Def-D (first bull bar). Entry at Def-D close, SL at exp_low,
+    TP at EQ (50%).
+
+    Runs every 5 min Mon-Fri 07:00–08:10 UTC.  One alert per day.
+    """
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return
+
+    now_min = now.hour * 60 + now.minute
+    if not (_DAX_IE_OPEN_HOUR * 60 <= now_min <= _DAX_IE_OPEN_HOUR * 60 + 70):
+        return
+
+    try:
+        from data.ger40_m5_reader import load_mt5_candles, is_available
+    except ImportError:
+        _dlog.warning("[DAX_IE] ger40_m5_reader not importable")
+        return
+
+    if not is_available():
+        _dlog.info("[DAX_IE] GER40_M5.csv not found")
+        return
+
+    try:
+        candles = load_mt5_candles()
+    except Exception as exc:
+        _dlog.error("[DAX_IE] data load failed: %s", exc)
+        return
+
+    today   = now.date()
+    open_ts = datetime(today.year, today.month, today.day,
+                       _DAX_IE_OPEN_HOUR, _DAX_IE_OPEN_MINUTE,
+                       tzinfo=timezone.utc)
+
+    ts_map = {c["ts"]: i for i, c in enumerate(candles)}
+    oi = ts_map.get(open_ts)
+    if oi is None:
+        _dlog.info("[DAX_IE] no open bar for %s", today)
+        return
+
+    bars_since_open = candles[oi: oi + _DAX_IE_EXP_BARS + 3]
+    if len(bars_since_open) < 4:
+        return
+
+    exp = _dax_ie_find_expansion(bars_since_open)
+    if exp is None:
+        _dlog.info("[DAX_IE] no_expansion | %s", today)
+        return
+
+    # Def-D: first bull bar immediately after expansion peak
+    trigger_idx = oi + exp["exp_end"] + 1
+    if trigger_idx >= len(candles):
+        return
+    tb = candles[trigger_idx]
+
+    if tb["close"] <= tb["open"]:
+        _dlog.info("[DAX_IE] waiting_for_defd | %s", today)
+        return
+
+    entry = tb["close"]
+    sl    = exp["exp_low"]
+    tp    = exp["mid_price"]
+
+    # Entry must be between SL (below) and TP (above)
+    if entry >= tp or entry <= sl:
+        return
+
+    # Freshness: trigger bar must have closed within last 10 min
+    trigger_age = (now - tb["ts"]).total_seconds() / 60
+    if trigger_age > 10:
+        _dlog.info("[DAX_IE] STALE | age=%.0fm", trigger_age)
+        return
+
+    risk   = abs(entry - sl)
+    reward = abs(entry - tp)
+    if risk <= 0:
+        return
+    rr = reward / risk
+
+    alert_id = f"dax_ie_{today}"
+    if alert_id in _DAX_IE_ALERTED_DATES:
+        _dlog.info("[DAX_IE] DEDUP | %s", alert_id)
+        return
+    _DAX_IE_ALERTED_DATES.add(alert_id)
+
+    trigger_str = tb["ts"].strftime("%H:%M UTC")
+    msg = (
+        f"🔴 <b>DAX SELL — Frankfurt Initial Expansion</b>\n"
+        f"Entry:     <code>{entry:.0f}</code>\n"
+        f"SL:        <code>{sl:.0f}</code>  (risk {risk:.0f} pts)\n"
+        f"TP (EQ):   <code>{tp:.0f}</code>  ({rr:.1f}R)\n"
+        f"Expansion: {exp['exp_pct']:.2f}%  ({exp['exp_end']+1} bars)\n"
+        f"Trigger:   {trigger_str} (Def-D bar closed)"
+    )
+
+    _dlog.info("[DAX_IE] SIGNAL | entry=%.0f sl=%.0f tp=%.0f rr=%.2f | %s",
+               entry, sl, tp, rr, alert_id)
+    alert_manager.send_alert({"message": msg, "alert_id": alert_id})
+
+
 def tsla_data_job(db: "LocalDB") -> None:
     """Read TSLA 5m candles from MT5 file bridge and store 5m + resampled 15m to DB.
 
@@ -5956,6 +6111,17 @@ def main() -> None:
         max_instances=1,
         id="trade_nas100_open_job",
     )
+    scheduler.add_job(
+        dax_initial_expansion_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="7,8",
+        minute="1,6,11,16,21,26,31,36,41,46,51,56",
+        second=30,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_dax_ie_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
@@ -5968,6 +6134,7 @@ def main() -> None:
     logging.info("TSLA session job runs Tue-Fri 13:00-16:55 UTC (09:00-12:55 ET) — SERPE detection")
     logging.info("XAU BOS job runs Mon-Thu at hours 01/03/14/15/17 UTC — BOS/ChoCH + pullback alert")
     logging.info("NAS100 open job runs Mon-Fri 13:30-14:35 UTC every 5 min — US open expansion + EQ retrace")
+    logging.info("DAX initial expansion job runs Mon-Fri 07:00-08:10 UTC every 5 min — BEAR expansion + EQ retrace")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
