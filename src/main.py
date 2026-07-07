@@ -6155,6 +6155,23 @@ def main() -> None:
         logging.exception("Startup gap check failed (non-fatal)")
         _dlog.error("[STARTUP] gap check failed (non-fatal)")
 
+    # Startup health-check notification
+    try:
+        import socket
+        hostname = socket.gethostname()
+        now_idt  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        job_count = len(scheduler.get_jobs())
+        startup_msg = (
+            f"✅ <b>Trade service started</b>\n"
+            f"Host:  <code>{hostname}</code>\n"
+            f"Time:  {now_idt}\n"
+            f"Jobs:  {job_count} scheduled"
+        )
+        alert_manager.notifier.send_message(startup_msg)
+        logging.info("Startup notification sent.")
+    except Exception as exc:
+        logging.warning("Startup notification failed (non-fatal): %s", exc)
+
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
