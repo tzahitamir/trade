@@ -46,7 +46,7 @@ INITIAL_LOOKBACK_HOURS = 8760  # 365 days
 API_DAILY_LIMIT = 800
 
 # Fetch order: highest EV alert pairs first; USDJPY last (no live alerts, drop first under pressure)
-FETCH_PRIORITY = ["NZDUSD", "EURJPY", "EURUSD", "USDCHF", "USDCAD", "XAUUSD", "USDJPY"]
+FETCH_PRIORITY = ["GBPUSD", "EURUSD", "EURJPY", "XAUUSD", "USDJPY"]
 
 # Tracks pairs whose last fetch returned stale data (0 new candles when one was expected).
 # fetch_job retries only these pairs each minute until the fresh candle arrives.
@@ -55,14 +55,12 @@ _stale_retry: dict = {}
 _STALE_MAX_RETRIES = 4  # give up after 4 extra attempts (~4 min total from candle close)
 
 # Pairs with 5m-early BOS detection and their active UTC session windows.
-# All 5 pairs unified 07:00–15:00 UTC (8h) — covers 78% of gold-filtered signals.
-# Budget: 15m(07-21)×5=280 + 4h=30 + 30m=8 + 5m(07-15)×5=480 = 798/day < 800 limit.
+# Budget: 15m(07-21)×5=280 + 4h=30 + 30m=8 + 5m×3(07-15)=288 + 5m_GBPUSD(08-18)=120 = 726/day < 800.
 _5M_PAIRS_SESSION: dict = {
-    "XAUUSD": (7, 15),   # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
-    "NZDUSD": (7, 15),   # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
-    "EURUSD": (7, 15),   # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
-    "USDCHF": (7, 15),   # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
-    "EURJPY": (7, 15),   # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
+    "XAUUSD": (7,  15),  # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
+    "EURUSD": (7,  15),  # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
+    "EURJPY": (7,  15),  # 07:00–15:00 UTC  (8h × 12 =  96 calls/day)
+    "GBPUSD": (8,  18),  # 08:00–18:00 UTC  (10h × 12 = 120 calls/day) — NY is the edge
 }
 TIMEFRAME_INTERVAL_MINUTES = {
     "5m": 5,
@@ -87,13 +85,12 @@ def should_fetch_timeframe(timeframe: str, now: datetime) -> bool:
     Covers active FX trading hours; skips Sat/Sun.
     Budget is enforced separately in fetch_job via the API daily counter.
 
-    Daily estimate on a full weekday (7 pairs):
-      15m: 4/hr × 14h (07-21 UTC) × 7 = 392 calls
-      4h:  6/day × 7                   =  42 calls
+    Daily estimate on a full weekday (5 pairs: GBPUSD, EURUSD, EURJPY, XAUUSD, USDJPY):
+      15m: 4/hr × 14h (07-21 UTC) × 5 = 280 calls
+      4h:  6/day × 5                   =  30 calls
       30m: 2/hr × 4h (12-16 UTC) × 1  =   8 calls  (EURUSD LIQ only — fetch_job filter)
-      5m:  12/hr × 14h (07-21) × 1    = 168 calls  (XAUUSD)
-           12/hr × 7h  (08-15) × 2    = 168 calls  (NZDUSD + EURUSD)
-      Total ≈ 778/day  (under 800 free-tier limit)
+      5m:  12/hr × 8h (07-15) × 3     = 288 calls  (XAUUSD + EURUSD + EURJPY)
+      Total ≈ 606/day  (well under 800 free-tier limit)
     """
     timeframe = timeframe.lower()
     minute  = now.minute
@@ -175,7 +172,7 @@ _5M_ATR_MIN_DIST = 0.2   # 5m close must be >= this × ATR5m past the broken lev
 
 # ── 1h BOS retrace-entry ("1h bos, all tf aligned") ─────────────────────────
 # Pairs where the retrace entry has positive EV; EURJPY excluded (negative EV).
-_1H_RETRACE_PAIRS   = frozenset({"NZDUSD", "EURUSD", "USDCHF", "XAUUSD"})
+_1H_RETRACE_PAIRS   = frozenset({"EURUSD", "XAUUSD"})
 _1H_RETRACE_MIN_MAE = 0.75   # minimum adverse excursion before retrace-entry triggers
 _1H_RETRACE_LOOKBACK_H = 12  # how far back to search for active 1h BOS events
 
@@ -193,15 +190,11 @@ def _h1re_4h_pass(symbol: str, prev_h4_aligned: bool, curr_h4_aligned: bool) -> 
 
     Derived from full-history backtest (analyze_1h_combo_gate.py):
       EURUSD  : BOTH prev + curr 4h aligned → WR 61.5 % EV +0.69R (★★★)
-      NZDUSD  : curr 4h aligned             → WR 47.6 % EV +0.90R (★★★)
-      USDCHF  : curr 4h aligned             → WR 53.1 % EV +0.31R (★★★)
       XAUUSD  : no 4h gate — 4h counter group still WR 43.9 % EV +2.33R;
                 filtering it out reduces EV from +1.55R to +0.29R.
     """
     if symbol == "EURUSD":
         return prev_h4_aligned and curr_h4_aligned
-    if symbol in ("NZDUSD", "USDCHF"):
-        return curr_h4_aligned
     if symbol == "XAUUSD":
         return True   # no 4h gate: counter-4h trades remain high-EV for XAU
     return False
@@ -460,10 +453,6 @@ def _5m_candle_quality_pass(
                         WR 34.1 → 41.1 % (EURUSD, 46 % kept)
                             34.1 → 38.6 % (EURJPY, 53 % kept).
 
-      USDCHF : keep only aligned→aligned (both C1 and C2 body in BOS direction).
-               WR 34.7 → 39.2 % keeping 30 % of signals.
-
-      NZDUSD : no filter — no statistically significant improvement found.
     """
     if symbol == "XAUUSD":
         if not (0.3 <= b2 < 1.5):
@@ -476,10 +465,6 @@ def _5m_candle_quality_pass(
             return False, f"C2 body {b2:.2f}×ATR in medium zone [0.7, 1.5)"
         if not a1 and a2:  # counter→aligned
             return False, "counter→aligned pattern (C1 counter, C2 aligned)"
-
-    elif symbol == "USDCHF":
-        if not (a1 and a2):
-            return False, f"not aligned→aligned (C1={'aligned' if a1 else 'counter'}, C2={'aligned' if a2 else 'counter'})"
 
     return True, ""
 
@@ -644,6 +629,190 @@ def _process_symbol_5m(
         })
 
 
+# ── BOS conf2 / conf3 live alerts ─────────────────────────────────────────────
+# Each entry: min_conf bars of consecutive directional closes required after BOS.
+# sessions: (start_h, end_h) UTC ranges; BOS bar must fall in at least one.
+# ema_gate: if True, require 4h close > EMA-20 (bull) / < EMA-20 (bear).
+_BOS_CONF_PAIRS: dict = {
+    "GBPUSD": {"min_conf": 2, "sessions": [(8, 12), (13, 18)],  "ema_gate": False},
+    "EURUSD": {"min_conf": 2, "sessions": [(6, 12)],             "ema_gate": False},
+    "EURJPY": {"min_conf": 3, "sessions": [(8, 12), (13, 18)],  "ema_gate": True},
+    "XAUUSD": {"min_conf": 3, "sessions": [(8, 12), (13, 18)],  "ema_gate": False},
+}
+
+_BOS_CONF_DETECT_PARAMS: dict = {
+    "min_break_strength":          0.0,
+    "require_liquidity_sweep":     False,
+    "swing_lookback":              15,
+    "min_swing_age_candles":       5,
+    "min_break_distance_atr_mult": 0.3,
+    "min_atr_pct":                 0.0,
+}
+
+# Per-pair, per-confluence WR hints shown in the alert message
+_BOS_CONF_WR: dict = {
+    ("GBPUSD", "NY+conf2"):          "WR 80%",
+    ("GBPUSD", "London+conf2"):      "WR ~70%",
+    ("EURUSD", "Frankfurt+conf2"):   "WR 80%",
+    ("EURUSD", "London+conf2"):      "WR ~70%",
+    ("EURJPY", "htf_ema+conf3"):     "WR 76%",
+    ("EURJPY", "London+conf3"):      "WR ~65%",
+    ("EURJPY", "NY+conf3"):          "WR ~65%",
+    ("XAUUSD", "London+conf3"):      "WR ~65%",
+    ("XAUUSD", "NY+conf3"):          "WR ~65%",
+}
+
+
+def _price_dp(symbol: str) -> int:
+    if "JPY" in symbol:  return 3
+    if symbol == "XAUUSD": return 2
+    return 5
+
+
+def _calc_ema20(values: list) -> float | None:
+    """20-period EMA of a chronological close list."""
+    if len(values) < 20:
+        return None
+    k, v = 2 / 21, sum(values[:20]) / 20
+    for x in values[20:]:
+        v = x * k + v * (1 - k)
+    return v
+
+
+def _bos_conf_session(bos_ts: int, symbol: str) -> str | None:
+    """Return session label ("Frankfurt", "London", "NY") if BOS bar falls in
+    a valid session for this pair, else None (signal is outside tradeable hours).
+    """
+    dt = datetime.fromtimestamp(bos_ts, tz=timezone.utc)
+    h  = dt.hour + dt.minute / 60.0
+
+    if symbol == "EURUSD":
+        if 6 <= h < 9.5:  return "Frankfurt"
+        if 9.5 <= h < 12: return "London"
+        return None
+    # GBPUSD, EURJPY, XAUUSD
+    if  8 <= h < 12:    return "London"
+    if 13 <= h < 18:    return "NY"
+    return None
+
+
+def _process_symbol_15m_bos_conf(
+    symbol: str,
+    new_candles: list,
+    db,
+    alert_manager,
+) -> None:
+    """Fire BOS conf2 or conf3 alert when consecutive signal-TF closes confirm.
+
+    Algorithm:
+      1. Load last 60 15m bars from DB (includes the just-inserted bar).
+      2. Split chronologically: everything except the last min_conf bars forms
+         the detection window → detect_bos fires if the window's last bar broke
+         a swing.  The remaining min_conf bars are the confirmation bars.
+      3. All confirmation bars must close in the BOS direction (close > open
+         for bullish, close < open for bearish).
+      4. Check session gate; optionally check 4h EMA alignment (EURJPY).
+      5. Dedup via db.insert_monitor (INSERT OR IGNORE on alert_id).
+    """
+    cfg = _BOS_CONF_PAIRS.get(symbol)
+    if not cfg or not new_candles:
+        return
+
+    min_conf = cfg["min_conf"]
+
+    context = db.query_recent(symbol, "15m", limit=60)   # newest-first
+    if len(context) < min_conf + 8:
+        return
+
+    # detect_bos expects newest-first; _chronological inside reverses it.
+    # Skip the min_conf newest bars (the confirmation bars) so c[-1] = BOS bar.
+    bos_window_desc = context[min_conf:]   # newest-first, starts at BOS bar
+
+    evs = alert_manager.analyzer.detect_bos(
+        bos_window_desc,
+        params={**_BOS_CONF_DETECT_PARAMS, "symbol": symbol, "timeframe": "15m"},
+    )
+    if not evs:
+        return
+
+    ev           = evs[-1]
+    direction    = ev["direction"]
+    broken_level = ev["broken_level"]
+    bos_ts       = ev["breakout_ts"]
+    bullish      = direction == "bullish"
+
+    # Confirmation bars: context[0..min_conf-1] newest-first → reverse for chrono check
+    conf_bars = list(reversed(context[:min_conf]))   # oldest conf bar first
+    if not all(
+        (c["close"] > c["open"] if bullish else c["close"] < c["open"])
+        for c in conf_bars
+    ):
+        _dlog.debug("[BOS_CONF] %s | conf bars not all directional | skip", symbol)
+        return
+
+    # Session gate
+    session = _bos_conf_session(bos_ts, symbol)
+    if session is None:
+        _dlog.debug("[BOS_CONF] %s | BOS @ %s UTC outside valid session | skip",
+                    symbol,
+                    datetime.fromtimestamp(bos_ts, tz=timezone.utc).strftime("%H:%M"))
+        return
+
+    # 4h EMA alignment gate (EURJPY)
+    confluence = f"{session}+conf{min_conf}"
+    if cfg["ema_gate"]:
+        candles_4h = db.query_recent(symbol, "4h", limit=30)
+        if candles_4h:
+            closes_4h = [c["close"] for c in reversed(candles_4h)]
+            ema = _calc_ema20(closes_4h)
+            if ema is not None:
+                aligned = (closes_4h[-1] > ema) if bullish else (closes_4h[-1] < ema)
+                if aligned:
+                    confluence = f"htf_ema+conf{min_conf}"
+
+    # Dedup: each BOS bar fires at most once per pair/direction
+    alert_id = (f"bos_conf{min_conf}_{symbol.lower()}"
+                f"_{direction[0]}_{bos_ts}")
+
+    entry = context[0]["close"]                            # newest bar = conf2/conf3 close
+    atr   = alert_manager.analyzer.calculate_atr(context[:20]) or 0.0
+    sl    = (broken_level - 0.25 * atr) if bullish else (broken_level + 0.25 * atr)
+    risk  = abs(entry - sl)
+    tp    = (entry + 2.0 * risk) if bullish else (entry - 2.0 * risk)
+
+    try:
+        inserted = db.insert_monitor(
+            alert_id=alert_id, symbol=symbol, direction=direction,
+            entry=entry, sl=sl, tp=tp, breakout_ts=bos_ts,
+        )
+    except Exception:
+        logging.exception("[BOS_CONF] insert_monitor failed for %s", alert_id)
+        inserted = False
+
+    if not inserted:
+        _dlog.debug("[BOS_CONF] DEDUP | %s | %s already fired", symbol, alert_id)
+        return
+
+    side      = "BUY" if bullish else "SELL"
+    bos_time  = datetime.fromtimestamp(bos_ts, tz=timezone.utc).strftime("%H:%M UTC")
+    wr_hint   = _BOS_CONF_WR.get((symbol, confluence), "")
+    wr_str    = f" | {wr_hint}" if wr_hint else ""
+    dp        = _price_dp(symbol)
+    sl_label  = "below level" if bullish else "above level"
+
+    message = (
+        f"{'🟢' if bullish else '🔴'} {side} {symbol} | 15m BOS conf{min_conf}\n"
+        f"Session: {session} (BOS at {bos_time})\n"
+        f"Confluence: {confluence}{wr_str}\n"
+        f"Entry: ~{entry:.{dp}f} | SL: {sl:.{dp}f} ({sl_label}) | TP: {tp:.{dp}f}"
+    )
+    _dlog.info(
+        "[BOS_CONF] ALERT | %s | %s | conf%d | %s | entry=%.5f sl=%.5f | id=%s",
+        symbol, direction.upper(), min_conf, confluence, entry, sl, alert_id,
+    )
+    alert_manager.send_alert({"message": message, "alert_id": alert_id})
+
+
 def process_symbol_timeframe(
     symbol: str,
     timeframe: str,
@@ -707,6 +876,10 @@ def process_symbol_timeframe(
     if not (7 <= _bar_hour < 21):
         _dlog.info("[BOS] %s 15m | OUTSIDE_SESSION (hour=%d UTC) | skip", symbol, _bar_hour)
         return len(new_candles)
+
+    # BOS conf2/conf3 alerts (GBPUSD, EURUSD, EURJPY, XAUUSD)
+    if symbol in _BOS_CONF_PAIRS:
+        _process_symbol_15m_bos_conf(symbol, new_candles, db, alert_manager)
 
     # Load gold params for this symbol/strategy to filter signals
     gold_map = db.get_gold_params("BOS15m", symbol)
@@ -6017,15 +6190,6 @@ def main() -> None:
         args=[db, alert_manager],
         max_instances=1,
         id="trade_momentum_monitor_job",
-    )
-    scheduler.add_job(
-        daily_report_job,
-        trigger="cron",
-        hour=18,
-        minute=0,
-        args=[settings, db, alert_manager],
-        max_instances=1,
-        id="trade_daily_report_job",
     )
     scheduler.add_job(
         scheduler_heartbeat_job,

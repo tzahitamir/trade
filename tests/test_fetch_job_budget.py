@@ -108,7 +108,7 @@ def test_usdjpy_fetched_last(db):
 
 
 def test_best_pairs_survive_budget_pressure(db):
-    """When budget runs short, NZDUSD/EURJPY are fetched; USDJPY is dropped."""
+    """When budget runs short, highest-priority pairs (GBPUSD/EURUSD) are fetched; lower ones are dropped."""
     # Allow only 3 calls
     db.increment_api_calls(API_DAILY_LIMIT - 3)
     settings = _make_settings()
@@ -124,8 +124,8 @@ def test_best_pairs_survive_budget_pressure(db):
         mock_dt.now.return_value = _fetch_at_minute(1)
         fetch_job(settings, MagicMock(), db, MagicMock())
 
-    assert "NZDUSD" in fetched
-    assert "EURJPY" in fetched
+    assert "GBPUSD" in fetched
+    assert "EURUSD" in fetched
     assert "USDJPY" not in fetched
 
 

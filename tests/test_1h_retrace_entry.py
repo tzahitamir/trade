@@ -85,34 +85,6 @@ class TestH1re4hPass:
         def test_neither_passes(self):
             assert _h1re_4h_pass("XAUUSD", prev_h4_aligned=False, curr_h4_aligned=False)
 
-    # NZDUSD: only curr required
-    class TestNZDUSD:
-        def test_curr_aligned_passes(self):
-            assert _h1re_4h_pass("NZDUSD", prev_h4_aligned=False, curr_h4_aligned=True)
-
-        def test_both_aligned_passes(self):
-            assert _h1re_4h_pass("NZDUSD", prev_h4_aligned=True, curr_h4_aligned=True)
-
-        def test_curr_counter_fails(self):
-            assert not _h1re_4h_pass("NZDUSD", prev_h4_aligned=True, curr_h4_aligned=False)
-
-        def test_neither_fails(self):
-            assert not _h1re_4h_pass("NZDUSD", prev_h4_aligned=False, curr_h4_aligned=False)
-
-    # USDCHF: only curr required (same as NZDUSD)
-    class TestUSDCHF:
-        def test_curr_aligned_passes(self):
-            assert _h1re_4h_pass("USDCHF", prev_h4_aligned=False, curr_h4_aligned=True)
-
-        def test_both_aligned_passes(self):
-            assert _h1re_4h_pass("USDCHF", prev_h4_aligned=True, curr_h4_aligned=True)
-
-        def test_curr_counter_fails(self):
-            assert not _h1re_4h_pass("USDCHF", prev_h4_aligned=True, curr_h4_aligned=False)
-
-        def test_neither_fails(self):
-            assert not _h1re_4h_pass("USDCHF", prev_h4_aligned=False, curr_h4_aligned=False)
-
     # EURJPY: excluded — must never pass (returns False regardless)
     class TestEURJPY:
         def test_always_fails_even_both_aligned(self):

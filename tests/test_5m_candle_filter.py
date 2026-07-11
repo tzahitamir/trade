@@ -131,38 +131,6 @@ class TestEURJPY:
         assert ok
 
 
-# ─── USDCHF ────────────────────────────────────────────────────────────────
-
-class TestUSDCHF:
-    sym = "USDCHF"
-
-    def test_pass_aligned_aligned(self):
-        ok, _ = _5m_candle_quality_pass(self.sym, b1=0.5, b2=0.5, a1=True, a2=True)
-        assert ok
-
-    def test_block_c1_counter(self):
-        ok, reason = _5m_candle_quality_pass(self.sym, b1=0.5, b2=0.5, a1=False, a2=True)
-        assert not ok
-        assert "C1" in reason or "aligned" in reason.lower()
-
-    def test_block_c2_counter(self):
-        ok, reason = _5m_candle_quality_pass(self.sym, b1=0.5, b2=0.5, a1=True, a2=False)
-        assert not ok
-        assert "C2" in reason or "aligned" in reason.lower()
-
-    def test_block_both_counter(self):
-        ok, _ = _5m_candle_quality_pass(self.sym, b1=0.5, b2=0.5, a1=False, a2=False)
-        assert not ok
-
-    def test_pass_regardless_of_body_size(self):
-        # Any body size is fine for USDCHF as long as both aligned
-        ok, _ = _5m_candle_quality_pass(self.sym, b1=3.0, b2=3.0, a1=True, a2=True)
-        assert ok
-
-    def test_block_large_body_counter(self):
-        ok, _ = _5m_candle_quality_pass(self.sym, b1=3.0, b2=0.5, a1=False, a2=True)
-        assert not ok
-
 
 # ─── NZDUSD (no filter) ────────────────────────────────────────────────────
 
