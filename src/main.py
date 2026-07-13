@@ -5920,6 +5920,8 @@ def run_gap_check(
             except Exception as exc:
                 _dlog.error("[GAP_CHECK] ERROR | %s %s | %s", symbol, tf, exc)
                 logging.warning("Gap check failed for %s %s: %s", symbol, tf, exc)
+            if not dry_run:
+                time.sleep(8)  # stay within 8 calls/min during gap check
 
     if dry_run:
         _dlog.info("[GAP_CHECK] END (dry-run) | total_gaps=%d", total_gaps)
