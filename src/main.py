@@ -1299,12 +1299,17 @@ def fetch_job(settings: Settings, fetcher: FXFetcher, db: LocalDB, alert_manager
                 _stale_retry.pop((symbol, timeframe), None)
             time.sleep(8)
         except Exception as exc:
+            is_rate_limit = "429" in str(exc)
             _dlog.error("[FETCH] ERROR | %s %s | %s", symbol, timeframe, exc)
-            logging.exception("Failed to fetch %s %s: %s", symbol, timeframe, exc)
-            alert_manager.send_fetch_error(symbol, timeframe, str(exc))
+            if is_rate_limit:
+                # Log silently — rate-limit errors are transient and spammy over Telegram
+                logging.warning("Failed to fetch %s %s: %s", symbol, timeframe, exc)
+            else:
+                logging.exception("Failed to fetch %s %s: %s", symbol, timeframe, exc)
+                alert_manager.send_fetch_error(symbol, timeframe, str(exc))
             _stale_retry.pop((symbol, timeframe), None)
             # Always sleep after an error — prevents 429 cascade on rate-limit hits
-            time.sleep(60 if "429" in str(exc) else 8)
+            time.sleep(60 if is_rate_limit else 8)
 
     _dlog.info("[FETCH] END | mode=%s | api_used_now=%d/%d | stale_pending=%d",
                mode, db.get_api_calls_today(), API_DAILY_LIMIT, len(_stale_retry))
