@@ -6207,28 +6207,7 @@ def main() -> None:
         max_instances=1,
         id="trade_heartbeat_job",
     )
-    scheduler.add_job(
-        dax_morning_brief_job,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour=7,
-        minute="6,21,36,51",
-        second=0,
-        args=[db, alert_manager],
-        max_instances=1,
-        id="trade_dax_morning_brief_job",
-    )
-    scheduler.add_job(
-        dax_sweep_watcher_job,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour="7-9",
-        minute="*",
-        second=15,
-        args=[alert_manager],
-        max_instances=1,
-        id="trade_dax_sweep_watcher_job",
-    )
+
     scheduler.add_job(
         dax_frank_rejection_job,
         trigger="cron",
