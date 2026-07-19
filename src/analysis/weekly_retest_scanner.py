@@ -431,14 +431,24 @@ def format_watchlist_update(candidates: list[dict]) -> str:
 def format_watchlist_alert(alerts: list[dict]) -> str:
     lines = ["<b>⚡ WATCHLIST ALERT — BOS support retest in progress</b>\n"]
     for a in alerts:
+        level = a["level"]
+        sl    = a["sl"]
+        risk  = round(level - sl, 4)
+        tp1   = round(level + 2 * risk, 2)
+        tp2   = round(level + 4 * risk, 2)
         panic = "\n  🚨 Panic-sell candle absorbed during pullback" if a.get("has_panic_sell") else ""
         lines.append(
             f"<b>{a['ticker']}</b>\n"
-            f"  Support: ${a['level']:.2f}  |  "
-            f"Price: ${a['alert_price']:.2f} (+{a['alert_pct_above']:.1f}%)\n"
-            f"  Entry limit: ${a['entry']:.2f}  |  SL: ${a['sl']:.2f}\n"
-            f"  Above support {a['consec_total']} weeks since BOS {a['bos_date']}\n"
-            f"  Peak expansion: +{a['peak_gain_pct']:.0f}%"
+            f"  Current price: ${a['alert_price']:.2f}  (+{a['alert_pct_above']:.1f}% above support)\n"
+            f"\n"
+            f"  🎯 ACTION: Place BUY LIMIT at <b>${level:.2f}</b>\n"
+            f"  🛑 SL: ${sl:.2f}  (risk ${risk:.2f}/share)\n"
+            f"  ✅ TP1: ${tp1:.2f}  (2R)  |  TP2: ${tp2:.2f}  (4R)\n"
+            f"\n"
+            f"  📊 Check Friday weekly close — if bar closes near its LOW\n"
+            f"     (bearish candle), cancel the limit before next week.\n"
+            f"\n"
+            f"  BOS {a['bos_date']}  |  {a['consec_total']}w above support  |  Peak +{a['peak_gain_pct']:.0f}%"
             f"{panic}\n"
         )
     return "\n".join(lines)

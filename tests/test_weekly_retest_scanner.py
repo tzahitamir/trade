@@ -338,6 +338,32 @@ class TestFormatWatchlistAlert:
         assert "500.00" in msg
         assert "510.00" in msg
 
+    def test_buy_limit_instruction_present(self):
+        msg = wrs.format_watchlist_alert([self.BASE_ALERT])
+        assert "BUY LIMIT" in msg
+        assert "500.00" in msg  # limit at level
+
+    def test_sl_and_tp_present(self):
+        msg = wrs.format_watchlist_alert([self.BASE_ALERT])
+        assert "SL:" in msg
+        assert "TP1:" in msg
+        assert "TP2:" in msg
+
+    def test_friday_check_reminder_present(self):
+        msg = wrs.format_watchlist_alert([self.BASE_ALERT])
+        assert "Friday" in msg
+        assert "cancel" in msg.lower()
+
+    def test_tp_levels_are_2r_and_4r(self):
+        level = self.BASE_ALERT["level"]   # 500.0
+        sl    = self.BASE_ALERT["sl"]      # 487.0
+        risk  = level - sl                 # 13.0
+        tp1_expected = round(level + 2 * risk, 2)  # 526.0
+        tp2_expected = round(level + 4 * risk, 2)  # 552.0
+        msg = wrs.format_watchlist_alert([self.BASE_ALERT])
+        assert str(tp1_expected) in msg
+        assert str(tp2_expected) in msg
+
     def test_panic_sell_shown_in_alert(self):
         alert = dict(self.BASE_ALERT, has_panic_sell=True)
         msg = wrs.format_watchlist_alert([alert])
@@ -350,7 +376,8 @@ class TestFormatWatchlistAlert:
     def test_multiple_alerts(self):
         alerts = [
             dict(self.BASE_ALERT, ticker="NVDA"),
-            dict(self.BASE_ALERT, ticker="AAPL", level=150.0, alert_price=153.0),
+            dict(self.BASE_ALERT, ticker="AAPL", level=150.0, alert_price=153.0,
+                 sl=144.0, entry=152.25),
         ]
         msg = wrs.format_watchlist_alert(alerts)
         assert "NVDA" in msg
