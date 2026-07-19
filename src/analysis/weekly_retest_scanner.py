@@ -307,6 +307,7 @@ def _find_watchlist_candidate(df: pd.DataFrame, ticker: str) -> dict | None:
             "level":            round(float(level), 4),
             "entry":            round(level * (1 + ENTRY_PCT), 4),
             "sl":               round(level - ATR_FRACTION * atr_last, 4),
+            "atr":              round(float(atr_last), 4),
             "bos_date":         str(dates[bos_idx].date()),
             "consec_total":     consec_total,
             "peak_gain_pct":    peak_gain_pct,
@@ -347,6 +348,11 @@ def build_watchlist() -> list[dict]:
         if pct < 0 or pct > WATCHLIST_MAX_PCT_ABOVE:
             continue
         cand["pre_score"] = score
+        try:
+            info = yf.Ticker(ticker).info
+            cand["sector"] = info.get("sector") or "Unknown"
+        except Exception:
+            cand["sector"] = "Unknown"
         candidates.append(cand)
 
     candidates.sort(key=lambda c: c["current_pct_above"])
@@ -431,15 +437,18 @@ def format_watchlist_update(candidates: list[dict]) -> str:
 def format_watchlist_alert(alerts: list[dict]) -> str:
     lines = ["<b>⚡ WATCHLIST ALERT — BOS support retest in progress</b>\n"]
     for a in alerts:
-        level = a["level"]
-        sl    = a["sl"]
-        risk  = round(level - sl, 4)
-        tp1   = round(level + 2 * risk, 2)
-        tp2   = round(level + 4 * risk, 2)
-        panic = "\n  🚨 Panic-sell candle absorbed during pullback" if a.get("has_panic_sell") else ""
+        level  = a["level"]
+        sl     = a["sl"]
+        risk   = round(level - sl, 4)
+        tp1    = round(level + 2 * risk, 2)
+        tp2    = round(level + 4 * risk, 2)
+        atr    = a.get("atr", risk / ATR_FRACTION)
+        sector = a.get("sector", "Unknown")
+        panic  = "\n  🚨 Panic-sell candle absorbed during pullback" if a.get("has_panic_sell") else ""
         lines.append(
-            f"<b>{a['ticker']}</b>\n"
+            f"<b>{a['ticker']}</b>  <i>{sector}</i>\n"
             f"  Current price: ${a['alert_price']:.2f}  (+{a['alert_pct_above']:.1f}% above support)\n"
+            f"  ATR (14w): ${atr:.2f}\n"
             f"\n"
             f"  🎯 ACTION: Place BUY LIMIT at <b>${level:.2f}</b>\n"
             f"  🛑 SL: ${sl:.2f}  (risk ${risk:.2f}/share)\n"

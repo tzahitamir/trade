@@ -324,6 +324,7 @@ class TestFormatWatchlistAlert:
     BASE_ALERT = {
         "ticker": "NVDA", "level": 500.0, "alert_price": 510.0,
         "alert_pct_above": 2.0, "entry": 507.5, "sl": 487.0,
+        "atr": 13.0, "sector": "Technology",
         "consec_total": 25, "bos_date": "2025-01-15",
         "peak_gain_pct": 40.0, "has_panic_sell": False,
     }
@@ -337,6 +338,15 @@ class TestFormatWatchlistAlert:
         assert "NVDA" in msg
         assert "500.00" in msg
         assert "510.00" in msg
+
+    def test_sector_shown(self):
+        msg = wrs.format_watchlist_alert([self.BASE_ALERT])
+        assert "Technology" in msg
+
+    def test_atr_shown(self):
+        msg = wrs.format_watchlist_alert([self.BASE_ALERT])
+        assert "ATR" in msg
+        assert "13.00" in msg
 
     def test_buy_limit_instruction_present(self):
         msg = wrs.format_watchlist_alert([self.BASE_ALERT])
