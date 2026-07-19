@@ -18,6 +18,7 @@ from analysis.confluence_detector import detect_confluences, find_trigger_candle
 from db.local_db import LocalDB
 from alerts.alert_manager import AlertManager
 from alerts.log_monitor import LogMonitor
+from analysis import weekly_retest_scanner
 
 
 class SizeAndAgeRotatingHandler(RotatingFileHandler):
@@ -5708,6 +5709,47 @@ def tsla_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertM
         _dlog.info("[TSLA_SESSION] alert_suppressed (alerts_off) | chart=%s", chart_path)
 
 
+def weekly_retest_scan_job(alert_manager: AlertManager) -> None:
+    """Sunday 20:00 IDT: scan S&P 500 + Nasdaq 100 for bull weekly retest setups."""
+    logging.info("[WEEKLY_RETEST] Starting Sunday scan (~570 tickers via yfinance)...")
+    try:
+        result = weekly_retest_scanner.scan()
+        msg = weekly_retest_scanner.format_message(result)
+        alert_manager.notifier.send_message(msg)
+        total = len(result["pending"]) + len(result["open"])
+        logging.info("[WEEKLY_RETEST] Scan done: %d pending + %d open = %d candidates",
+                     len(result["pending"]), len(result["open"]), total)
+    except Exception:
+        logging.exception("[WEEKLY_RETEST] Scan failed")
+
+
+def watchlist_update_job(alert_manager: AlertManager) -> None:
+    """Sunday 17:05 UTC (20:05 IDT): rebuild score-5 BOS watchlist and send summary."""
+    logging.info("[WATCHLIST] Rebuilding weekly BOS watchlist...")
+    try:
+        candidates = weekly_retest_scanner.build_watchlist()
+        msg = weekly_retest_scanner.format_watchlist_update(candidates)
+        alert_manager.notifier.send_message(msg)
+        logging.info("[WATCHLIST] Sent update: %d score-5 candidates", len(candidates))
+    except Exception:
+        logging.exception("[WATCHLIST] build_watchlist failed")
+
+
+def watchlist_price_check_job(alert_manager: AlertManager) -> None:
+    """Mon-Fri 20:30 UTC (23:30 IDT): check if any watchlist stock is within 3% of its BOS level."""
+    logging.info("[WATCHLIST] Running daily price check...")
+    try:
+        alerts = weekly_retest_scanner.check_watchlist_alerts()
+        if alerts:
+            msg = weekly_retest_scanner.format_watchlist_alert(alerts)
+            alert_manager.notifier.send_message(msg)
+            logging.info("[WATCHLIST] Alert sent for %d stocks", len(alerts))
+        else:
+            logging.info("[WATCHLIST] No stocks in alert zone today")
+    except Exception:
+        logging.exception("[WATCHLIST] price check failed")
+
+
 def scheduler_heartbeat_job() -> None:
     """Log a heartbeat every 30 minutes so the debug log confirms the scheduler is alive."""
     _dlog.info("[SCHEDULER] heartbeat | alive | %s UTC",
@@ -6274,6 +6316,36 @@ def main() -> None:
         max_instances=1,
         id="trade_dax_ie_job",
     )
+    scheduler.add_job(
+        weekly_retest_scan_job,
+        trigger="cron",
+        day_of_week="sun",
+        hour=17,
+        minute=0,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_weekly_retest_job",
+    )
+    scheduler.add_job(
+        watchlist_update_job,
+        trigger="cron",
+        day_of_week="sun",
+        hour=17,
+        minute=5,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_watchlist_update_job",
+    )
+    scheduler.add_job(
+        watchlist_price_check_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=20,
+        minute=30,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_watchlist_price_check_job",
+    )
 
     logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
     logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
@@ -6287,6 +6359,8 @@ def main() -> None:
     logging.info("XAU BOS job runs Mon-Thu at hours 01/03/14/15/17 UTC — BOS/ChoCH + pullback alert")
     logging.info("NAS100 open job runs Mon-Fri 13:30-14:35 UTC every 5 min — US open expansion + EQ retrace")
     logging.info("DAX initial expansion job runs Mon-Fri 07:00-08:10 UTC every 5 min — BEAR expansion + EQ retrace")
+    logging.info("Weekly BOS watchlist update runs Sun 17:05 UTC (20:05 IDT) — score-5 pre-retest candidates")
+    logging.info("Weekly BOS watchlist price check runs Mon-Fri 20:30 UTC (23:30 IDT) — alerts when within 3%% of support")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
