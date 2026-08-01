@@ -6191,14 +6191,15 @@ def main() -> None:
     log_monitor = LogMonitor(log_file, alert_manager.notifier)
 
     scheduler = BlockingScheduler()
-    scheduler.add_job(
-        fetch_job,
-        trigger="cron",
-        second=FETCH_CHECK_SECOND,
-        args=[settings, fetcher, db, alert_manager],
-        max_instances=1,
-        id="trade_fetch_job",
-    )
+    # -- DISABLED: fetch_job (FX 15m/4h Twelve Data — no active FX strategies)
+    # scheduler.add_job(
+    #     fetch_job,
+    #     trigger="cron",
+    #     second=FETCH_CHECK_SECOND,
+    #     args=[settings, fetcher, db, alert_manager],
+    #     max_instances=1,
+    #     id="trade_fetch_job",
+    # )
     scheduler.add_job(
         check_logs_job,
         trigger="interval",
@@ -6207,41 +6208,45 @@ def main() -> None:
         max_instances=1,
         id="trade_log_monitor_job",
     )
-    scheduler.add_job(
-        dax_data_job,
-        trigger="cron",
-        minute="*/5",
-        second=0,
-        args=[db],
-        max_instances=1,
-        id="trade_dax_data_job",
-    )
-    scheduler.add_job(
-        dax_session_job,
-        trigger="cron",
-        minute="*/5",
-        second=30,
-        args=[settings, db, alert_manager],
-        max_instances=1,
-        id="trade_dax_session_job",
-    )
-    scheduler.add_job(
-        gap_check_job,
-        trigger="cron",
-        hour=6,
-        minute=0,
-        args=[settings, fetcher, db],
-        max_instances=1,
-        id="trade_gap_check_job",
-    )
-    scheduler.add_job(
-        momentum_monitor_job,
-        trigger="interval",
-        minutes=15,
-        args=[db, alert_manager],
-        max_instances=1,
-        id="trade_momentum_monitor_job",
-    )
+    # -- DISABLED: dax_data_job (DAX DB feed — no active DAX strategies)
+    # scheduler.add_job(
+    #     dax_data_job,
+    #     trigger="cron",
+    #     minute="*/5",
+    #     second=0,
+    #     args=[db],
+    #     max_instances=1,
+    #     id="trade_dax_data_job",
+    # )
+    # -- DISABLED: dax_session_job (DAX SERPE alerts)
+    # scheduler.add_job(
+    #     dax_session_job,
+    #     trigger="cron",
+    #     minute="*/5",
+    #     second=30,
+    #     args=[settings, db, alert_manager],
+    #     max_instances=1,
+    #     id="trade_dax_session_job",
+    # )
+    # -- DISABLED: gap_check_job (daily gap check alerts)
+    # scheduler.add_job(
+    #     gap_check_job,
+    #     trigger="cron",
+    #     hour=6,
+    #     minute=0,
+    #     args=[settings, fetcher, db],
+    #     max_instances=1,
+    #     id="trade_gap_check_job",
+    # )
+    # -- DISABLED: momentum_monitor_job (FX momentum alerts)
+    # scheduler.add_job(
+    #     momentum_monitor_job,
+    #     trigger="interval",
+    #     minutes=15,
+    #     args=[db, alert_manager],
+    #     max_instances=1,
+    #     id="trade_momentum_monitor_job",
+    # )
     scheduler.add_job(
         scheduler_heartbeat_job,
         trigger="interval",
@@ -6250,72 +6255,78 @@ def main() -> None:
         id="trade_heartbeat_job",
     )
 
-    scheduler.add_job(
-        dax_frank_rejection_job,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour=10,
-        minute="6,21,36,51",
-        second=30,
-        args=[alert_manager],
-        max_instances=1,
-        id="trade_dax_frank_rejection_job",
-    )
-    scheduler.add_job(
-        tsla_data_job,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour="13-20",
-        minute="*/5",
-        second=15,
-        args=[db],
-        max_instances=1,
-        id="trade_tsla_data_job",
-    )
-    scheduler.add_job(
-        tsla_session_job,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour="13-16",
-        minute="*/5",
-        second=45,
-        args=[settings, db, alert_manager],
-        max_instances=1,
-        id="trade_tsla_session_job",
-    )
-    scheduler.add_job(
-        xau_bos_job,
-        trigger="cron",
-        day_of_week="mon-thu",
-        hour="6,14,15,16,17",
-        minute="1,16,31,46",
-        second=30,
-        args=[alert_manager],
-        max_instances=1,
-        id="trade_xau_bos_job",
-    )
-    scheduler.add_job(
-        nas100_open_job,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour="13,14",
-        minute="1,6,11,16,21,26,31,36,41,46,51,56",
-        second=30,
-        args=[alert_manager],
-        max_instances=1,
-        id="trade_nas100_open_job",
-    )
-    scheduler.add_job(
-        dax_initial_expansion_job,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour="7,8",
-        minute="1,6,11,16,21,26,31,36,41,46,51,56",
-        second=30,
-        args=[alert_manager],
-        max_instances=1,
-        id="trade_dax_ie_job",
-    )
+    # -- DISABLED: dax_frank_rejection_job (DAX Frankfurt rejection alerts)
+    # scheduler.add_job(
+    #     dax_frank_rejection_job,
+    #     trigger="cron",
+    #     day_of_week="mon-fri",
+    #     hour=10,
+    #     minute="6,21,36,51",
+    #     second=30,
+    #     args=[alert_manager],
+    #     max_instances=1,
+    #     id="trade_dax_frank_rejection_job",
+    # )
+    # -- DISABLED: tsla_data_job (TSLA MT5 data feed — no active TSLA strategy)
+    # scheduler.add_job(
+    #     tsla_data_job,
+    #     trigger="cron",
+    #     day_of_week="mon-fri",
+    #     hour="13-20",
+    #     minute="*/5",
+    #     second=15,
+    #     args=[db],
+    #     max_instances=1,
+    #     id="trade_tsla_data_job",
+    # )
+    # -- DISABLED: tsla_session_job (TSLA SERPE alerts)
+    # scheduler.add_job(
+    #     tsla_session_job,
+    #     trigger="cron",
+    #     day_of_week="mon-fri",
+    #     hour="13-16",
+    #     minute="*/5",
+    #     second=45,
+    #     args=[settings, db, alert_manager],
+    #     max_instances=1,
+    #     id="trade_tsla_session_job",
+    # )
+    # -- DISABLED: xau_bos_job (XAU/Gold BOS alerts)
+    # scheduler.add_job(
+    #     xau_bos_job,
+    #     trigger="cron",
+    #     day_of_week="mon-thu",
+    #     hour="6,14,15,16,17",
+    #     minute="1,16,31,46",
+    #     second=30,
+    #     args=[alert_manager],
+    #     max_instances=1,
+    #     id="trade_xau_bos_job",
+    # )
+    # -- DISABLED: nas100_open_job (NAS100 open expansion alerts)
+    # scheduler.add_job(
+    #     nas100_open_job,
+    #     trigger="cron",
+    #     day_of_week="mon-fri",
+    #     hour="13,14",
+    #     minute="1,6,11,16,21,26,31,36,41,46,51,56",
+    #     second=30,
+    #     args=[alert_manager],
+    #     max_instances=1,
+    #     id="trade_nas100_open_job",
+    # )
+    # -- DISABLED: dax_initial_expansion_job (DAX initial expansion alerts)
+    # scheduler.add_job(
+    #     dax_initial_expansion_job,
+    #     trigger="cron",
+    #     day_of_week="mon-fri",
+    #     hour="7,8",
+    #     minute="1,6,11,16,21,26,31,36,41,46,51,56",
+    #     second=30,
+    #     args=[alert_manager],
+    #     max_instances=1,
+    #     id="trade_dax_ie_job",
+    # )
     scheduler.add_job(
         weekly_retest_scan_job,
         trigger="cron",
