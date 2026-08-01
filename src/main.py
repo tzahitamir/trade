@@ -6358,39 +6358,13 @@ def main() -> None:
         id="trade_watchlist_price_check_job",
     )
 
-    logging.info("Starting continuous fetch scheduler. Fetch check runs every minute at second %d.", FETCH_CHECK_SECOND)
-    logging.info("DAX session job runs every 5 min; alerts during 09:00-12:30 Israel time (Frankfurt open)")
-    logging.info("Gap check job runs daily at 06:00 UTC")
-    logging.info("Daily report job runs at 21:00 IDT (18:00 UTC)")
-    logging.info("DAX morning brief job runs Mon-Fri at 04:06/21/36/51 UTC (07:06/21/36/51 IDT) — live update each slot")
-    logging.info("DAX sweep watcher runs every minute Mon-Fri 04:00-06:35 UTC (07:00-09:35 IDT)")
-    logging.info("DAX Frankfurt rejection job runs Mon-Fri at 07:06/21/36/51 UTC (10:06/21/36/51 IDT)")
-    logging.info("TSLA data job runs Tue-Fri 13:00-20:55 UTC (09:00-16:55 ET) — reads MT5 TSLA_M5.csv")
-    logging.info("TSLA session job runs Tue-Fri 13:00-16:55 UTC (09:00-12:55 ET) — SERPE detection")
-    logging.info("XAU BOS job runs Mon-Thu at hours 01/03/14/15/17 UTC — BOS/ChoCH + pullback alert")
-    logging.info("NAS100 open job runs Mon-Fri 13:30-14:35 UTC every 5 min — US open expansion + EQ retrace")
-    logging.info("DAX initial expansion job runs Mon-Fri 07:00-08:10 UTC every 5 min — BEAR expansion + EQ retrace")
+    logging.info("Active jobs: log_monitor(10min) heartbeat(30min)")
     logging.info("Weekly BOS watchlist update runs Sun 17:05 UTC (20:05 IDT) — score-5 pre-retest candidates")
     logging.info("Weekly BOS watchlist price check runs Mon-Fri 20:30 UTC (23:30 IDT) — alerts when within 3%% of support")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
-    _dlog.info("[STARTUP] trade service starting | pairs=%d alert_pairs=%s dev_mode=%s",
-               len(settings.fx_pairs),
-               getattr(settings, "alert_pairs", settings.fx_pairs),
-               getattr(settings, "dev_mode", False))
-    _dlog.info("[STARTUP] liq_live_pairs=%s | bos_timeframes=%s", _LIQ_LIVE_PAIRS, settings.timeframes)
-    _dlog.info("[STARTUP] scheduler jobs: fetch(1min) monitor(15min) dax_data(5min) "
-               "dax_session(5min) gap_check(06:00UTC) daily_report(18:00UTC) heartbeat(30min)")
-
-    # Run gap check once at startup so any downtime gaps are recovered immediately
-    logging.info("Running startup gap check...")
-    _dlog.info("[STARTUP] running startup gap check...")
-    try:
-        run_gap_check(settings, fetcher, db)
-    except Exception:
-        logging.exception("Startup gap check failed (non-fatal)")
-        _dlog.error("[STARTUP] gap check failed (non-fatal)")
+    _dlog.info("[STARTUP] trade service starting — weekly BOS retest mode only")
 
     # Startup health-check notification
     try:
