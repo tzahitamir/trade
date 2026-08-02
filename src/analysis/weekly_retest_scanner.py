@@ -308,7 +308,7 @@ def _find_watchlist_candidate(df: pd.DataFrame, ticker: str) -> dict | None:
             "entry":            round(level * (1 + ENTRY_PCT), 4),
             "sl":               round(level - ATR_FRACTION * atr_last, 4),
             "atr":              round(float(atr_last), 4),
-            "bos_date":         str(dates[bos_idx].date()),
+            "bos_date":         str(pd.Timestamp(dates[bos_idx]).date()),
             "consec_total":     consec_total,
             "peak_gain_pct":    peak_gain_pct,
             "consol_min_pct":   consol_min_pct,
