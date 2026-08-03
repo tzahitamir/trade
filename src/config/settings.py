@@ -20,6 +20,7 @@ class Settings:
     telegram_chat_id: str = ""
     dev_mode: bool = True
     dax_alerts_enabled: bool = False  # disabled until larger sample accumulated
+    resend_api_key: str = ""
 
     def should_alert(self, symbol: str) -> bool:
         """Return True if this symbol should generate live alerts."""
@@ -59,5 +60,6 @@ class Settings:
         dev_env = os.environ.get("TRADE_DEV_MODE")
         if dev_env is not None:
             settings.dev_mode = dev_env.lower() in ("true", "1")
+        settings.resend_api_key = os.environ.get("RESEND_API_KEY", settings.resend_api_key)
 
         return settings

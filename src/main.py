@@ -18,6 +18,7 @@ from analysis.confluence_detector import detect_confluences, find_trigger_candle
 from db.local_db import LocalDB
 from alerts.alert_manager import AlertManager
 from alerts.log_monitor import LogMonitor
+from alerts.email_notifier import EmailNotifier
 from analysis import weekly_retest_scanner
 
 
@@ -5709,7 +5710,7 @@ def tsla_session_job(settings: "Settings", db: "LocalDB", alert_manager: "AlertM
         _dlog.info("[TSLA_SESSION] alert_suppressed (alerts_off) | chart=%s", chart_path)
 
 
-def weekly_retest_scan_job(alert_manager: AlertManager) -> None:
+def weekly_retest_scan_job(alert_manager: AlertManager, email_notifier: "EmailNotifier") -> None:
     """Sunday 20:00 IDT: scan S&P 500 + Nasdaq 100 for bull weekly retest setups."""
     logging.info("[WEEKLY_RETEST] Starting Sunday scan (~570 tickers via yfinance)...")
     try:
@@ -5717,19 +5718,25 @@ def weekly_retest_scan_job(alert_manager: AlertManager) -> None:
         msg = weekly_retest_scanner.format_message(result)
         alert_manager.notifier.send_message(msg)
         total = len(result["pending"]) + len(result["open"])
+        from datetime import date as _date
+        subject = f"Weekly BOS Retest — {_date.today().strftime('%b %d %Y')} ({total} candidates)"
+        email_notifier.send(subject, msg)
         logging.info("[WEEKLY_RETEST] Scan done: %d pending + %d open = %d candidates",
                      len(result["pending"]), len(result["open"]), total)
     except Exception:
         logging.exception("[WEEKLY_RETEST] Scan failed")
 
 
-def watchlist_update_job(alert_manager: AlertManager) -> None:
+def watchlist_update_job(alert_manager: AlertManager, email_notifier: "EmailNotifier") -> None:
     """Sunday 17:05 UTC (20:05 IDT): rebuild score-5 BOS watchlist and send summary."""
     logging.info("[WATCHLIST] Rebuilding weekly BOS watchlist...")
     try:
         candidates = weekly_retest_scanner.build_watchlist()
         msg = weekly_retest_scanner.format_watchlist_update(candidates)
         alert_manager.notifier.send_message(msg)
+        from datetime import date as _date
+        subject = f"BOS Watchlist — {_date.today().strftime('%b %d %Y')} ({len(candidates)} candidates)"
+        email_notifier.send(subject, msg)
         logging.info("[WATCHLIST] Sent update: %d score-5 candidates", len(candidates))
     except Exception:
         logging.exception("[WATCHLIST] build_watchlist failed")
@@ -6098,6 +6105,10 @@ def main() -> None:
     db = LocalDB(settings.db_path)
     # Pass the existing DB instance to AlertManager to avoid locking issues
     alert_manager = AlertManager(settings, db=db)
+    email_notifier = EmailNotifier(
+        api_key=settings.resend_api_key,
+        recipient="tzahitamir@gmail.com",
+    )
 
     if args.test_telegram:
         alert_manager.send_test_alert()
@@ -6333,7 +6344,7 @@ def main() -> None:
         day_of_week="sun",
         hour=17,
         minute=0,
-        args=[alert_manager],
+        args=[alert_manager, email_notifier],
         max_instances=1,
         id="trade_weekly_retest_job",
     )
@@ -6343,7 +6354,7 @@ def main() -> None:
         day_of_week="sun",
         hour=17,
         minute=5,
-        args=[alert_manager],
+        args=[alert_manager, email_notifier],
         max_instances=1,
         id="trade_watchlist_update_job",
     )
