@@ -6211,14 +6211,15 @@ def main() -> None:
     #     max_instances=1,
     #     id="trade_fetch_job",
     # )
-    scheduler.add_job(
-        check_logs_job,
-        trigger="interval",
-        minutes=10,
-        args=[log_monitor],
-        max_instances=1,
-        id="trade_log_monitor_job",
-    )
+    # -- DISABLED: log monitor (error alerts suppressed — weekly strategy only)
+    # scheduler.add_job(
+    #     check_logs_job,
+    #     trigger="interval",
+    #     minutes=10,
+    #     args=[log_monitor],
+    #     max_instances=1,
+    #     id="trade_log_monitor_job",
+    # )
     # -- DISABLED: dax_data_job (DAX DB feed — no active DAX strategies)
     # scheduler.add_job(
     #     dax_data_job,
@@ -6377,22 +6378,8 @@ def main() -> None:
 
     _dlog.info("[STARTUP] trade service starting — weekly BOS retest mode only")
 
-    # Startup health-check notification
-    try:
-        import socket
-        hostname = socket.gethostname()
-        now_idt  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        job_count = len(scheduler.get_jobs())
-        startup_msg = (
-            f"✅ <b>Trade service started</b>\n"
-            f"Host:  <code>{hostname}</code>\n"
-            f"Time:  {now_idt}\n"
-            f"Jobs:  {job_count} scheduled"
-        )
-        alert_manager.notifier.send_message(startup_msg)
-        logging.info("Startup notification sent.")
-    except Exception as exc:
-        logging.warning("Startup notification failed (non-fatal): %s", exc)
+    # Startup notification disabled — weekly strategy alerts only
+    logging.info("Startup notification suppressed (weekly-only mode)")
 
     try:
         scheduler.start()
