@@ -467,11 +467,13 @@ def format_watchlist_alert(alerts: list[dict]) -> str:
 # ── FVG Recovery scan ─────────────────────────────────────────────────────────
 
 FVG_MIN_SIZE        = 2.0   # minimum bullish FVG size %
+FVG_MAX_SIZE        = 5.0   # only alert for FVGs < 5% (best EV per research)
 FVG_PEAK_WIN        = 20    # bars to search for post-FVG peak
 FVG_BREACH_WIN      = 52    # max bars to find breach after peak
 FVG_RECOV_WIN       = 60    # max bars after breach to find recovery
 FVG_RECENT_BARS     = 4     # recovery must be within last N weekly bars
 FVG_OVERSHOOT_LIMIT = 0.5   # daily alert: cur_price ≤ top + 0.5×fvg_range
+FVG_ACTIVE_WEEKS    = 8     # watch for retest up to 8 weeks after recovery
 
 
 def scan_fvg_recovery(recent_bars: int = FVG_RECENT_BARS) -> list[dict]:
@@ -507,7 +509,7 @@ def scan_fvg_recovery(recent_bars: int = FVG_RECENT_BARS) -> list[dict]:
             if top <= bot:
                 continue
             size_pct = (top / bot - 1) * 100
-            if size_pct < FVG_MIN_SIZE:
+            if size_pct < FVG_MIN_SIZE or size_pct >= FVG_MAX_SIZE:
                 continue
             fvg_range = top - bot
 
@@ -620,20 +622,18 @@ def format_fvg_recovery(setups: list[dict]) -> str:
         bot       = s["fvg_bot"]
         cur       = s["cur_price"]
         fvg_range = top - bot
-        tp1       = s["tp1"]   # top + 1×range
-        tp2       = s["tp2"]   # top + 2×range
+        sl_mid    = round(top - fvg_range * 0.5, 2)   # SL at FVG midpoint
+        risk      = round(fvg_range * 0.5, 2)          # risk = 0.5× range
+        tp1       = s["tp1"]   # top + 1×range → 2:1 R:R with mid SL
+        tp2       = s["tp2"]   # top + 2×range → 4:1 R:R
         tp3       = s["tp3"]
-
-        # R:R always from limit entry at FVG top
-        risk = round(fvg_range, 2)
         above_pct = round((cur - top) / fvg_range * 100) if fvg_range > 0 else 0
 
-        tp_parts = [f"TP1: ${tp1:.2f} (1:1)", f"TP2: ${tp2:.2f} (2:1)"]
-        if tp3 > top:
+        tp_parts = [f"TP1: ${tp1:.2f} (2:1)", f"TP2: ${tp2:.2f} (4:1)"]
+        if tp3 > top and risk > 0:
             rr3 = round((tp3 - top) / risk, 1)
             tp_parts.append(f"TP3: ${tp3:.2f} ({rr3:.1f}R, prior peak)")
 
-        # Status based on current price vs TPs
         if cur >= tp2:
             status = " ⚡TP2 hit"
         elif cur >= tp1:
@@ -643,14 +643,14 @@ def format_fvg_recovery(setups: list[dict]) -> str:
 
         lines += [
             f"<b>{s['ticker']}</b>  FVG {s['size_pct']:.1f}%  |  recovery {ago}{status}",
-            f"  Now: ${cur:.2f} (+{above_pct}% above top)  |  📌 Limit: ${top:.2f}  |  🛑 SL: ${bot:.2f}  (risk ${risk:.2f})",
+            f"  Now: ${cur:.2f} (+{above_pct}% above top)  |  📌 Limit: ${top:.2f}  |  🛑 SL: ${sl_mid:.2f}  (mid FVG, risk ${risk:.2f})",
             f"  🎯 " + "  |  ".join(tp_parts),
             f"  FVG date: {s['fvg_date']}",
             "",
         ]
 
     lines.append(
-        "<i>Limit at FVG top: 86% fill rate | 73% TP1 win | +0.47R EV per filled trade</i>"
+        "<i>Limit at FVG top | SL at mid: 86% fill · 66% TP1 win · +0.99R EV per filled trade</i>"
     )
     return "\n".join(lines)
 
@@ -687,7 +687,7 @@ def _find_active_fvg_breaches() -> list[dict]:
             if top <= bot:
                 continue
             size_pct = (top / bot - 1) * 100
-            if size_pct < FVG_MIN_SIZE:
+            if size_pct < FVG_MIN_SIZE or size_pct >= FVG_MAX_SIZE:
                 continue
             fvg_range = top - bot
 
@@ -726,6 +726,91 @@ def _find_active_fvg_breaches() -> list[dict]:
                 "fvg_range":   fvg_range,
                 "peak_price":  round(peak_price, 2),
                 "breach_date": str(breach_date),
+            })
+
+    return results
+
+
+def _find_recovered_fvg_breaches(max_weeks: int = FVG_ACTIVE_WEEKS) -> list[dict]:
+    """
+    Finds FVG setups where:
+      - Breach confirmed (weekly close < bot)
+      - Weekly recovery happened (close >= top) within last max_weeks weeks
+      - No re-breach after recovery (no weekly close < bot after recovery bar)
+      - FVG size in [FVG_MIN_SIZE, FVG_MAX_SIZE)
+    These are "limit order active" setups: recovery confirmed at weekly level,
+    now watching for daily retest.
+    """
+    tickers = get_universe()
+    results = []
+
+    for ticker in tickers:
+        df = _fetch_weekly(ticker)
+        if df is None:
+            continue
+
+        highs  = df["High"].values
+        lows   = df["Low"].values
+        closes = df["Close"].values
+        dates  = df.index
+        n      = len(df)
+
+        for i in range(1, n - 1):
+            bot = highs[i - 1]
+            top = lows[i + 1]
+            if top <= bot:
+                continue
+            size_pct = (top / bot - 1) * 100
+            if size_pct < FVG_MIN_SIZE or size_pct >= FVG_MAX_SIZE:
+                continue
+            fvg_range = top - bot
+
+            pk_end = min(i + 2 + FVG_PEAK_WIN, n)
+            if pk_end <= i + 2:
+                continue
+            peak_rel   = int(np.argmax(highs[i + 2 : pk_end]))
+            peak_bar   = i + 2 + peak_rel
+            peak_price = float(highs[peak_bar])
+            if peak_price < top * 1.01:
+                continue
+
+            breach_bar = None
+            for j in range(i + 2, min(peak_bar + FVG_BREACH_WIN, n)):
+                if closes[j] < bot:
+                    breach_bar = j
+                    break
+            if breach_bar is None:
+                continue
+
+            # Weekly recovery: first close >= top after breach (excluding in-progress bar)
+            rec_bar = None
+            for j in range(breach_bar + 1, min(breach_bar + FVG_RECOV_WIN, n - 1)):
+                if closes[j] >= top:
+                    rec_bar = j
+                    break
+            if rec_bar is None:
+                continue
+
+            weeks_since_rec = (n - 1) - rec_bar
+            if weeks_since_rec > max_weeks:
+                continue
+
+            # No re-breach after recovery
+            re_breach = any(closes[j] < bot for j in range(rec_bar + 1, n - 1))
+            if re_breach:
+                continue
+
+            results.append({
+                "ticker":          ticker,
+                "fvg_date":        str(pd.Timestamp(dates[i]).date()),
+                "fvg_bot":         round(bot, 2),
+                "fvg_top":         round(top, 2),
+                "size_pct":        round(size_pct, 1),
+                "fvg_range":       fvg_range,
+                "peak_price":      round(peak_price, 2),
+                "breach_date":     str(pd.Timestamp(dates[breach_bar]).date()),
+                "recovery_date":   str(pd.Timestamp(dates[rec_bar]).date()),
+                "weeks_since_rec": weeks_since_rec,
             })
 
     return results
@@ -851,29 +936,209 @@ def format_fvg_daily_alert(setups: list[dict]) -> str:
         bot       = s["fvg_bot"]
         cur       = s["cur_price"]
         fvg_range = top - bot
-        # R:R always from FVG top (limit entry), not from current price
-        risk  = round(fvg_range, 2)          # top − bot = 1× range
-        tp1   = s["tp1"]                     # top + 1× range → 1:1
-        tp2   = s["tp2"]                     # top + 2× range → 2:1
-        tp3   = s["tp3"]
-        rr3   = round((tp3 - top) / risk, 1) if tp3 > top else None
+        sl_mid    = round(top - fvg_range * 0.5, 2)   # SL at FVG midpoint
+        risk      = round(fvg_range * 0.5, 2)          # risk = 0.5× range
+        tp1       = s["tp1"]                            # top + 1× range → 2:1 R:R
+        tp2       = s["tp2"]                            # top + 2× range → 4:1 R:R
+        tp3       = s["tp3"]
+        rr3       = round((tp3 - top) / risk, 1) if tp3 > top and risk > 0 else None
         above_pct = round((cur - top) / fvg_range * 100) if fvg_range > 0 else 0
 
         tp_parts = [
-            f"TP1: ${tp1:.2f} (1:1)",
-            f"TP2: ${tp2:.2f} (2:1)",
+            f"TP1: ${tp1:.2f} (2:1)",
+            f"TP2: ${tp2:.2f} (4:1)",
         ]
         if rr3 and rr3 > 0:
             tp_parts.append(f"TP3: ${tp3:.2f} ({rr3:.1f}R, prior peak)")
 
         lines += [
             f"<b>{s['ticker']}</b>  FVG {s['size_pct']:.1f}%  (formed {s['fvg_date']})",
-            f"  Now: ${cur:.2f} (+{above_pct}% above top)  |  📌 Limit: ${top:.2f}  |  🛑 SL: ${bot:.2f}  (risk ${risk:.2f})",
+            f"  FVG zone: ${bot:.2f} — ${top:.2f}",
+            f"  Now: ${cur:.2f}  (+{above_pct}% above limit)",
+            f"  📌 BUY LIMIT: ${top:.2f}  |  🛑 SL: ${sl_mid:.2f}  (mid FVG, risk ${risk:.2f})",
             f"  🎯 " + "  |  ".join(tp_parts),
             "",
         ]
 
-    lines.append("<i>Limit at FVG top: 86% fill rate | 73% TP1 win | +0.47R EV per filled trade</i>")
+    lines.append("<i>Limit at FVG top | SL at mid: 86% fill · 66% TP1 win · +0.99R EV per filled trade</i>")
+    return "\n".join(lines)
+
+
+def scan_fvg_retest_alert() -> list[dict]:
+    """
+    Daily job: fires when today's low touches FVG top (limit order at FVG top is filling).
+
+    Covers ALL active FVG setups where:
+      - FVG breach confirmed (weekly close < bot)
+      - Recovery happened on a PRIOR day (any daily close >= top before today)
+      - No re-breach since recovery (no daily close < bot after recovery)
+      - Today's daily low <= FVG top  (limit order being hit)
+      - FVG size in [FVG_MIN_SIZE, FVG_MAX_SIZE)
+
+    This catches both same-week retests (recovery Mon, retest Thu) and
+    multi-week retests (recovery 3 weeks ago, retest today).
+    """
+    # Pool 1: breach confirmed, no weekly recovery yet (same-week daily recovery possible)
+    active = _find_active_fvg_breaches()
+
+    # Pool 2: breach + weekly recovery within last FVG_ACTIVE_WEEKS weeks
+    recovered = _find_recovered_fvg_breaches()
+
+    # Merge, deduplicate by ticker (keep largest FVG)
+    by_ticker: dict[str, dict] = {}
+    for item in active + recovered:
+        t = item["ticker"]
+        if t not in by_ticker or item["size_pct"] > by_ticker[t]["size_pct"]:
+            by_ticker[t] = item
+
+    if not by_ticker:
+        return []
+
+    _log.info("[FVG_RETEST] %d candidates, fetching daily OHLC...", len(by_ticker))
+
+    unique_tickers = list(by_ticker.keys())
+    daily_data: dict[str, pd.DataFrame] = {}
+    BATCH = 60
+    for start in range(0, len(unique_tickers), BATCH):
+        batch = unique_tickers[start : start + BATCH]
+        try:
+            raw = yf.download(
+                batch, period="1y", interval="1d",
+                auto_adjust=True, group_by="ticker", progress=False,
+            )
+            for t in batch:
+                try:
+                    df = raw[t] if len(batch) > 1 else raw
+                    df = df[["High", "Low", "Close"]].dropna()
+                    if not df.empty:
+                        daily_data[t] = df
+                except Exception:
+                    pass
+        except Exception as e:
+            _log.warning("[FVG_RETEST] fetch error: %s", e)
+
+    results = []
+    for ticker, c in by_ticker.items():
+        df = daily_data.get(ticker)
+        if df is None:
+            continue
+
+        top       = c["fvg_top"]
+        bot       = c["fvg_bot"]
+        fvg_range = c["fvg_range"]
+        breach_dt = pd.Timestamp(c["breach_date"])
+
+        # Daily bars since breach
+        d_sub = df[df.index >= breach_dt].copy()
+        if len(d_sub) < 2:
+            continue
+
+        d_closes = d_sub["Close"].values
+        d_lows   = d_sub["Low"].values
+
+        # Find first daily close >= top BEFORE today (index -1 = today)
+        first_rec_before_today = None
+        for k, cv in enumerate(d_closes[:-1]):
+            if cv >= top:
+                first_rec_before_today = k
+                break
+
+        if first_rec_before_today is None:
+            continue  # no prior-day recovery → recovery alert handles it if today qualifies
+
+        # Check for re-breach between recovery and yesterday (not today)
+        re_breach = any(
+            d_closes[j] < bot
+            for j in range(first_rec_before_today + 1, len(d_closes) - 1)
+        )
+        if re_breach:
+            continue
+
+        today_low   = float(d_lows[-1])
+        today_close = float(d_closes[-1])
+
+        if today_low > top:
+            continue  # price hasn't touched FVG top today
+
+        if today_close < bot:
+            continue  # full re-breach today — not a retest
+
+        sl_mid    = round(top - fvg_range * 0.5, 2)
+        risk      = round(fvg_range * 0.5, 2)
+        tp1       = round(top + fvg_range * 1.0, 2)   # 2:1 R:R with mid SL
+        tp2       = round(top + fvg_range * 2.0, 2)   # 4:1 R:R
+        tp3       = round(c.get("peak_price", 0), 2)
+        depth_pct = int((top - today_low) / fvg_range * 100) if fvg_range > 0 else 0
+
+        rec_timestamp   = d_sub.index[first_rec_before_today]
+        days_since_rec  = max(1, (pd.Timestamp(date.today()) - rec_timestamp).days)
+
+        results.append({
+            "ticker":         ticker,
+            "fvg_date":       c["fvg_date"],
+            "fvg_bot":        round(bot, 2),
+            "fvg_top":        round(top, 2),
+            "sl_mid":         sl_mid,
+            "size_pct":       c["size_pct"],
+            "cur_price":      round(today_close, 2),
+            "today_low":      round(today_low, 2),
+            "depth_pct":      depth_pct,
+            "tp1":            tp1,
+            "tp2":            tp2,
+            "tp3":            tp3,
+            "breach_date":    c["breach_date"],
+            "recovery_date":  str(rec_timestamp.date()),
+            "days_since_rec": days_since_rec,
+        })
+
+    results.sort(key=lambda x: -x["size_pct"])
+    return results
+
+
+def format_fvg_retest_alert(setups: list[dict]) -> str:
+    today = date.today().strftime("%b %d %Y")
+    lines = [
+        f"<b>⚡ FVG Retest — {today}</b>",
+        f"<i>{len(setups)} limit order{'s' if len(setups) != 1 else ''} filling NOW at FVG top</i>",
+        "",
+    ]
+    for s in setups:
+        top       = s["fvg_top"]
+        bot       = s["fvg_bot"]
+        fvg_range = top - bot
+        sl_mid    = s["sl_mid"]
+        risk      = round(top - sl_mid, 2)
+        tp1       = s["tp1"]
+        tp2       = s["tp2"]
+        tp3       = s["tp3"]
+        depth     = s["depth_pct"]
+        days      = s.get("days_since_rec", 0)
+
+        depth_str = "wick touch" if depth <= 5 else f"{depth}% into FVG"
+        rr3       = round((tp3 - top) / risk, 1) if tp3 > top and risk > 0 else None
+
+        weeks, rem = divmod(days, 7)
+        if weeks == 0:
+            since_str = f"{days}d since recovery"
+        elif rem == 0:
+            since_str = f"{weeks}w since recovery"
+        else:
+            since_str = f"{weeks}w {rem}d since recovery"
+
+        tp_parts = [f"TP1: ${tp1:.2f} (2:1)", f"TP2: ${tp2:.2f} (4:1)"]
+        if rr3 and rr3 > 0:
+            tp_parts.append(f"TP3: ${tp3:.2f} ({rr3:.1f}R, prior peak)")
+
+        lines += [
+            f"<b>{s['ticker']}</b>  FVG {s['size_pct']:.1f}%  |  {since_str}  |  {depth_str}  (formed {s['fvg_date']})",
+            f"  FVG zone: ${bot:.2f} — ${top:.2f}",
+            f"  Today low: ${s['today_low']:.2f}  |  Close: ${s['cur_price']:.2f}",
+            f"  📌 BUY LIMIT: ${top:.2f}  |  🛑 SL: ${sl_mid:.2f}  (mid FVG, risk ${risk:.2f})",
+            f"  🎯 " + "  |  ".join(tp_parts),
+            "",
+        ]
+
+    lines.append("<i>Mid SL: 66% TP1 win | 2:1 R:R | +0.99R EV per filled trade</i>")
     return "\n".join(lines)
 
 

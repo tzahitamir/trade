@@ -5768,21 +5768,47 @@ def watchlist_price_check_job(alert_manager: AlertManager) -> None:
 
 
 def fvg_daily_alert_job(alert_manager: AlertManager, email_notifier: "EmailNotifier") -> None:
-    """Mon-Fri 20:35 UTC (23:35 IDT): alert when today's close is first daily close back above a weekly FVG."""
-    logging.info("[FVG_DAILY] Scanning for today's weekly FVG recoveries...")
+    """Mon-Fri 20:35 UTC (23:35 IDT): two scans —
+    1. Recovery alert: today's daily close is the FIRST close above weekly FVG top → place limit.
+    2. Retest alert: today's daily low touched FVG top on any setup where recovery was prior day → limit filling.
+    """
+    from datetime import date as _date
+
+    # ── Scan 1: new recoveries (place your limit) ──────────────────────────────
+    logging.info("[FVG_DAILY] Scanning for new FVG recoveries...")
     try:
-        setups = weekly_retest_scanner.scan_fvg_daily_alert()
-        if setups:
-            msg = weekly_retest_scanner.format_fvg_daily_alert(setups)
+        recovery_setups = weekly_retest_scanner.scan_fvg_daily_alert()
+        if recovery_setups:
+            msg = weekly_retest_scanner.format_fvg_daily_alert(recovery_setups)
             alert_manager.notifier.send_message(msg)
-            from datetime import date as _date
-            subject = f"FVG Recovery Alert — {_date.today().strftime('%b %d %Y')} ({len(setups)} setup{'s' if len(setups) != 1 else ''})"
+            subject = (
+                f"FVG Recovery — {_date.today().strftime('%b %d %Y')} "
+                f"({len(recovery_setups)} setup{'s' if len(recovery_setups) != 1 else ''})"
+            )
             email_notifier.send(subject, msg)
-            logging.info("[FVG_DAILY] Alert sent (Telegram + email): %d setups", len(setups))
+            logging.info("[FVG_DAILY] Recovery alert sent: %d setups", len(recovery_setups))
         else:
-            logging.info("[FVG_DAILY] No FVG recoveries today")
+            logging.info("[FVG_DAILY] No new FVG recoveries today")
     except Exception:
-        logging.exception("[FVG_DAILY] scan failed")
+        logging.exception("[FVG_DAILY] recovery scan failed")
+
+    # ── Scan 2: retest alerts (limit order filling NOW) ────────────────────────
+    logging.info("[FVG_DAILY] Scanning for FVG retests (limit filling)...")
+    try:
+        retest_setups = weekly_retest_scanner.scan_fvg_retest_alert()
+        if retest_setups:
+            msg = weekly_retest_scanner.format_fvg_retest_alert(retest_setups)
+            alert_manager.notifier.send_message(msg)
+            subject = (
+                f"FVG Retest ⚡ — {_date.today().strftime('%b %d %Y')} "
+                f"({len(retest_setups)} limit{'s' if len(retest_setups) != 1 else ''} filling)"
+            )
+            email_notifier.send(subject, msg)
+            logging.info("[FVG_DAILY] Retest alert sent: %d setups", len(retest_setups))
+        else:
+            logging.info("[FVG_DAILY] No FVG retests today")
+    except Exception:
+        logging.exception("[FVG_DAILY] retest scan failed")
 
 
 def scheduler_heartbeat_job() -> None:
