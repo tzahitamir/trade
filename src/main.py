@@ -5716,6 +5716,16 @@ def weekly_retest_scan_job(alert_manager: AlertManager, email_notifier: "EmailNo
     try:
         result = weekly_retest_scanner.scan()
         msg = weekly_retest_scanner.format_message(result)
+
+        # FVG recovery section (data already cached from scan() above)
+        try:
+            fvg_setups = weekly_retest_scanner.scan_fvg_recovery()
+            fvg_section = weekly_retest_scanner.format_fvg_recovery(fvg_setups)
+            msg = msg + "\n\n" + fvg_section
+            logging.info("[WEEKLY_RETEST] FVG recovery: %d setups found", len(fvg_setups))
+        except Exception:
+            logging.exception("[WEEKLY_RETEST] FVG recovery scan failed (non-fatal)")
+
         alert_manager.notifier.send_message(msg)
         total = len(result["pending"]) + len(result["open"])
         from datetime import date as _date
@@ -5755,6 +5765,21 @@ def watchlist_price_check_job(alert_manager: AlertManager) -> None:
             logging.info("[WATCHLIST] No stocks in alert zone today")
     except Exception:
         logging.exception("[WATCHLIST] price check failed")
+
+
+def fvg_daily_alert_job(alert_manager: AlertManager) -> None:
+    """Mon-Fri 20:35 UTC (23:35 IDT): alert when today's close is first daily close back above a weekly FVG."""
+    logging.info("[FVG_DAILY] Scanning for today's weekly FVG recoveries...")
+    try:
+        setups = weekly_retest_scanner.scan_fvg_daily_alert()
+        if setups:
+            msg = weekly_retest_scanner.format_fvg_daily_alert(setups)
+            alert_manager.notifier.send_message(msg)
+            logging.info("[FVG_DAILY] Alert sent: %d setups", len(setups))
+        else:
+            logging.info("[FVG_DAILY] No FVG recoveries today")
+    except Exception:
+        logging.exception("[FVG_DAILY] scan failed")
 
 
 def scheduler_heartbeat_job() -> None:
@@ -6369,10 +6394,21 @@ def main() -> None:
         max_instances=1,
         id="trade_watchlist_price_check_job",
     )
+    scheduler.add_job(
+        fvg_daily_alert_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=20,
+        minute=35,
+        args=[alert_manager],
+        max_instances=1,
+        id="trade_fvg_daily_alert_job",
+    )
 
     logging.info("Active jobs: log_monitor(10min) heartbeat(30min)")
     logging.info("Weekly BOS watchlist update runs Sun 17:05 UTC (20:05 IDT) — score-5 pre-retest candidates")
     logging.info("Weekly BOS watchlist price check runs Mon-Fri 20:30 UTC (23:30 IDT) — alerts when within 3%% of support")
+    logging.info("FVG daily alert runs Mon-Fri 20:35 UTC (23:35 IDT) — fires on first daily close back above weekly FVG top")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
