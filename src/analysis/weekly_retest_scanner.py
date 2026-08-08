@@ -606,7 +606,7 @@ def format_fvg_recovery(setups: list[dict]) -> str:
     today = date.today().strftime("%b %d %Y")
     lines = [
         f"<b>🔄 Weekly FVG Recovery — {today}</b>",
-        f"<i>Bullish FVG breached then reclaimed gap — {len(setups)} setup{'s' if len(setups) != 1 else ''} (cur ≤ top + 0.5× gap)</i>",
+        f"<i>{len(setups)} setup{'s' if len(setups) != 1 else ''} — place limit at FVG top, wait for retest</i>",
         "",
     ]
 
@@ -615,50 +615,42 @@ def format_fvg_recovery(setups: list[dict]) -> str:
         return "\n".join(lines)
 
     for s in setups:
-        ago  = "this week" if s["bars_ago"] == 0 else f"{s['bars_ago']}w ago"
-        cur  = s["cur_price"]
-        sl   = s["sl"]
-        tp1  = s["tp1"]
-        tp2  = s["tp2"]
-        tp3  = s["tp3"]
-        risk = round(cur - sl, 2)
+        ago       = "this week" if s["bars_ago"] == 0 else f"{s['bars_ago']}w ago"
+        top       = s["fvg_top"]
+        bot       = s["fvg_bot"]
+        cur       = s["cur_price"]
+        fvg_range = top - bot
+        tp1       = s["tp1"]   # top + 1×range
+        tp2       = s["tp2"]   # top + 2×range
+        tp3       = s["tp3"]
 
-        if risk <= 0:
-            continue
+        # R:R always from limit entry at FVG top
+        risk = round(fvg_range, 2)
+        above_pct = round((cur - top) / fvg_range * 100) if fvg_range > 0 else 0
 
-        # Determine which TPs are still ahead from current price
-        tp_parts = []
-        if cur < tp1:
-            rr1 = round((tp1 - cur) / risk, 1)
-            tp_parts.append(f"TP1: ${tp1:.2f} ({rr1:.1f}R, +1× gap)")
-        if cur < tp2:
-            rr2 = round((tp2 - cur) / risk, 1)
-            tp_parts.append(f"TP2: ${tp2:.2f} ({rr2:.1f}R, +2× gap)")
-        if cur < tp3:
-            rr3 = round((tp3 - cur) / risk, 1)
+        tp_parts = [f"TP1: ${tp1:.2f} (1:1)", f"TP2: ${tp2:.2f} (2:1)"]
+        if tp3 > top:
+            rr3 = round((tp3 - top) / risk, 1)
             tp_parts.append(f"TP3: ${tp3:.2f} ({rr3:.1f}R, prior peak)")
 
-        if not tp_parts:
-            continue  # all TPs already hit
-
-        # Status tag: already past TP1?
-        if cur >= tp1:
+        # Status based on current price vs TPs
+        if cur >= tp2:
+            status = " ⚡TP2 hit"
+        elif cur >= tp1:
             status = " ⚡TP1 hit"
-        elif cur >= tp2 * 0.98:
-            status = " near TP2"
         else:
             status = ""
 
         lines += [
             f"<b>{s['ticker']}</b>  FVG {s['size_pct']:.1f}%  |  recovery {ago}{status}",
-            f"  FVG zone: ${s['fvg_bot']:.2f}–${s['fvg_top']:.2f}  |  Now: ${cur:.2f}  |  🛑 SL: ${sl:.2f}",
+            f"  Now: ${cur:.2f} (+{above_pct}% above top)  |  📌 Limit: ${top:.2f}  |  🛑 SL: ${bot:.2f}  (risk ${risk:.2f})",
             f"  🎯 " + "  |  ".join(tp_parts),
             f"  FVG date: {s['fvg_date']}",
             "",
         ]
 
     lines.append(
-        "<i>Edge: 96% hit TP1 | 89% hit TP2 | 80% reach prior peak — within 40 weekly bars</i>"
+        "<i>Limit at FVG top: 86% fill rate | 73% TP1 win | +0.47R EV per filled trade</i>"
     )
     return "\n".join(lines)
 
@@ -851,38 +843,37 @@ def format_fvg_daily_alert(setups: list[dict]) -> str:
     today = date.today().strftime("%b %d %Y")
     lines = [
         f"<b>🔄 FVG Recovery Alert — {today}</b>",
-        f"<i>{len(setups)} weekly FVG just reclaimed — entry at the edge</i>",
+        f"<i>{len(setups)} weekly FVG reclaimed — place limit at FVG top, wait for retest</i>",
         "",
     ]
     for s in setups:
-        cur  = s["cur_price"]
-        sl   = s["sl"]
-        top  = s["fvg_top"]
-        risk = round(cur - sl, 2)
-        if risk <= 0:
-            continue
+        top       = s["fvg_top"]
+        bot       = s["fvg_bot"]
+        cur       = s["cur_price"]
+        fvg_range = top - bot
+        # R:R always from FVG top (limit entry), not from current price
+        risk  = round(fvg_range, 2)          # top − bot = 1× range
+        tp1   = s["tp1"]                     # top + 1× range → 1:1
+        tp2   = s["tp2"]                     # top + 2× range → 2:1
+        tp3   = s["tp3"]
+        rr3   = round((tp3 - top) / risk, 1) if tp3 > top else None
+        above_pct = round((cur - top) / fvg_range * 100) if fvg_range > 0 else 0
 
-        fvg_range = s["tp1"] - top   # tp1 = top + 1×range → range = tp1 - top
-        overshoot_pct = round((cur - top) / fvg_range * 100) if fvg_range > 0 else 0
-
-        rr1 = round((s["tp1"] - cur) / risk, 1)
-        rr2 = round((s["tp2"] - cur) / risk, 1)
         tp_parts = [
-            f"TP1: ${s['tp1']:.2f} ({rr1:.1f}R, +1× gap)",
-            f"TP2: ${s['tp2']:.2f} ({rr2:.1f}R, +2× gap)",
+            f"TP1: ${tp1:.2f} (1:1)",
+            f"TP2: ${tp2:.2f} (2:1)",
         ]
-        if s["tp3"] > cur:
-            rr3 = round((s["tp3"] - cur) / risk, 1)
-            tp_parts.append(f"TP3: ${s['tp3']:.2f} ({rr3:.1f}R, prior peak)")
+        if rr3 and rr3 > 0:
+            tp_parts.append(f"TP3: ${tp3:.2f} ({rr3:.1f}R, prior peak)")
 
         lines += [
             f"<b>{s['ticker']}</b>  FVG {s['size_pct']:.1f}%  (formed {s['fvg_date']})",
-            f"  FVG zone: ${s['fvg_bot']:.2f}–${top:.2f}  |  Now: ${cur:.2f} (+{overshoot_pct}% above top)  |  🛑 SL: ${sl:.2f}",
+            f"  Now: ${cur:.2f} (+{above_pct}% above top)  |  📌 Limit: ${top:.2f}  |  🛑 SL: ${bot:.2f}  (risk ${risk:.2f})",
             f"  🎯 " + "  |  ".join(tp_parts),
             "",
         ]
 
-    lines.append("<i>Edge: 96% hit TP1 | 89% hit TP2 | 80% reach prior peak</i>")
+    lines.append("<i>Limit at FVG top: 86% fill rate | 73% TP1 win | +0.47R EV per filled trade</i>")
     return "\n".join(lines)
 
 
