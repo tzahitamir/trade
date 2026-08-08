@@ -5767,7 +5767,7 @@ def watchlist_price_check_job(alert_manager: AlertManager) -> None:
         logging.exception("[WATCHLIST] price check failed")
 
 
-def fvg_daily_alert_job(alert_manager: AlertManager) -> None:
+def fvg_daily_alert_job(alert_manager: AlertManager, email_notifier: "EmailNotifier") -> None:
     """Mon-Fri 20:35 UTC (23:35 IDT): alert when today's close is first daily close back above a weekly FVG."""
     logging.info("[FVG_DAILY] Scanning for today's weekly FVG recoveries...")
     try:
@@ -5775,7 +5775,10 @@ def fvg_daily_alert_job(alert_manager: AlertManager) -> None:
         if setups:
             msg = weekly_retest_scanner.format_fvg_daily_alert(setups)
             alert_manager.notifier.send_message(msg)
-            logging.info("[FVG_DAILY] Alert sent: %d setups", len(setups))
+            from datetime import date as _date
+            subject = f"FVG Recovery Alert — {_date.today().strftime('%b %d %Y')} ({len(setups)} setup{'s' if len(setups) != 1 else ''})"
+            email_notifier.send(subject, msg)
+            logging.info("[FVG_DAILY] Alert sent (Telegram + email): %d setups", len(setups))
         else:
             logging.info("[FVG_DAILY] No FVG recoveries today")
     except Exception:
@@ -6400,7 +6403,7 @@ def main() -> None:
         day_of_week="mon-fri",
         hour=20,
         minute=35,
-        args=[alert_manager],
+        args=[alert_manager, email_notifier],
         max_instances=1,
         id="trade_fvg_daily_alert_job",
     )

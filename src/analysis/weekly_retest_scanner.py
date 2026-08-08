@@ -587,10 +587,13 @@ def scan_fvg_recovery(recent_bars: int = FVG_RECENT_BARS) -> list[dict]:
         cur = cur_prices.get(ticker)
         if cur is None:
             continue
-        # Filter: SL not already hit, and still below prior peak (trade still live)
-        if cur <= c["sl"]:
+        top = c["fvg_top"]
+        bot = c["fvg_bot"]
+        fvg_range = top - bot
+        # Filter: SL not hit, overshoot ≤ 0.5× fvg_range (same threshold as daily alert)
+        if cur <= bot:
             continue
-        if cur > c["tp3"] * 1.05:   # already 5%+ past prior peak — done
+        if cur > top + FVG_OVERSHOOT_LIMIT * fvg_range:
             continue
         c["cur_price"] = round(cur, 2)
         results.append(c)
@@ -599,17 +602,11 @@ def scan_fvg_recovery(recent_bars: int = FVG_RECENT_BARS) -> list[dict]:
     return results
 
 
-_FVG_MAX_DISPLAY = 15   # cap report at top N setups (most recent + largest FVG)
-
-
 def format_fvg_recovery(setups: list[dict]) -> str:
     today = date.today().strftime("%b %d %Y")
-    total = len(setups)
-    display = setups[:_FVG_MAX_DISPLAY]
-    count_note = f"showing top {_FVG_MAX_DISPLAY} of {total}" if total > _FVG_MAX_DISPLAY else f"{total} setup{'s' if total != 1 else ''}"
     lines = [
         f"<b>🔄 Weekly FVG Recovery — {today}</b>",
-        f"<i>Bullish FVG breached then reclaimed gap — {count_note}</i>",
+        f"<i>Bullish FVG breached then reclaimed gap — {len(setups)} setup{'s' if len(setups) != 1 else ''} (cur ≤ top + 0.5× gap)</i>",
         "",
     ]
 
@@ -617,7 +614,7 @@ def format_fvg_recovery(setups: list[dict]) -> str:
         lines.append("No recent FVG recovery setups this week.")
         return "\n".join(lines)
 
-    for s in display:
+    for s in setups:
         ago  = "this week" if s["bars_ago"] == 0 else f"{s['bars_ago']}w ago"
         cur  = s["cur_price"]
         sl   = s["sl"]
