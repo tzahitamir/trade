@@ -5818,14 +5818,17 @@ def bollinger_weekly_job(alert_manager: AlertManager, email_notifier: "EmailNoti
     logging.info("[BOLLINGER_WEEKLY] Starting Friday weekly scan (~570 tickers)...")
     try:
         setups = bollinger_scanner.bollinger_weekly_scan()
-        msg = bollinger_scanner.format_bollinger_weekly(setups)
-        alert_manager.notifier.send_message(msg)
-        subject = (
-            f"Bollinger Weekly — {_date.today().strftime('%b %d %Y')} "
-            f"({len(setups)} setup{'s' if len(setups) != 1 else ''})"
-        )
-        email_notifier.send(subject, msg)
-        logging.info("[BOLLINGER_WEEKLY] Done: %d setup(s)", len(setups))
+        if setups:
+            msg = bollinger_scanner.format_bollinger_weekly(setups)
+            alert_manager.notifier.send_message(msg)
+            subject = (
+                f"Bollinger Weekly — {_date.today().strftime('%b %d %Y')} "
+                f"({len(setups)} setup{'s' if len(setups) != 1 else ''})"
+            )
+            email_notifier.send(subject, msg)
+            logging.info("[BOLLINGER_WEEKLY] Alert sent: %d setup(s)", len(setups))
+        else:
+            logging.info("[BOLLINGER_WEEKLY] No setups this week")
     except Exception:
         logging.exception("[BOLLINGER_WEEKLY] scan failed")
 
