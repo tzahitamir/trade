@@ -20,6 +20,7 @@ from alerts.alert_manager import AlertManager
 from alerts.log_monitor import LogMonitor
 from alerts.email_notifier import EmailNotifier
 from analysis import weekly_retest_scanner
+from analysis import bollinger_scanner
 
 
 class SizeAndAgeRotatingHandler(RotatingFileHandler):
@@ -5811,6 +5812,45 @@ def fvg_daily_alert_job(alert_manager: AlertManager, email_notifier: "EmailNotif
         logging.exception("[FVG_DAILY] retest scan failed")
 
 
+def bollinger_weekly_job(alert_manager: AlertManager, email_notifier: "EmailNotifier") -> None:
+    """Friday 21:00 UTC (00:00 IDT Sat): scan S&P 500 + Nasdaq 100 weekly bars for bollinger_weekly setups."""
+    from datetime import date as _date
+    logging.info("[BOLLINGER_WEEKLY] Starting Friday weekly scan (~570 tickers)...")
+    try:
+        setups = bollinger_scanner.bollinger_weekly_scan()
+        msg = bollinger_scanner.format_bollinger_weekly(setups)
+        alert_manager.notifier.send_message(msg)
+        subject = (
+            f"Bollinger Weekly — {_date.today().strftime('%b %d %Y')} "
+            f"({len(setups)} setup{'s' if len(setups) != 1 else ''})"
+        )
+        email_notifier.send(subject, msg)
+        logging.info("[BOLLINGER_WEEKLY] Done: %d setup(s)", len(setups))
+    except Exception:
+        logging.exception("[BOLLINGER_WEEKLY] scan failed")
+
+
+def bollinger_earnings_gap_job(alert_manager: AlertManager, email_notifier: "EmailNotifier") -> None:
+    """Mon-Fri 20:45 UTC (23:45 IDT): scan S&P 500 + Nasdaq 100 daily bars for bollinger_earnings_gap setups."""
+    from datetime import date as _date
+    logging.info("[BOLLINGER_EG] Starting daily scan (~570 tickers)...")
+    try:
+        setups = bollinger_scanner.bollinger_earnings_gap_scan()
+        if setups:
+            msg = bollinger_scanner.format_bollinger_earnings_gap(setups)
+            alert_manager.notifier.send_message(msg)
+            subject = (
+                f"Bollinger Earnings Gap — {_date.today().strftime('%b %d %Y')} "
+                f"({len(setups)} setup{'s' if len(setups) != 1 else ''})"
+            )
+            email_notifier.send(subject, msg)
+            logging.info("[BOLLINGER_EG] Alert sent: %d setup(s)", len(setups))
+        else:
+            logging.info("[BOLLINGER_EG] No setups today")
+    except Exception:
+        logging.exception("[BOLLINGER_EG] scan failed")
+
+
 def scheduler_heartbeat_job() -> None:
     """Log a heartbeat every 30 minutes so the debug log confirms the scheduler is alive."""
     _dlog.info("[SCHEDULER] heartbeat | alive | %s UTC",
@@ -6149,6 +6189,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Full weekly job: rescan BOS experiment (no gold update) + live decay check per pair",
     )
+    parser.add_argument(
+        "--check-bollinger-weekly",
+        action="store_true",
+        help="Run bollinger_weekly scan immediately and send alert, then exit",
+    )
+    parser.add_argument(
+        "--check-bollinger-gap",
+        action="store_true",
+        help="Run bollinger_earnings_gap scan immediately and send alert, then exit",
+    )
     return parser.parse_args()
 
 
@@ -6176,6 +6226,16 @@ def main() -> None:
 
     if args.weekly_report:
         run_weekly_report(settings, db, alert_manager)
+        db.close()
+        return
+
+    if args.check_bollinger_weekly:
+        bollinger_weekly_job(alert_manager, email_notifier)
+        db.close()
+        return
+
+    if args.check_bollinger_gap:
+        bollinger_earnings_gap_job(alert_manager, email_notifier)
         db.close()
         return
 
@@ -6433,11 +6493,33 @@ def main() -> None:
         max_instances=1,
         id="trade_fvg_daily_alert_job",
     )
+    scheduler.add_job(
+        bollinger_earnings_gap_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=20,
+        minute=45,
+        args=[alert_manager, email_notifier],
+        max_instances=1,
+        id="trade_bollinger_earnings_gap_job",
+    )
+    scheduler.add_job(
+        bollinger_weekly_job,
+        trigger="cron",
+        day_of_week="fri",
+        hour=21,
+        minute=0,
+        args=[alert_manager, email_notifier],
+        max_instances=1,
+        id="trade_bollinger_weekly_job",
+    )
 
     logging.info("Active jobs: log_monitor(10min) heartbeat(30min)")
     logging.info("Weekly BOS watchlist update runs Sun 17:05 UTC (20:05 IDT) — score-5 pre-retest candidates")
     logging.info("Weekly BOS watchlist price check runs Mon-Fri 20:30 UTC (23:30 IDT) — alerts when within 3%% of support")
     logging.info("FVG daily alert runs Mon-Fri 20:35 UTC (23:35 IDT) — fires on first daily close back above weekly FVG top")
+    logging.info("Bollinger earnings gap runs Mon-Fri 20:45 UTC (23:45 IDT) — daily BB+MA cross after earnings gap ≥7%%")
+    logging.info("Bollinger weekly runs Fri 21:00 UTC (00:00 Sat IDT) — weekly BB+MA cross signal")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
 
