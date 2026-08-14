@@ -11,6 +11,13 @@ For signal data the 20-bar window (bars 6-25) is [95]×16 + [84, 83, 84.5, 84.7]
   2MA[-1]=(84.7+84.5)/2=84.6 > 4MA[-1]=(84.7+84.5+83+84)/4=84.05  → cross  ✓
   2MA[-2]=(84.5+83)/2=83.75  ≤ 4MA[-2]=(84.5+83+84+95)/4=86.625   → prev ok ✓
   close=84.7 ≤ 83.81×1.02=85.49                                      → prox  ✓
+
+Lookback test data: 22 bars at 95, then [84, 83, 86.5, 88.0]
+  Touch bars: bars[-4]=84, bars[-3]=83 both within 2% of lower_bb (~83.81)
+  bars[-2]=86.5, bars[-1]=88.0 — both above proximity threshold (~85.49)
+  2MA[-1]=(88+86.5)/2=87.25 > 4MA[-1]=(88+86.5+83+84)/4=85.375  → cross ✓
+  → lookback=0: no signal (last bar=88 > 85.49)
+  → lookback=5: signal (touch at bars[-3] or [-4])
 """
 
 import sys
@@ -26,7 +33,9 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from analysis.bollinger_scanner import (
     _bb_ma_cross,
+    _detect_signal,
     _get_earnings_gap,
+    format_bollinger_daily,
     format_bollinger_earnings_gap,
     format_bollinger_weekly,
 )
@@ -66,7 +75,78 @@ def _no_cross_data(n: int = 26) -> np.ndarray:
     return c
 
 
-# ── _bb_ma_cross ──────────────────────────────────────────────────────────────
+def _lookback_data(n: int = 26) -> np.ndarray:
+    """Touch at bars[-4] and [-3], cross at bars[-1]. Cross bar above proximity."""
+    c = np.zeros(n)
+    c[: n - 4] = 95.0
+    c[n - 4] = 84.0   # within 2% of lower_bb
+    c[n - 3] = 83.0   # within 2% of lower_bb
+    c[n - 2] = 86.5   # above proximity
+    c[n - 1] = 88.0   # cross bar, above proximity
+    return c
+
+
+# ── _detect_signal (and _bb_ma_cross alias) ───────────────────────────────────
+
+def test_detect_signal_basic():
+    result = _detect_signal(_signal_data())
+    assert result is not None
+    assert result["close"] == pytest.approx(84.7)
+    assert result["pct_above_lower"] <= 2.0
+    assert result["upper_bb"] > result["mid_bb"] > result["lower_bb"]
+
+
+def test_detect_signal_returns_bars_since_touch():
+    result = _detect_signal(_signal_data())
+    assert result is not None
+    assert "bars_since_touch" in result
+    assert result["bars_since_touch"] == 0
+
+
+def test_detect_signal_returns_all_keys():
+    result = _detect_signal(_signal_data())
+    assert result is not None
+    for key in ("close", "lower_bb", "mid_bb", "upper_bb", "pct_above_lower", "bars_since_touch"):
+        assert key in result
+
+
+def test_detect_signal_no_proximity():
+    result = _detect_signal(_no_proximity_data())
+    assert result is None
+
+
+def test_detect_signal_no_cross():
+    result = _detect_signal(_no_cross_data())
+    assert result is None
+
+
+def test_detect_signal_insufficient_data():
+    result = _detect_signal(np.ones(10))
+    assert result is None
+
+
+def test_detect_signal_lookback_0_no_signal():
+    """lookback=0: touch must be on the cross bar; lookback data has touch 1-2 bars before → None."""
+    result = _detect_signal(_lookback_data(), lookback=0)
+    assert result is None
+
+
+def test_detect_signal_lookback_5_signal():
+    """lookback=5: touch 2 bars ago is within window → signal returned."""
+    result = _detect_signal(_lookback_data(), lookback=5)
+    assert result is not None
+    assert result["bars_since_touch"] >= 1
+
+
+def test_detect_signal_lookback_bars_since_touch():
+    """bars_since_touch is non-zero: touch happened before the cross bar."""
+    result = _detect_signal(_lookback_data(), lookback=5)
+    assert result is not None
+    # Touch was before the cross bar (search newest-to-oldest, so >= 1)
+    assert result["bars_since_touch"] >= 1
+
+
+# ── _bb_ma_cross alias ────────────────────────────────────────────────────────
 
 def test_bb_ma_cross_signal_detected():
     result = _bb_ma_cross(_signal_data())
@@ -99,7 +179,6 @@ def test_bb_ma_cross_insufficient_data():
 
 
 def test_bb_ma_cross_minimum_bars():
-    # Exactly at minimum (BB_PERIOD + MA_SLOW + 2 = 26): should work
     result = _bb_ma_cross(_signal_data(n=26))
     assert result is not None
 
@@ -160,7 +239,6 @@ def test_get_earnings_gap_outside_lookback():
 
 def test_get_earnings_gap_insufficient_drop():
     gap_date = _weekday_before(date.today(), 15)
-    # Only a -3% drop, below the 7% threshold
     closes = _make_price_series(gap_date, gap_magnitude=-0.03)
     with patch("analysis.bollinger_scanner.yf") as mock_yf:
         mock_yf.Ticker.return_value = _mock_ticker(gap_date)
@@ -197,6 +275,7 @@ def test_format_weekly_with_setup():
             "mid_bb":          200.00,
             "upper_bb":        216.00,
             "pct_above_lower": 0.82,
+            "bars_since_touch": 1,
         }
     ]
     msg = format_bollinger_weekly(setups)
@@ -206,6 +285,61 @@ def test_format_weekly_with_setup():
     assert "TP" in msg
     assert "184.00" in msg
     assert "216.00" in msg
+    assert "upper BB" in msg
+
+
+# ── format_bollinger_daily ────────────────────────────────────────────────────
+
+def test_format_daily_empty():
+    msg = format_bollinger_daily([])
+    assert "bollinger_daily" in msg
+    assert "No bollinger_daily setups" in msg
+
+
+def test_format_daily_with_setup_today():
+    setups = [
+        {
+            "ticker":           "MSFT",
+            "bar_date":         date(2026, 8, 13),
+            "close":            390.00,
+            "lower_bb":         385.00,
+            "mid_bb":           420.00,
+            "upper_bb":         455.00,
+            "pct_above_lower":  1.30,
+            "bars_since_touch": 0,
+        }
+    ]
+    msg = format_bollinger_daily(setups)
+    assert "MSFT" in msg
+    assert "bollinger_daily" in msg
+    assert "SL" in msg
+    assert "MA cross" in msg
+    assert "385.00" in msg
+    assert "today" in msg
+
+
+def test_format_daily_with_setup_bars_ago():
+    setups = [
+        {
+            "ticker":           "GOOGL",
+            "bar_date":         date(2026, 8, 13),
+            "close":            175.00,
+            "lower_bb":         170.00,
+            "mid_bb":           185.00,
+            "upper_bb":         200.00,
+            "pct_above_lower":  2.0,
+            "bars_since_touch": 3,
+        }
+    ]
+    msg = format_bollinger_daily(setups)
+    assert "GOOGL" in msg
+    assert "3d ago" in msg
+
+
+def test_format_daily_stats_line():
+    msg = format_bollinger_daily([])
+    assert "50.1%" in msg
+    assert "EV" in msg
 
 
 # ── format_bollinger_earnings_gap ─────────────────────────────────────────────
