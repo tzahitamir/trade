@@ -5820,7 +5820,8 @@ def bollinger_weekly_job(alert_manager: AlertManager, email_notifier: "EmailNoti
         setups = bollinger_scanner.bollinger_weekly_scan()
         if setups:
             msg = bollinger_scanner.format_bollinger_weekly(setups)
-            alert_manager.notifier.send_message(msg)
+            if alert_manager.notifier:
+                alert_manager.notifier.send_message(msg)
             subject = (
                 f"Bollinger Weekly — {_date.today().strftime('%b %d %Y')} "
                 f"({len(setups)} setup{'s' if len(setups) != 1 else ''})"
@@ -5841,7 +5842,8 @@ def bollinger_earnings_gap_job(alert_manager: AlertManager, email_notifier: "Ema
         setups = bollinger_scanner.bollinger_earnings_gap_scan()
         if setups:
             msg = bollinger_scanner.format_bollinger_earnings_gap(setups)
-            alert_manager.notifier.send_message(msg)
+            if alert_manager.notifier:
+                alert_manager.notifier.send_message(msg)
             subject = (
                 f"Bollinger Earnings Gap — {_date.today().strftime('%b %d %Y')} "
                 f"({len(setups)} setup{'s' if len(setups) != 1 else ''})"
@@ -5862,7 +5864,8 @@ def bollinger_daily_job(alert_manager: AlertManager, email_notifier: "EmailNotif
         setups = bollinger_scanner.bollinger_daily_scan()
         if setups:
             msg = bollinger_scanner.format_bollinger_daily(setups)
-            alert_manager.notifier.send_message(msg)
+            if alert_manager.notifier:
+                alert_manager.notifier.send_message(msg)
             subject = (
                 f"Bollinger Daily — {_date.today().strftime('%b %d %Y')} "
                 f"({len(setups)} setup{'s' if len(setups) != 1 else ''})"
