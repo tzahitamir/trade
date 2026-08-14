@@ -9,7 +9,7 @@ bollinger_weekly (Friday after US close):
 
 bollinger_earnings_gap (Mon-Fri after US close):
   Signal: daily close ≤2% above lower BB (20d, 2σ) + 2MA crosses above 4MA
-           + earnings gap ≥7% within last 30 calendar days
+           + earnings gap ≥7% within last 60 calendar days
   Exit:   upper BB at entry, fixed (TP)
   SL:     lower BB at entry, fixed (hard intraday stop)
   Stats:  WR=26.2%, avgW=+15.9%, avgL=-1.3%, EV=+3.22%/trade, ~17 days hold
@@ -37,7 +37,7 @@ MA_SLOW       = 4
 PROXIMITY_PCT = 2.0
 
 EARNINGS_GAP_PCT  = 7.0
-EARNINGS_LOOKBACK = 30
+EARNINGS_LOOKBACK = 60
 
 
 # ── Core signal detection ─────────────────────────────────────────────────────
@@ -290,7 +290,7 @@ def format_bollinger_earnings_gap(setups: list[dict]) -> str:
     lines = [
         f"<b>🔻 Bollinger Earnings Gap — {today_str}</b>",
         f"<i>Strategy: bollinger_earnings_gap | {n} setup{'s' if n != 1 else ''} found</i>",
-        "<i>Daily close ≤2% above lower BB + 2MA cross + earnings gap ≥7% within 30 days</i>",
+        "<i>Daily close ≤2% above lower BB + 2MA cross + earnings gap ≥7% within 60 days</i>",
         "",
     ]
 

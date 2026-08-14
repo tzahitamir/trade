@@ -150,7 +150,7 @@ def test_get_earnings_gap_within_window():
 
 
 def test_get_earnings_gap_outside_lookback():
-    gap_date = _weekday_before(date.today(), 45)  # older than 30-day lookback
+    gap_date = _weekday_before(date.today(), 75)  # older than 60-day lookback
     closes = _make_price_series(gap_date, gap_magnitude=-0.09)
     with patch("analysis.bollinger_scanner.yf") as mock_yf:
         mock_yf.Ticker.return_value = _mock_ticker(gap_date)

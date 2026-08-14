@@ -6521,7 +6521,7 @@ def main() -> None:
     logging.info("Weekly BOS watchlist update runs Sun 17:05 UTC (20:05 IDT) — score-5 pre-retest candidates")
     logging.info("Weekly BOS watchlist price check runs Mon-Fri 20:30 UTC (23:30 IDT) — alerts when within 3%% of support")
     logging.info("FVG daily alert runs Mon-Fri 20:35 UTC (23:35 IDT) — fires on first daily close back above weekly FVG top")
-    logging.info("Bollinger earnings gap runs Mon-Fri 20:45 UTC (23:45 IDT) — daily BB+MA cross after earnings gap ≥7%%")
+    logging.info("Bollinger earnings gap runs Mon-Fri 20:45 UTC (23:45 IDT) — daily BB+MA cross after earnings gap ≥7%% within 60d")
     logging.info("Bollinger weekly runs Fri 21:00 UTC (00:00 Sat IDT) — weekly BB+MA cross signal")
     logging.info("Log rotation enabled: 12h interval, 4 backups (~48h retention)")
     logging.info("Debug log: logs/debug.log (rotates at 10 MB or 48 h)")
