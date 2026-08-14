@@ -33,8 +33,10 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 from analysis.bollinger_scanner import (
     _bb_ma_cross,
+    _bw_metrics,
     _detect_signal,
     _get_earnings_gap,
+    _weekly_pct,
     format_bollinger_daily,
     format_bollinger_earnings_gap,
     format_bollinger_weekly,
@@ -144,6 +146,60 @@ def test_detect_signal_lookback_bars_since_touch():
     assert result is not None
     # Touch was before the cross bar (search newest-to-oldest, so >= 1)
     assert result["bars_since_touch"] >= 1
+
+
+# ── _bw_metrics ──────────────────────────────────────────────────────────────
+
+def test_bw_metrics_signal_data():
+    # _bw_metrics needs BB_PERIOD(20) + BW_AVG_PERIOD(10) + 2 = 32 bars minimum
+    result = _bw_metrics(_signal_data(n=36))
+    assert result is not None
+    bwp, bwc_ratio = result
+    assert bwp > 0
+    assert bwc_ratio > 0
+
+
+def test_bw_metrics_insufficient_data():
+    result = _bw_metrics(np.ones(10))
+    assert result is None
+
+
+def test_bw_metrics_bwp_reasonable():
+    result = _bw_metrics(_signal_data(n=36))
+    assert result is not None
+    bwp, _ = result
+    assert 5.0 < bwp < 50.0
+
+
+# ── _weekly_pct ───────────────────────────────────────────────────────────────
+
+def _make_weekly_series(n: int = 30, trend: str = "up") -> pd.Series:
+    """Synthetic weekly series — uptrend ends near upper BB, downtrend near lower."""
+    if trend == "up":
+        closes = np.linspace(80, 120, n)
+    else:
+        closes = np.linspace(120, 80, n)
+    idx = pd.date_range(end="2026-08-08", periods=n, freq="W-FRI")
+    return pd.Series(closes, index=idx)
+
+
+def test_weekly_pct_uptrend_near_upper():
+    s = _make_weekly_series(30, trend="up")
+    pct = _weekly_pct(s)
+    assert pct is not None
+    assert pct > 0.5   # rising into upper band
+
+
+def test_weekly_pct_downtrend_near_lower():
+    s = _make_weekly_series(30, trend="down")
+    pct = _weekly_pct(s)
+    assert pct is not None
+    assert pct < 0.5   # falling toward lower band
+
+
+def test_weekly_pct_insufficient_data():
+    s = pd.Series(np.ones(5))
+    assert _weekly_pct(s) is None
 
 
 # ── _bb_ma_cross alias ────────────────────────────────────────────────────────
@@ -307,6 +363,9 @@ def test_format_daily_with_setup_today():
             "upper_bb":         455.00,
             "pct_above_lower":  1.30,
             "bars_since_touch": 0,
+            "bwp":              18.0,
+            "bwc_ratio":        1.20,
+            "weekly_pct":       0.85,
         }
     ]
     msg = format_bollinger_daily(setups)
@@ -316,6 +375,8 @@ def test_format_daily_with_setup_today():
     assert "MA cross" in msg
     assert "385.00" in msg
     assert "today" in msg
+    assert "18.0%" in msg
+    assert "85" in msg   # weekly_pct shown as 85%
 
 
 def test_format_daily_with_setup_bars_ago():
@@ -329,16 +390,20 @@ def test_format_daily_with_setup_bars_ago():
             "upper_bb":         200.00,
             "pct_above_lower":  2.0,
             "bars_since_touch": 3,
+            "bwp":              10.5,
+            "bwc_ratio":        1.30,
+            "weekly_pct":       0.82,
         }
     ]
     msg = format_bollinger_daily(setups)
     assert "GOOGL" in msg
     assert "3d ago" in msg
+    assert "expanding" in msg   # bwc_ratio 1.30 → "expanding ↗"
 
 
 def test_format_daily_stats_line():
     msg = format_bollinger_daily([])
-    assert "50.1%" in msg
+    assert "77.1%" in msg
     assert "EV" in msg
 
 

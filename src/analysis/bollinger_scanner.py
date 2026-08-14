@@ -11,9 +11,12 @@ bollinger_weekly (Friday after US close):
 bollinger_daily (Mon-Fri after US close):
   Signal: lower BB (20d, 2σ) touched within last 5 bars,
           + 2MA crosses above 4MA on the current daily bar
+          + weekly BB position > 0.80 (stock near weekly upper band = uptrend context)
+          + band width > 8% of price (meaningful potential move)
+          + band width change ratio < 1.50 (exclude sharp post-expansion entries)
   Exit:   negative MA cross while close > mid band (dynamic)
   SL:     lower BB at entry, fixed
-  Stats:  WR=50.1%, avgW=+4.95%, avgL=-2.79%, EV=+1.09%/trade, ~8.5 days hold
+  Stats:  WR=77.1%, avgW=+5.5%, avgL=-2.2%, EV=+4.55%/trade, ~7.4 days hold
 
 bollinger_earnings_gap (Mon-Fri after US close):
   Signal: daily close ≤2% above lower BB (20d, 2σ) + 2MA crosses above 4MA
@@ -46,6 +49,12 @@ PROXIMITY_PCT = 2.0
 
 WEEKLY_LOOKBACK   = 1    # bars (weeks) — touch within 1 prior weekly bar
 DAILY_LOOKBACK    = 5    # bars (days)  — touch within 5 prior daily bars
+
+# bollinger_daily quality gates (derived from correlation research)
+DAILY_WEEKLY_GATE = 0.80  # weekly BB position: 0=lower, 1=upper; >0.80 = uptrend context
+DAILY_BWP_MIN     = 8.0   # min band width % of price → meaningful potential profit
+DAILY_BWC_MAX     = 1.50  # max band width change ratio → exclude sharp post-explosion entries
+BW_AVG_PERIOD     = 10    # bars to average band width for change ratio
 
 EARNINGS_GAP_PCT  = 7.0
 EARNINGS_LOOKBACK = 60   # calendar days
@@ -114,6 +123,56 @@ def _detect_signal(closes: np.ndarray, lookback: int = 0) -> dict | None:
 # keep legacy name as alias so existing tests don't break
 def _bb_ma_cross(closes: np.ndarray) -> dict | None:
     return _detect_signal(closes, lookback=0)
+
+
+def _bw_metrics(closes: np.ndarray) -> tuple[float, float] | None:
+    """
+    Band-width metrics for the last bar of *closes*.
+    Returns (bwp, bwc_ratio) where:
+      bwp       = (upper_bb - lower_bb) / close × 100  (potential move to upper BB as % of price)
+      bwc_ratio = bwp / rolling_avg10(bwp)             (1.0=stable, <1=squeezing, >1=expanding)
+    Returns None if data is insufficient.
+    """
+    n = len(closes)
+    if n < BB_PERIOD + BW_AVG_PERIOD + 2:
+        return None
+    c   = pd.Series(closes)
+    mid = c.rolling(BB_PERIOD, min_periods=BB_PERIOD).mean()
+    std = c.rolling(BB_PERIOD, min_periods=BB_PERIOD).std()
+    lb  = (mid - BB_STD * std).values
+    ub  = (mid + BB_STD * std).values
+    i   = n - 1
+    cl  = float(closes[i])
+    if np.isnan(lb[i]) or np.isnan(ub[i]) or cl <= 0:
+        return None
+    bwp_arr = np.where(closes > 0, (ub - lb) / closes * 100, np.nan)
+    bwp_avg = float(
+        pd.Series(bwp_arr).rolling(BW_AVG_PERIOD, min_periods=BW_AVG_PERIOD).mean().iloc[i]
+    )
+    bwp = (ub[i] - lb[i]) / cl * 100
+    if np.isnan(bwp_avg) or bwp_avg <= 0 or np.isnan(bwp):
+        return None
+    return round(bwp, 2), round(bwp / bwp_avg, 3)
+
+
+def _weekly_pct(weekly_series: pd.Series) -> float | None:
+    """
+    Position of the latest weekly close on its 20-week Bollinger Band scale.
+    Returns 0.0 at the lower band, 1.0 at the upper band (can exceed [0,1]).
+    Returns None if data is insufficient.
+    """
+    if len(weekly_series) < BB_PERIOD + 2:
+        return None
+    c   = weekly_series
+    mid = c.rolling(BB_PERIOD, min_periods=BB_PERIOD).mean()
+    std = c.rolling(BB_PERIOD, min_periods=BB_PERIOD).std()
+    lb  = float((mid - BB_STD * std).iloc[-1])
+    ub  = float((mid + BB_STD * std).iloc[-1])
+    cl  = float(c.iloc[-1])
+    if np.isnan(lb) or np.isnan(ub) or (ub - lb) <= 0:
+        return None
+    pct = (cl - lb) / (ub - lb)
+    return round(pct, 3) if np.isfinite(pct) else None
 
 
 # ── Earnings gap detection ────────────────────────────────────────────────────
@@ -224,22 +283,53 @@ def bollinger_daily_scan() -> list[dict]:
     """
     Scan S&P 500 + Nasdaq 100 on daily bars for the bollinger_daily setup.
     Run Mon-Fri after US market close.
-    Signal: fresh 2MA/4MA cross + lower BB touched within last DAILY_LOOKBACK=5 bars.
+
+    Signal: fresh 2MA/4MA cross + lower BB touched within last DAILY_LOOKBACK=5 bars
+            AND weekly BB position > DAILY_WEEKLY_GATE (=0.80, uptrend context)
+            AND band width > DAILY_BWP_MIN % of price (=8%, meaningful TP potential)
+            AND band width change ratio < DAILY_BWC_MAX (=1.50, exclude sharp expansion)
     Exit: negative MA cross while close > mid band (dynamic).
     Returns list of setup dicts sorted by proximity to lower BB (closest first).
     """
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tickers = get_universe()
-    data    = _batch_download(tickers, "1d", "3mo")
+    tickers      = get_universe()
+    daily_data   = _batch_download(tickers, "1d", "3mo")
+    weekly_data  = _batch_download(tickers, "1wk", "2y")
     setups: list[dict] = []
 
-    for tk, series in data.items():
+    for tk, series in daily_data.items():
         try:
             sig = _detect_signal(series.values, lookback=DAILY_LOOKBACK)
             if sig is None:
                 continue
+
+            # Gate 1: band width % of price (potential move + volatility quality)
+            bw = _bw_metrics(series.values)
+            if bw is None:
+                continue
+            bwp, bwc_ratio = bw
+            if bwp < DAILY_BWP_MIN:
+                continue
+            if bwc_ratio >= DAILY_BWC_MAX:
+                continue
+
+            # Gate 2: weekly BB position (uptrend context)
+            w_series = weekly_data.get(tk)
+            if w_series is None:
+                continue
+            wp = _weekly_pct(w_series)
+            if wp is None or wp <= DAILY_WEEKLY_GATE:
+                continue
+
             bar_date = series.index[-1].date() if hasattr(series.index[-1], "date") else series.index[-1]
-            setups.append({"ticker": tk, "bar_date": bar_date, **sig})
+            setups.append({
+                "ticker":     tk,
+                "bar_date":   bar_date,
+                "bwp":        bwp,
+                "bwc_ratio":  bwc_ratio,
+                "weekly_pct": round(wp, 3),
+                **sig,
+            })
         except Exception:
             pass
 
@@ -343,7 +433,7 @@ def format_bollinger_daily(setups: list[dict]) -> str:
     lines = [
         f"<b>🔵 Bollinger Daily — {today_str}</b>",
         f"<i>Strategy: bollinger_daily | {n} setup{'s' if n != 1 else ''} found</i>",
-        "<i>Daily lower BB touch (≤5 bars ago) + 2MA/4MA cross | exit: MA cross above mid</i>",
+        "<i>Daily BB touch (≤5d) + 2MA cross | weekly>80% | band>8% | not overextended | exit: MA above mid</i>",
         "",
     ]
 
@@ -351,35 +441,51 @@ def format_bollinger_daily(setups: list[dict]) -> str:
         lines += [
             "No bollinger_daily setups today.",
             "",
-            "<i>Stats: 50.1% WR | avg win +4.95% | avg loss -2.79% | EV +1.09%/trade</i>",
+            "<i>Stats: 77.1% WR | avg win +5.5% | avg loss -2.2% | EV +4.55%/trade | ~7.4 days hold</i>",
         ]
         return "\n".join(lines)
 
     for s in setups:
-        tk   = s["ticker"]
-        cl   = s["close"]
-        lb   = s["lower_bb"]
-        mb   = s["mid_bb"]
-        ub   = s["upper_bb"]
-        pct  = s["pct_above_lower"]
-        bst  = s.get("bars_since_touch", 0)
+        tk         = s["ticker"]
+        cl         = s["close"]
+        lb         = s["lower_bb"]
+        mb         = s["mid_bb"]
+        ub         = s["upper_bb"]
+        pct        = s["pct_above_lower"]
+        bst        = s.get("bars_since_touch", 0)
+        bwp        = s.get("bwp", 0.0)
+        bwc        = s.get("bwc_ratio", 1.0)
+        wp         = s.get("weekly_pct", 0.0)
 
         risk_pct   = round((cl - lb) / cl * 100, 1) if cl != 0 else 0.0
         reward_pct = round((ub - cl) / cl * 100, 1) if cl != 0 else 0.0
         prox_str   = f"{pct:.1f}% above" if pct >= 0 else f"{abs(pct):.1f}% below"
         touch_str  = "today" if bst == 0 else f"{bst}d ago"
 
+        if bwc < 0.70:
+            bwc_label = "squeezing ↘"
+        elif bwc < 0.90:
+            bwc_label = "mild squeeze"
+        elif bwc < 1.10:
+            bwc_label = "stable"
+        elif bwc < 1.50:
+            bwc_label = "expanding ↗"
+        else:
+            bwc_label = "sharp expansion"
+
+        wp_pct = round(wp * 100, 0)
+
         lines += [
-            f"<b>{tk}</b>  |  {prox_str} lower BB  |  lower BB touched {touch_str}",
-            f"  📈 Close: ${cl:.2f}  |  Lower BB: ${lb:.2f}  |  Mid: ${mb:.2f}  |  Upper: ${ub:.2f}",
-            f"  🛑 SL: ${lb:.2f}  (lower BB fixed — risk {risk_pct:.1f}%)",
-            f"  🎯 TP: exit on negative MA cross above mid  |  Upper BB ${ub:.2f} (+{reward_pct:.1f}%)",
-            f"  ⏱ Avg hold ~8.5 days",
+            f"<b>{tk}</b>  |  {prox_str} lower BB  |  touch {touch_str}",
+            f"  📈 Close: ${cl:.2f}  |  Lower: ${lb:.2f}  |  Mid: ${mb:.2f}  |  Upper: ${ub:.2f}",
+            f"  📐 Band width: {bwp:.1f}% of price ({bwc_label}, ratio {bwc:.2f})  |  Weekly pos: {wp_pct:.0f}%",
+            f"  🛑 SL: ${lb:.2f}  (−{risk_pct:.1f}%)  |  🎯 TP: MA cross above mid  |  Upper BB ${ub:.2f} (+{reward_pct:.1f}%)",
+            f"  ⏱ Avg hold ~7.4 days",
             "",
         ]
 
     lines.append(
-        "<i>bollinger_daily: 50.1% WR | avg win +4.95% | avg loss -2.79% | EV +1.09%/trade</i>"
+        "<i>bollinger_daily: 77.1% WR | avg win +5.5% | avg loss -2.2% | EV +4.55%/trade</i>"
     )
     return "\n".join(lines)
 
